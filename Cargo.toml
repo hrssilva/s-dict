@@ -1,0 +1,8 @@
+[package]
+name = "s-dict"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "A dynamic, incrementally mutable bidirectional RDF term <-> TermId dictionary, built from macro-dynamic lexical blocks over micro-static per-block indexes."
+
+[dependencies]
