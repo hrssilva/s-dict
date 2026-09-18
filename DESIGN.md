@@ -579,6 +579,155 @@ path is strictly better on every axis -- consistent with this document's
 running theme that measuring beats assuming, including when a change is
 already known to be a net win.
 
+#### Does it hold at bulk scale? (`examples/perf_decode_bulk.rs`)
+
+The 20,000-term measurement above is dominated by single-lookup latency.
+A fair objection: nanosecond-level deltas can still be worth chasing if
+the real workload decodes *millions* of terms in one pass (a dictionary
+dump/export, bulk materialization) -- so it's worth checking whether the
+per-op advantage holds, shrinks, or grows at that scale, not just
+assuming it scales linearly. `examples/perf_decode_bulk.rs` runs the
+same `setup_only`/`get_term`/`get_term_into` comparison at 2,000,000
+terms in a single pass (no repeats needed at this scale), built via
+`insert_batch`'s bootstrap path rather than sequential `insert` --
+sequential insert's ~90us/op rebuild cost would make multi-million-term
+setup itself take minutes and would mix rebuild-cost variance into what
+should be a clean decode-only measurement.
+
+Per-op deltas (2,000,000 calls each, `setup_only` subtracted):
+
+| metric | `get_term` | `get_term_into` | delta |
+|---|---:|---:|---:|
+| cycles | 2563.3 | 2119.7 | 17.3% |
+| instructions | 8708.5 | 7824.4 | 10.2% |
+| cache references | 5.76 | **-1.34** | 123% |
+| cache misses | 3.61 | **-0.55** | 115% |
+| branches | 955.4 | 763.5 | 20.1% |
+| branch misses | 2.81 | 2.77 | 1.3% |
+
+Two things change at this scale, both favorably:
+
+- **`get_term_into`'s cache cost drops into the noise.** At 20,000 terms
+  it was 1.55 cache-references/op (already small); at 2,000,000 it's
+  *negative* -- statistically indistinguishable from zero, sometimes
+  measuring slightly below the `setup_only` baseline itself. This is the
+  mechanism working exactly as expected, taken to its logical conclusion:
+  the one reused buffer amortizes its (already tiny) warm-up cost over
+  far more calls, so per-op it essentially vanishes. `get_term`'s
+  cache-reference cost, by contrast, doesn't amortize away -- it's paying
+  for a genuinely fresh allocation on every single call regardless of how
+  many calls there are, so it stays roughly constant (5.76 vs. 5.17
+  before, a small increase plausibly from a larger heap at this scale).
+- **The 20,000-term branch-misses anomaly (`get_term_into` measuring
+  *worse*, -48.7%) mostly disappears at scale** (1.3% at 2,000,000
+  terms). That's a useful data point on its own: the earlier result
+  wasn't wrong, but a smaller sample was more exposed to noise/warm-up
+  effects than the headline cycle-count numbers suggested. Bulk-scale
+  measurement isn't just "the same conclusion with bigger numbers" --
+  it can also correct which parts of a smaller measurement were solid
+  versus noisy.
+
+Translated to wall clock: `get_term` decoded 2,000,000 terms in 646.2ns/op,
+`get_term_into` in 524.8ns/op -- **242.8ms saved over one 2-million-term
+pass**, which is the concrete, scale-dependent answer to "does a
+sub-100ns/op difference matter": at dump/export scale, yes, by hundreds
+of milliseconds per pass, and that gap should widen (not shrink) as the
+dataset grows further, per the cache-amortization argument above.
+
+### Binary-search unranking: acting on the `perf record` finding
+
+The measurements above characterize `get_term`/`get_term_into`'s cost;
+they don't explain *where inside* `term_at_into` it goes. `perf stat`
+can't answer that -- it only aggregates whole-process counters. `perf
+record -g` (call-graph sampling) can, and reveals a concrete, fixable
+finding rather than "the FST is just slow."
+
+Isolating the recording from setup noise mattered here: at the scale of
+a single decode pass, one-time bootstrap setup and the decode loop take
+comparable wall time, so naively recording the whole process mixes
+setup-time functions (`fst::raw::registry::Registry::new`, part of
+`Block::build`'s minimization, not decoding) into what's supposed to be
+a decode-only profile. `examples/perf_decode_bulk.rs` gained a `repeats`
+argument so the loop can be made to dominate total runtime (e.g.
+100,000 terms x 20 repeats -- one bootstrap, 2,000,000 decodes) rather
+than trying to separate the two after the fact.
+
+With a clean recording, 83.32% of self-time landed in `term_at_into`
+(then implemented by calling `raw::Fst::get_key_into` directly), broken
+down as:
+
+| Sub-cost | Share of total runtime | What it is |
+|---|---:|---|
+| `Range<usize>::next()` | **41.5%** | Just stepping through candidate transitions |
+| `transition`/`input` decode | ~24.2% | Actually decoding each transition's label/output/target |
+| `unpack_delta`/`unpack_uint` | 2.4% | Varint-decoding the target address |
+| `push` | 2.8% | Writing the decoded byte |
+| loop overhead | 3.3% | `get_key_into`'s outer `while` |
+
+`get_key_into`'s algorithm is `node.transitions().take_while(|t| t.out.value() <= value).last()` -- a **linear scan** through a node's transitions (up to its full branching factor), going through generic `Iterator`/`TakeWhile`/`fold`/`try_fold` machinery for every candidate examined. The single largest cost, 41.5% of total runtime, was that generic-iterator overhead itself -- not decoding transition data, just advancing through candidates one at a time.
+
+The fix: `fst::raw::Node` also exposes `transition(&self, i: usize) ->
+Transition` and `len(&self) -> usize` -- direct indexed access. And the
+existing linear scan's own correctness already *requires* a node's
+transitions to be sorted by non-decreasing accumulated output value
+(that's the only way "take the last one `<= value`" is a well-defined
+greedy-descent step at all) -- so a manual binary search over
+`node.transition(i)` by index is valid using a precondition the
+algorithm already relied on, not a new assumption. `src/block.rs` now
+has its own `last_transition_at_most` (a `partition_point`-style binary
+search) and `term_at_into` walks the FST directly via `Node::root`/
+`Node::transition`/`Node::node`, bypassing `get_key_into` entirely.
+
+Correctness risk here is real -- a subtly wrong binary-search comparison
+would silently corrupt every reverse lookup -- so this got its own
+targeted stress test (`term_at_and_rank_round_trip_with_wide_branching`,
+3,000 entries with a digit suffix producing up to 10-way branching per
+node, covering low/high/middle target indices within a node, not just
+the always-one-choice case the other fixed-width test data happens to
+produce) in addition to the full 3-way differential fuzz suite, which
+already exercises `get_term` under randomized insert/remove sequences.
+All passed clean.
+
+Measured, before vs. after, at the same 2,000,000-term bulk-decode scale:
+
+| metric (per op) | linear scan | binary search | change |
+|---|---:|---:|---:|
+| `get_term` cycles | 2563.3 | 2172.6 | -15.2% |
+| `get_term` instructions | 8708.5 | 7483.1 | -14.1% |
+| `get_term_into` cycles | 2119.7 | 1668.6 | -21.3% |
+| `get_term_into` instructions | 7824.4 | 6594.7 | -15.7% |
+| `get_term` wall clock | 646.1ns/op | 563.2ns/op | **-12.8%** |
+| `get_term_into` wall clock | 524.8ns/op | 454.7ns/op | **-13.4%** |
+
+Over the full 2,000,000-term pass: 165.8ms saved for `get_term`, 140.3ms
+for `get_term_into` -- on top of the earlier `get_term_into`-vs-`get_term`
+saving, not instead of it.
+
+Not a clean win on every axis, reported honestly rather than only citing
+the metrics that favor the change: branches per op went *up* (`get_term`
+955.4 -> 1062.4, `get_term_into` 763.5 -> 876.0) and branch-misses got
+meaningfully worse (`get_term` -62.0%, `get_term_into` -22.8% worse, in
+both absolute count and as a fraction of branches taken), and
+cache-references ticked up slightly too (binary search jumps to
+arbitrary midpoints in a node's transition table; the old linear scan
+walked it sequentially, which is more prefetcher-friendly even though it
+does more total work). Binary search is less predictable per-branch than
+a straight-line scan, and it doesn't have the sequential-access property
+the old approach had either -- both real, structural costs of the
+algorithm change. They just don't outweigh the reduction in *total* work
+(far fewer transitions actually visited), so cycles, instructions, and
+wall clock all still improved substantially. A follow-up `perf record`
+after the change confirms the mechanism directly: the `next<usize>`
+iterator-machinery hot spot is gone entirely from the profile: 71.91%
+of self-time is still in `term_at_into`, but now split across
+`transition`/`common_input` decode (~40%, legitimate work), the binary
+search's own loop (~18%), byte-writing, and target-node construction --
+i.e., what's left is mostly necessary work, not abstraction overhead.
+That's a reasonable place to stop this specific optimization; further
+gains would mean touching the FST's own byte-level decode routines
+(`common_input`, `unpack_delta`) rather than how we call into them, a
+larger step than this one.
+
 ## What's not implemented yet
 
 In the design doc's own stage numbering (§17), this crate currently

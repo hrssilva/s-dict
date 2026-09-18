@@ -15,3 +15,12 @@ description = "A dynamic, incrementally mutable bidirectional RDF term <-> TermI
 # unranking primitive is exactly the kind of thing to measure before
 # building around).
 fst = "0.4"
+
+# A separate profile from plain `release`, purely so `perf record`'s
+# call-graph sampling gets meaningful symbols (source-level line info)
+# into the `fst` crate's own internals, not just this crate's. Doesn't
+# touch `[profile.release]` itself -- real release builds stay lean.
+[profile.profiling]
+inherits = "release"
+debug = true
+strip = false

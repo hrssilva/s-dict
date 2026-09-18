@@ -48,7 +48,12 @@ optimization. On top of that, `Dictionary`/`FrontCodedDictionary` both
 moved from design doc §5's Variant A reverse mapping to Variant B
 (`TermId -> (BlockId, local_rank)`, no scan) after measuring both --
 faster reverse lookups, more reverse-directory space, exactly the
-tradeoff §5 names, now with real numbers on each side.
+tradeoff §5 names, now with real numbers on each side. `Block::term_at_into`
+also now walks the FST's `raw` API directly with a binary search instead
+of calling the `fst` crate's own `get_key_into` (a linear scan) -- a
+`perf record` call-graph profile found that scan's generic-`Iterator`
+overhead, not per-transition data decoding, was 41.5% of that function's
+runtime; the fix cuts wall-clock decode time ~13% at bulk scale.
 
 A non-trivial router, RDF-aware term decomposition, and the remaining §13
 baselines (global static minimal FST, dynamic compact tries, global FST +
@@ -129,11 +134,14 @@ constant -- see DESIGN.md §12 for why.
   lockstep, across several block-size configurations chosen to force
   splits and merges; plus `#[ignore]`d perf/space probes (run with
   `cargo test --release -- --ignored --nocapture`).
-- `examples/perf_get_term.rs` -- a dedicated `perf stat` target isolating
-  `get_term`/`get_term_into` from setup cost (via a `setup_only` baseline
-  to subtract), for hardware-counter-level measurement (cycles,
-  instructions, cache/branch misses) beyond what the wall-clock probes
-  show -- see DESIGN.md for how to run it and what it found.
+- `examples/perf_get_term.rs`, `examples/perf_decode_bulk.rs` -- dedicated
+  `perf stat` targets isolating `get_term`/`get_term_into` from setup cost
+  (via a `setup_only` baseline to subtract), for hardware-counter-level
+  measurement (cycles, instructions, cache/branch misses) beyond what the
+  wall-clock probes show -- the first at 20,000 terms/many repeats, the
+  second in a single 2,000,000-term pass, checking whether the same
+  per-op advantage holds (it does, and gets cleaner) at bulk-decode
+  scale -- see DESIGN.md for how to run them and what they found.
 
 ## Testing
 
