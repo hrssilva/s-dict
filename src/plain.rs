@@ -45,6 +45,21 @@ impl PlainDictionary {
         let free_ids_bytes = self.free_ids.len() * std::mem::size_of::<u32>();
         forward_bytes + reverse_bytes + free_ids_bytes
     }
+
+    /// See [`crate::Dictionary::get_term_into`] -- identical contract.
+    /// `PlainDictionary` already stores the term as an owned `Box<str>`,
+    /// so this just copies its bytes into `buf` rather than decoding
+    /// anything, but it's offered for the same reason: letting a hot loop
+    /// reuse one buffer across many calls instead of allocating a
+    /// `String` per call.
+    pub fn get_term_into(&self, id: TermId, buf: &mut Vec<u8>) -> bool {
+        buf.clear();
+        let Some(Some(s)) = self.reverse.get(id.0 as usize) else {
+            return false;
+        };
+        buf.extend_from_slice(s.as_bytes());
+        true
+    }
 }
 
 impl TermDictionary for PlainDictionary {
@@ -149,5 +164,19 @@ mod tests {
         // The reverse Vec's slots (now None) still cost their Option<Box<str>>
         // size; only the string content and forward-map entries are freed.
         assert!(dict.size_bytes() < after_one);
+    }
+
+    #[test]
+    fn get_term_into_matches_get_term() {
+        let mut dict = PlainDictionary::new();
+        let id = dict.insert("http://example.org/a");
+        let mut buf = Vec::new();
+        assert!(dict.get_term_into(id, &mut buf));
+        assert_eq!(std::str::from_utf8(&buf).unwrap(), "http://example.org/a");
+
+        let missing = TermId(9999);
+        buf.clear();
+        assert!(!dict.get_term_into(missing, &mut buf));
+        assert!(buf.is_empty());
     }
 }

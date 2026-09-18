@@ -31,12 +31,21 @@ for the full architecture, roadmap, and literature grounding):
   points instead of an FST. Exists specifically to isolate what automaton
   minimization buys over blocking + prefix compression alone (design doc
   §8). Measured against `Dictionary` on 9,000 namespace-clustered terms:
-  the FST is ~1.74x more space-efficient (13.84 vs 24.07 bytes/term), but
-  front coding is ~6.4x faster to rebuild per insert (91.1µs vs 14.1µs)
-  *and* faster at both lookup directions (`get_id` ~1.2x, `get_term`
-  ~3.5x) at this block size -- see DESIGN.md for the full comparison,
-  why the lookup result is the more surprising one, and how to reproduce
-  it.
+  the FST is ~1.4x more space-efficient (9.84 vs 18.07 bytes/term), but
+  front coding is ~6x faster to rebuild per insert and faster at both
+  lookup directions too at this block size -- see DESIGN.md for the full
+  comparison, why the lookup result is the more surprising one, and how
+  to reproduce it.
+
+All three implementations have also been through a Data-Oriented-Design
+optimization pass (DESIGN.md's "Optimization pass" section): a
+struct-of-arrays scratch buffer (`EntriesArena`) replacing a
+`Vec<(Box<str>, TermId)>` that allocated per-term on every block rebuild,
+a buffer-reusing `get_term_into` alongside the allocating `get_term`,
+`u16` instead of `u32` for a field genuinely bounded by a single term's
+length, and a `NonZeroU32`-backed `BlockId` so `Option<BlockId>` costs 4
+bytes instead of 8 via Rust's niche optimization -- each change measured
+before and after, not assumed.
 
 A non-trivial router, RDF-aware term decomposition, and the remaining §13
 baselines (global static minimal FST, dynamic compact tries, global FST +
@@ -74,6 +83,12 @@ assert_eq!(
     Some("http://www.w3.org/2000/01/rdf-schema#Class")
 );
 
+// get_term_into reuses a caller buffer instead of allocating a fresh
+// String per call -- for hot loops materializing many terms.
+let mut buf = Vec::new();
+dict.get_term_into(class_id, &mut buf);
+assert_eq!(std::str::from_utf8(&buf).unwrap(), "http://www.w3.org/2000/01/rdf-schema#Class");
+
 // Batch insertion groups new terms by destination block instead of
 // rebuilding a block once per term.
 let ids = dict.insert_batch(&["http://dbpedia.org/resource/Berlin", "http://dbpedia.org/resource/Paris"]);
@@ -102,6 +117,10 @@ constant -- see DESIGN.md §12 for why.
   `FrontCodedDictionary`, the §13 front-coded-blocks baseline: the same
   macro structure as `Dictionary`, with shared-prefix delta coding
   instead of an FST.
+- `src/entries_arena.rs` -- `EntriesArena`, the struct-of-arrays scratch
+  buffer both `Dictionary` and `FrontCodedDictionary` decode into and
+  rebuild from, instead of a `Vec<(Box<str>, TermId)>` that allocated
+  per term on every block rebuild.
 - `tests/dictionary.rs` -- differential fuzz testing of `Dictionary` and
   `FrontCodedDictionary` against `PlainDictionary` as an oracle, in
   lockstep, across several block-size configurations chosen to force

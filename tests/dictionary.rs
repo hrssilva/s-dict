@@ -216,6 +216,14 @@ fn perf_probe_default_block_bounds() {
     }
     let get_term_elapsed = start.elapsed();
 
+    let mut buf = Vec::new();
+    let start = Instant::now();
+    for &id in &ids {
+        dict.get_term_into(id, &mut buf);
+        std::hint::black_box(&buf);
+    }
+    let get_term_into_elapsed = start.elapsed();
+
     let start = Instant::now();
     for t in &term_refs {
         dict.remove(t);
@@ -224,10 +232,12 @@ fn perf_probe_default_block_bounds() {
 
     eprintln!(
         "20000 sequential inserts: {insert_elapsed:?} ({:?}/op); \
-         20000 get_term (select_b via Fst::get_key): {get_term_elapsed:?} ({:?}/op); \
+         20000 get_term (allocates): {get_term_elapsed:?} ({:?}/op); \
+         20000 get_term_into (reused buffer): {get_term_into_elapsed:?} ({:?}/op); \
          20000 sequential removes: {remove_elapsed:?} ({:?}/op)",
         insert_elapsed / 20_000,
         get_term_elapsed / 20_000,
+        get_term_into_elapsed / 20_000,
         remove_elapsed / 20_000,
     );
 }

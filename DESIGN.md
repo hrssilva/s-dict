@@ -150,32 +150,21 @@ actually exposes at its lower `raw` layer:
   no insertion-point primitive for absent keys either, only
   present/absent). Every mutating `Dictionary` operation --
   `insert`, `remove`, `split`, `merge_with_neighbor`, and each
-  `insert_batch` block-group -- decodes the affected block(s) into a plain
-  `Vec<(Box<str>, TermId)>`, mutates that Vec, and calls `Block::build` to
-  replace the block wholesale. This is exactly the update procedure design
-  doc §6 prescribes for FST-backed blocks ("enumerate/decode terms into
-  reusable scratch memory... build new minimal FST... atomically
-  replace"), and it's O(block size) either way -- the same complexity
-  class as Stage 1's `Vec::insert` shifting, just via a decode+rebuild
-  pass instead of a memmove.
+  `insert_batch` block-group -- decodes the affected block(s), mutates the
+  result, and calls `Block::build` to replace the block wholesale. This is
+  exactly the update procedure design doc §6 prescribes for FST-backed
+  blocks ("enumerate/decode terms into reusable scratch memory... build
+  new minimal FST... atomically replace"), and it's O(block size) either
+  way -- the same complexity class as Stage 1's `Vec::insert` shifting,
+  just via a decode+rebuild pass instead of a memmove. (Decoding and
+  rebuilding used a `Vec<(Box<str>, TermId)>` scratch buffer originally;
+  see the "Optimization pass" section below for why and how that changed.)
 
-  §6/§10 specifically call for that decode step to use a *reusable*
-  scratch buffer rather than a fresh allocation per rebuild
-  ("rebuilding an FST should use a reusable per-thread scratch arena...
-  the maximum scratch requirement can itself be bounded or amortized").
-  `Dictionary` does this: `entries_scratch: Vec<(Box<str>, TermId)>` is
-  taken via `mem::take` at the start of a mutation, filled by
-  `Block::decode_into` (which clears and reuses its capacity rather than
-  allocating), and handed back immediately after `Block::build` reads it
-  -- before any nested call (e.g. a cascading split) that might also want
-  it. `Block::decode_all()` remains as a plain-allocation convenience
-  wrapper for colder call sites (the "absorbed" side of a merge, and each
-  `insert_batch` group, which is already amortized across many terms).
-
-  Measured, not assumed: this did **not** produce a measurable
-  improvement. The `(block_min=2, block_max=8)` fuzz suite's wall time was
-  unchanged (~1.06s before and after, same test, same machine). A
-  temporary `#[ignore]`d probe (`tests/dictionary.rs`,
+  Measured, not assumed: reusing that scratch buffer's outer `Vec` across
+  calls did **not** produce a measurable improvement on its own. The
+  `(block_min=2, block_max=8)` fuzz suite's wall time was unchanged
+  (~1.06s before and after, same test, same machine). A temporary
+  `#[ignore]`d probe (`tests/dictionary.rs`,
   `perf_probe_default_block_bounds`; run with
   `cargo test --release -- --ignored --nocapture`) doing 20,000 sequential
   inserts then removes at the *default* block bounds (64..=256) measured
@@ -187,27 +176,31 @@ actually exposes at its lower `raw` layer:
   A follow-up probe (`src/block.rs`, `perf_probe_block_rebuild_breakdown`,
   same `--ignored --nocapture` invocation) isolated *where* the ~83µs
   actually goes, at a fixed 160-entry block (the midpoint of the default
-  64..=256 bounds), 5,000 iterations each:
+  64..=256 bounds), 5,000 iterations each. Numbers below are post-
+  "Optimization pass" (see that section); `decode_into` was 11.95µs/op
+  and the per-string clone floor 4.45µs/op before it:
 
   | Step | Cost |
   |---|---:|
-  | `Block::decode_into` (existing block -> `Vec`) | 11.95µs/op |
-  | `Block::build` (fresh `MapBuilder` insert loop + finalize) | **58.79µs/op** |
-  | pure `Box<str>` clone floor (no FST work at all) | 4.45µs/op |
-  | decode + build (~ one `insert`'s rebuild cost) | 70.74µs/op |
+  | `Block::decode_into` (existing block -> arena) | 7.25µs/op |
+  | `Block::build` (fresh `MapBuilder` insert loop + finalize) | **59.59µs/op** |
+  | pure `String` clone floor (no FST work at all) | 5.44µs/op |
+  | decode + build (~ one `insert`'s rebuild cost) | 66.84µs/op |
 
   `Block::build` -- the `fst` crate's own per-key minimization work as
   `MapBuilder::insert` is called once per sorted key, plus finalization --
-  is unambiguously the dominant cost, ~83% of the decode+build total, and
+  is unambiguously the dominant cost, ~89% of the decode+build total, and
   decode+build alone already accounts for essentially all of the ~83µs
   measured end-to-end for a full `Dictionary::insert` (the remainder is
   routing/id-allocation/directory bookkeeping, all much smaller).
-  `decode_into` costs about 2.7x the pure-allocation floor, so some of its
-  cost is genuine FST-walking, but it's a minor contributor next to
-  `Block::build`. This rules out both of the earlier candidate
-  explanations (outer-`Vec` churn, per-string allocation) as the
-  bottleneck -- it's specifically the general-purpose `fst` crate doing
-  real automaton minimization work on every one of a block's keys, on
+  `decode_into` costs about 1.3x the pure-allocation floor now (was 2.7x
+  before the optimization pass), so most of its remaining cost is genuine
+  FST-walking, not allocation -- but it's still a minor contributor next
+  to `Block::build`. Per-entry allocation *was* a real, fixable cost (see
+  "Optimization pass" below, ~40% off `decode_into` alone), but
+  `Block::build`'s minimization work rules out the bigger question this
+  section originally asked: it's specifically the general-purpose `fst`
+  crate doing real automaton work on every one of a block's keys, on
   every single-term mutation, which by construction only gets cheaper by
   rebuilding less often (bigger batches/`insert_batch`, already available)
   or building cheaper (a specialized construction path for small bounded
@@ -312,6 +305,138 @@ term distribution -- not yet the systematic `B` sweep §12 asks for
 (which should also sweep `RESTART_INTERVAL`, now that it visibly matters
 to more than just space), and not yet run against a real RDF corpus
 (§8's other requirement). Both remain open, see below.
+
+### Optimization pass -- Data-Oriented Design (`src/entries_arena.rs`, plus `block.rs`/`front_coded_block.rs`/`dictionary.rs`/`front_coded_dictionary.rs`)
+
+A DoD-focused pass targeting four concrete things: `get_term`'s allocation,
+the scratch/rebuild path's *temporary* allocation, total memory size, and
+right-sizing integer field widths. Each change is measured against the
+same probes used throughout this document, not assumed.
+
+- **`entries_scratch: Vec<(Box<str>, TermId)>` was itself a "pointer-heavy"
+  structure** -- exactly what §10 warns against ("avoid representations
+  resembling `State { Vec<Transition>, Box<State> }`... prefer compact
+  indices and packed arrays"), just one level removed from the FST/DAWG
+  case that section is actually about. Every block rebuild's
+  `decode_into` allocated one `Box<str>` *per term in the block* (up to
+  `block_max`, so up to 256 individual small heap allocations for a
+  single-term insert), even though every one of those terms except the
+  one actually changing was unchanged content being needlessly recopied
+  into a fresh allocation.
+
+  Replaced with [`EntriesArena`] (`src/entries_arena.rs`): a struct-of-
+  arrays scratch buffer -- one contiguous `text: Vec<u8>` holding every
+  term's bytes concatenated, `offsets: Vec<u32>` (CSR-style) marking
+  where each one starts/ends, and `ids: Vec<TermId>`. `decode_into` now
+  just pushes bytes onto `text` (amortized `Vec` growth, no per-entry
+  allocation); rebuilding calls `Block::build`/`FrontCodedBlock::build`
+  with a *borrowing* iterator over `(&str, TermId)` pairs straight out of
+  the arena, so no owned string is ever materialized just to feed a
+  rebuild. `Dictionary`/`FrontCodedDictionary` each keep two arenas
+  (`scratch_a`, `scratch_b`, still `mem::take`n at the start of a
+  mutation and handed back before any nested scratch use, same discipline
+  as before) rather than one, because e.g. an insert needs "the block's
+  existing content" and "that content merged with the new term" alive at
+  once; a plain `merge_into(old, new, out)` free function (arena + sorted
+  slice -> arena) is shared by both the single-insert path (`new` is a
+  one-element slice) and each `insert_batch` group (`new` is the group),
+  which also means batch grouping's `new_entries` no longer allocates a
+  `Box<str>` per genuinely-new term either -- it borrows straight from the
+  caller's `&[&str]` input. `bootstrap` (empty-dictionary initial batch)
+  needed no arena at all once its ids were collected into a plain
+  `Vec<TermId>` first: it builds directly from `unique_terms[start..end]`
+  `&str` slices zipped with those ids.
+
+  Measured (`src/block.rs`, `perf_probe_block_rebuild_breakdown`, same
+  160-entry/5,000-iteration probe as above): `decode_into` dropped from
+  11.95µs/op to **7.25µs/op**, about **40% faster**, bringing it to
+  ~1.3x the pure-allocation floor (was ~2.7x) -- most of what's left is
+  genuine FST-walking, not allocation. `Block::build` itself was
+  unaffected (59.59µs/op, statistically the same as 58.79µs/op before),
+  exactly as expected: its cost was never from entry materialization, it
+  never touched the old `Box<str>`s beyond reading their bytes. Net
+  effect on end-to-end `Dictionary::insert` is real but modest
+  (~66.8µs/op vs ~70.7µs/op decode+build) precisely because `Block::build`
+  dominates and this pass doesn't touch it -- consistent with everything
+  measured earlier in this document.
+
+- **`get_term_into`**: `Dictionary`, `FrontCodedDictionary`, and
+  `PlainDictionary` each gained an inherent `get_term_into(&self, id,
+  buf: &mut Vec<u8>) -> bool` alongside the trait's `get_term`, decoding
+  into a caller-reused buffer instead of allocating a fresh `String`
+  every call (§10's reusable-scratch principle applied to *reads*, not
+  just rebuilds -- a hot loop materializing many terms pays one
+  allocation total instead of one per term). `Block`/`FrontCodedBlock`
+  gained the matching `term_at_into(local_rank, buf: &mut Vec<u8>)`
+  underneath (using `Fst::get_key_into` and the front-coded restart-decode
+  directly into the buffer, respectively); `term_at` is now a thin
+  allocating wrapper over it, not a separate implementation.
+
+  Measured, same-process A/B (`tests/dictionary.rs`,
+  `perf_probe_default_block_bounds`, 20,000 terms, comparing `get_term`
+  and `get_term_into` back-to-back in one run to avoid the cross-session
+  noise noted below): **627ns/op for `get_term` vs. 533ns/op for
+  `get_term_into`, ~15% faster.** Modest, because the FST descent itself
+  dominates the cost and only the one small buffer allocation is being
+  removed -- but real and reproducible within a single process.
+
+  A note on measurement hygiene this pass ran into directly: an *absolute*
+  cross-session comparison (628ns now vs. a previously-recorded 384ns for
+  the same code path) looked like a ~60% regression at first. An A/B
+  reverting the code to the literal old implementation, in the same
+  session, reproduced the *same* ~630ns -- proving the "regression" was
+  session-to-session environmental noise (CPU frequency scaling, system
+  load) on this machine, not a code change. Absolute latency numbers in
+  this document should be read as relative/same-session comparisons,
+  not compared across sessions at face value; the `get_term_into` A/B
+  above is trustworthy specifically because both halves ran in one
+  process.
+
+- **`FrontCodedBlock::prefix_lens: Vec<u32> -> Vec<u16>`.** A shared-
+  prefix length is bounded by a single term's own byte length, never by
+  total block content -- no realistic RDF term is within orders of
+  magnitude of 65535 bytes, so `u16` loses nothing. (`suffix_offsets`
+  stays `u32`: it's a *cumulative* byte offset across the whole block, so
+  it needs headroom for `block_max` terms' worth of bytes, not one term's,
+  and that can realistically exceed 65535 as `block_max` grows in a
+  future `B` sweep.) Also switched `rank`'s hot binary-search-then-decode
+  loop to compare raw bytes (`&[u8]`) instead of validated `str`s --
+  `str`'s `Ord` is already byte-wise lexicographic, so re-validating UTF-8
+  on every comparison was pure overhead never buying anything.
+
+- **`BlockId`/`FrontCodedBlockId`: `u32` -> `NonZeroU32`** (storing slot +
+  1, `BlockId::slot()` subtracting it back out). This doesn't change
+  `BlockId` itself, but it changes `Option<BlockId>` -- via Rust's
+  niche-filling optimization, `Option<NonZeroU32>` is the same size as
+  `NonZeroU32` (4 bytes), whereas `Option<u32>` needs a separate
+  discriminant (8 bytes, rounded to alignment). `id_to_block:
+  Vec<Option<BlockId>>` is sized to the *total term count*, not the block
+  count, so this is the single highest-leverage space change in this
+  pass -- confirmed by a unit test (`block_id_niche_optimization_holds`)
+  asserting `size_of::<Option<BlockId>>() == size_of::<BlockId>()`.
+
+  Measured (`perf_probe_space_and_rebuild_fst_vs_front_coded`, same
+  9,000-term namespace-clustered set as the front-coded-baseline
+  comparison above): FST space dropped from 13.84 to **9.84 bytes/term**;
+  front-coded dropped from 24.07 to **18.07 bytes/term**. Both match
+  arithmetic exactly: FST's drop is `4 bytes x 9000 terms = 36,000 bytes`
+  (the `NonZeroU32` change alone, `size_bytes()`'s `id_to_block` term);
+  front-coded's drop is that same 36,000 bytes *plus* `2 bytes x 9000 =
+  18,000 bytes` from the `prefix_lens` shrink, for 54,000 total -- exactly
+  what both `size_bytes()` implementations report. Lookup numbers moved
+  too: front-coded `get_id` dropped from 291ns/op to 231ns/op (the byte-
+  comparison change); insert/`get_term` numbers on this dataset are noted
+  but, per the measurement-hygiene point above, not cross-session-
+  comparable to the earlier table without a same-session A/B, which
+  wasn't rerun for every metric here.
+
+None of this touched the *architectural* decisions from earlier sections
+(block rebuild triggers, split/merge thresholds, Variant A reverse
+mapping, the `fst` crate as F_b's base representation) -- it's entirely
+about the DoD shape of scratch/temporary data and field widths, and the
+correctness net (the 3-way differential fuzz suite, extended with a
+`block_id_niche_optimization_holds`-style assertion per type) passed
+clean on the first full rewrite.
 
 ## What's not implemented yet
 

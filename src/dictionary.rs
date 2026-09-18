@@ -1,12 +1,32 @@
+use std::num::NonZeroU32;
+
 use crate::block::Block;
+use crate::entries_arena::{EntriesArena, merge_into};
 use crate::{TermDictionary, TermId};
 
 /// A stable handle for a block: an index into `Dictionary`'s block slab.
 /// Stays valid across splits/merges of *other* blocks (design doc §10
 /// "stable integer handles... physical movement caused by compaction
-/// should not invalidate logical references").
+/// should not invalidate logical references"). Wraps a `NonZeroU32`
+/// storing the slot index plus one, rather than a plain `u32`, so that
+/// `Option<BlockId>` -- as used throughout `id_to_block`, which is sized
+/// to the total term count rather than the block count -- costs 4 bytes
+/// via Rust's niche-filling optimization instead of 8.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct BlockId(u32);
+pub struct BlockId(NonZeroU32);
+
+impl BlockId {
+    fn from_slot(slot: u32) -> BlockId {
+        BlockId(
+            NonZeroU32::new(slot + 1)
+                .expect("slot + 1 does not overflow u32 for realistic block counts"),
+        )
+    }
+
+    fn slot(self) -> u32 {
+        self.0.get() - 1
+    }
+}
 
 const DEFAULT_BLOCK_MIN: usize = 64;
 const DEFAULT_BLOCK_MAX: usize = 256;
@@ -19,11 +39,11 @@ const DEFAULT_BLOCK_MAX: usize = 256;
 ///
 /// Since a block's FST is immutable, every mutation (`insert`, `remove`,
 /// `split`, `merge_with_neighbor`, batch grouping) follows the same shape:
-/// decode the affected block(s) to a plain sorted `Vec`, mutate that Vec,
-/// and call [`Block::build`] to replace the block wholesale (design doc
-/// §6). This is O(block size) either way, same as Stage 1's `Vec::insert`
-/// shifting was -- just with a different constant factor, which is exactly
-/// what H2 asks to measure.
+/// decode the affected block(s) into an [`EntriesArena`] scratch buffer,
+/// mutate that, and call [`Block::build`] to replace the block wholesale
+/// (design doc §6). This is O(block size) either way, same as Stage 1's
+/// `Vec::insert` shifting was -- just with a different constant factor,
+/// which is exactly what H2 asks to measure.
 #[derive(Debug)]
 pub struct Dictionary {
     blocks: Vec<Option<Block>>,
@@ -41,14 +61,18 @@ pub struct Dictionary {
     block_min: usize,
     block_max: usize,
     len: usize,
-    /// Reusable scratch buffer for decode-mutate-rebuild block updates
-    /// (design doc §6/§10). Taken out via `mem::take` at the start of a
-    /// mutation, cleared and handed back as soon as its content is no
+    /// Two reusable scratch arenas for decode-mutate-rebuild block
+    /// updates (design doc §6/§10). Taken out via `mem::take` at the
+    /// start of a mutation and handed back as soon as their content is no
     /// longer needed (and always before any call that might itself want
-    /// the scratch buffer, e.g. a cascading split) -- so its backing
-    /// allocation is reused across the whole sequence of single-term
+    /// scratch space, e.g. a cascading split) -- so their backing byte
+    /// buffers are reused across the whole sequence of single-term
     /// inserts/removes instead of being freed and reallocated every time.
-    entries_scratch: Vec<(Box<str>, TermId)>,
+    /// Two, not one, because e.g. an insert needs both "the block's
+    /// existing content" and "that content merged with the new term" live
+    /// at once.
+    scratch_a: EntriesArena,
+    scratch_b: EntriesArena,
 }
 
 impl Default for Dictionary {
@@ -84,7 +108,8 @@ impl Dictionary {
             block_min,
             block_max,
             len: 0,
-            entries_scratch: Vec::new(),
+            scratch_a: EntriesArena::new(),
+            scratch_b: EntriesArena::new(),
         }
     }
 
@@ -115,14 +140,35 @@ impl Dictionary {
         blocks_bytes + directory_bytes + id_to_block_bytes
     }
 
+    /// Like [`TermDictionary::get_term`], but decodes into a caller-
+    /// provided, reused byte buffer instead of allocating a fresh
+    /// `String` every call -- for hot loops materializing many terms
+    /// (design doc §10 reusable scratch, applied to reads as well as
+    /// rebuilds). `buf` is cleared first. Returns `false` (leaving `buf`
+    /// empty) if `id` isn't present; otherwise `buf` holds the term's
+    /// UTF-8 bytes, interpreted via `std::str::from_utf8` (no
+    /// allocation) rather than returned as a `String`.
+    pub fn get_term_into(&self, id: TermId, buf: &mut Vec<u8>) -> bool {
+        buf.clear();
+        let Some(block_id) = self.id_to_block.get(id.0 as usize).and_then(|b| *b) else {
+            return false;
+        };
+        let block = self.block(block_id);
+        let Some(local_rank) = block.local_rank_of(id) else {
+            return false;
+        };
+        block.term_at_into(local_rank, buf);
+        true
+    }
+
     fn block(&self, id: BlockId) -> &Block {
-        self.blocks[id.0 as usize]
+        self.blocks[id.slot() as usize]
             .as_ref()
             .expect("BlockId must reference a live block")
     }
 
     fn block_mut(&mut self, id: BlockId) -> &mut Block {
-        self.blocks[id.0 as usize]
+        self.blocks[id.slot() as usize]
             .as_mut()
             .expect("BlockId must reference a live block")
     }
@@ -131,12 +177,12 @@ impl Dictionary {
         match self.free_block_slots.pop() {
             Some(slot) => {
                 self.blocks[slot as usize] = Some(block);
-                BlockId(slot)
+                BlockId::from_slot(slot)
             }
             None => {
-                let id = BlockId(self.blocks.len() as u32);
+                let slot = self.blocks.len() as u32;
                 self.blocks.push(Some(block));
-                id
+                BlockId::from_slot(slot)
             }
         }
     }
@@ -190,17 +236,17 @@ impl Dictionary {
     /// inserting a new directory entry for the right half (design doc §7).
     fn split(&mut self, dir_idx: usize) {
         let block_id = self.directory[dir_idx].1;
-        let mut entries = std::mem::take(&mut self.entries_scratch);
-        self.block(block_id).decode_into(&mut entries);
-        let mid = entries.len() / 2;
+        let mut arena = std::mem::take(&mut self.scratch_a);
+        arena.clear();
+        self.block(block_id).decode_into(&mut arena);
+        let mid = arena.len() / 2;
 
-        let left_block = Block::build(&entries[..mid]);
-        let right_block = Block::build(&entries[mid..]);
+        let left_block = Block::build(arena.range(0, mid));
+        let right_block = Block::build(arena.range(mid, arena.len()));
         let right_min: Box<str> = right_block.min_key().into();
-        let moved_ids: Vec<TermId> = entries[mid..].iter().map(|(_, id)| *id).collect();
+        let moved_ids: Vec<TermId> = (mid..arena.len()).map(|i| arena.id_at(i)).collect();
 
-        entries.clear();
-        self.entries_scratch = entries;
+        self.scratch_a = arena;
 
         *self.block_mut(block_id) = left_block;
         let right_block_id = self.alloc_block(right_block);
@@ -215,8 +261,8 @@ impl Dictionary {
     /// slot. Routing falls through to the predecessor block automatically.
     fn remove_empty_block(&mut self, dir_idx: usize) {
         let (_, block_id) = self.directory.remove(dir_idx);
-        self.blocks[block_id.0 as usize] = None;
-        self.free_block_slots.push(block_id.0);
+        self.blocks[block_id.slot() as usize] = None;
+        self.free_block_slots.push(block_id.slot());
     }
 
     /// Absorbs the underflowing block at `dir_idx` into a lexically
@@ -236,25 +282,28 @@ impl Dictionary {
         let absorb_block_id = self.directory[absorb_idx].1;
 
         // Blocks partition sorted space contiguously and keep_idx < absorb_idx,
-        // so `keep`'s entries are already all lexically smaller: a plain
-        // concatenation stays sorted, no merge needed.
-        let mut entries = std::mem::take(&mut self.entries_scratch);
-        self.block(keep_block_id).decode_into(&mut entries);
-        let absorbed_entries = self.block(absorb_block_id).decode_all();
-        let absorbed_ids: Vec<TermId> = absorbed_entries.iter().map(|(_, id)| *id).collect();
-        entries.extend(absorbed_entries);
+        // so `keep`'s entries are already all lexically smaller: decoding
+        // both into the same arena back-to-back (no clear in between)
+        // concatenates them in sorted order for free.
+        let mut arena = std::mem::take(&mut self.scratch_a);
+        arena.clear();
+        self.block(keep_block_id).decode_into(&mut arena);
+        let absorbed_start = arena.len();
+        self.block(absorb_block_id).decode_into(&mut arena);
+        let absorbed_ids: Vec<TermId> = (absorbed_start..arena.len())
+            .map(|i| arena.id_at(i))
+            .collect();
 
-        let rebuilt = Block::build(&entries);
-        entries.clear();
-        self.entries_scratch = entries;
+        let rebuilt = Block::build(arena.iter());
+        self.scratch_a = arena;
 
         *self.block_mut(keep_block_id) = rebuilt;
         for id in absorbed_ids {
             self.set_id_to_block(id, keep_block_id);
         }
 
-        self.blocks[absorb_block_id.0 as usize] = None;
-        self.free_block_slots.push(absorb_block_id.0);
+        self.blocks[absorb_block_id.slot() as usize] = None;
+        self.free_block_slots.push(absorb_block_id.slot());
         self.directory.remove(absorb_idx);
 
         self.split_while_oversized(keep_idx);
@@ -280,64 +329,31 @@ impl Dictionary {
             let size = base + if chunk_idx < extra { 1 } else { 0 };
             let end = start + size;
 
-            let mut chunk_entries: Vec<(Box<str>, TermId)> = Vec::with_capacity(end - start);
-            for (offset, &term) in unique_terms[start..end].iter().enumerate() {
+            let mut chunk_ids: Vec<TermId> = Vec::with_capacity(end - start);
+            for offset in 0..(end - start) {
                 let id = self.alloc_term_id();
-                chunk_entries.push((term.into(), id));
+                chunk_ids.push(id);
                 for &pos in &positions[start + offset] {
                     result[pos] = id;
                 }
             }
 
-            let block = Block::build(&chunk_entries);
+            let block = Block::build(
+                unique_terms[start..end]
+                    .iter()
+                    .copied()
+                    .zip(chunk_ids.iter().copied()),
+            );
             let min_key: Box<str> = block.min_key().into();
             let block_id = self.alloc_block(block);
-            for (_, id) in &chunk_entries {
-                self.set_id_to_block(*id, block_id);
+            for &id in &chunk_ids {
+                self.set_id_to_block(id, block_id);
             }
             self.directory.push((min_key, block_id));
             self.len += end - start;
             start = end;
         }
     }
-}
-
-/// Merges two sorted, mutually disjoint `(term, id)` lists into one sorted
-/// list in a single linear pass, instead of resorting the concatenation.
-fn merge_sorted_entries(
-    old: Vec<(Box<str>, TermId)>,
-    new: Vec<(Box<str>, TermId)>,
-) -> Vec<(Box<str>, TermId)> {
-    let mut merged = Vec::with_capacity(old.len() + new.len());
-    let mut old_iter = old.into_iter();
-    let mut new_iter = new.into_iter();
-    let mut old_next = old_iter.next();
-    let mut new_next = new_iter.next();
-
-    loop {
-        match (&old_next, &new_next) {
-            (Some((ot, _)), Some((nt, _))) => {
-                if ot.as_ref() <= nt.as_ref() {
-                    merged.push(old_next.take().unwrap());
-                    old_next = old_iter.next();
-                } else {
-                    merged.push(new_next.take().unwrap());
-                    new_next = new_iter.next();
-                }
-            }
-            (Some(_), None) => {
-                merged.push(old_next.take().unwrap());
-                old_next = old_iter.next();
-            }
-            (None, Some(_)) => {
-                merged.push(new_next.take().unwrap());
-                new_next = new_iter.next();
-            }
-            (None, None) => break,
-        }
-    }
-
-    merged
 }
 
 impl TermDictionary for Dictionary {
@@ -358,7 +374,7 @@ impl TermDictionary for Dictionary {
     fn insert(&mut self, term: &str) -> TermId {
         if self.directory.is_empty() {
             let id = self.alloc_term_id();
-            let block = Block::build(&[(term.into(), id)]);
+            let block = Block::build(std::iter::once((term, id)));
             let block_id = self.alloc_block(block);
             self.directory.push((term.into(), block_id));
             self.set_id_to_block(id, block_id);
@@ -374,17 +390,21 @@ impl TermDictionary for Dictionary {
         }
 
         let id = self.alloc_term_id();
-        let mut entries = std::mem::take(&mut self.entries_scratch);
-        self.block(block_id).decode_into(&mut entries);
-        let insert_at = entries.partition_point(|(t, _)| t.as_ref() < term);
-        entries.insert(insert_at, (term.into(), id));
 
-        let rebuilt = Block::build(&entries);
-        entries.clear();
-        self.entries_scratch = entries;
+        let mut old = std::mem::take(&mut self.scratch_a);
+        old.clear();
+        self.block(block_id).decode_into(&mut old);
 
+        let mut merged = std::mem::take(&mut self.scratch_b);
+        merge_into(&old, &[(term, id)], &mut merged);
+
+        let rebuilt = Block::build(merged.iter());
         self.directory[dir_idx].0 = rebuilt.min_key().into();
         *self.block_mut(block_id) = rebuilt;
+
+        self.scratch_a = old;
+        self.scratch_b = merged;
+
         self.set_id_to_block(id, block_id);
         self.len += 1;
         self.split_while_oversized(dir_idx);
@@ -434,7 +454,7 @@ impl TermDictionary for Dictionary {
             }
 
             let block_id = self.directory[dir_idx].1;
-            let mut new_entries: Vec<(Box<str>, TermId)> = Vec::new();
+            let mut new_entries: Vec<(&str, TermId)> = Vec::new();
             for k in u..run_end {
                 let term = unique_terms[k];
                 match self.block(block_id).rank(term) {
@@ -449,19 +469,28 @@ impl TermDictionary for Dictionary {
                         for &pos in &positions[k] {
                             result[pos] = id;
                         }
-                        new_entries.push((term.into(), id));
+                        new_entries.push((term, id));
                     }
                 }
             }
 
             if !new_entries.is_empty() {
                 let added = new_entries.len();
-                let old_entries = self.block(block_id).decode_all();
-                let merged = merge_sorted_entries(old_entries, new_entries);
 
-                let rebuilt = Block::build(&merged);
+                let mut old = std::mem::take(&mut self.scratch_a);
+                old.clear();
+                self.block(block_id).decode_into(&mut old);
+
+                let mut merged = std::mem::take(&mut self.scratch_b);
+                merge_into(&old, &new_entries, &mut merged);
+
+                let rebuilt = Block::build(merged.iter());
                 self.directory[dir_idx].0 = rebuilt.min_key().into();
                 *self.block_mut(block_id) = rebuilt;
+
+                self.scratch_a = old;
+                self.scratch_b = merged;
+
                 self.len += added;
                 self.split_while_oversized(dir_idx);
             }
@@ -478,26 +507,35 @@ impl TermDictionary for Dictionary {
         let local_rank = self.block(block_id).rank(term)?;
         let id = self.block(block_id).id_at(local_rank);
 
-        let mut entries = std::mem::take(&mut self.entries_scratch);
-        self.block(block_id).decode_into(&mut entries);
-        entries.remove(local_rank);
+        let mut old = std::mem::take(&mut self.scratch_a);
+        old.clear();
+        self.block(block_id).decode_into(&mut old);
 
         self.id_to_block[id.0 as usize] = None;
         self.free_term_ids.push(id.0);
         self.len -= 1;
 
-        if entries.is_empty() {
-            entries.clear();
-            self.entries_scratch = entries;
+        if old.len() == 1 {
+            // The only entry was the one just removed.
+            self.scratch_a = old;
             self.remove_empty_block(dir_idx);
         } else {
-            let rebuilt = Block::build(&entries);
-            entries.clear();
-            self.entries_scratch = entries;
+            let mut filtered = std::mem::take(&mut self.scratch_b);
+            filtered.clear();
+            for i in 0..old.len() {
+                if i != local_rank {
+                    filtered.push(old.term_at(i), old.id_at(i));
+                }
+            }
 
+            let rebuilt = Block::build(filtered.iter());
             self.directory[dir_idx].0 = rebuilt.min_key().into();
             let remaining = rebuilt.len();
             *self.block_mut(block_id) = rebuilt;
+
+            self.scratch_a = old;
+            self.scratch_b = filtered;
+
             if remaining < self.block_min {
                 self.merge_with_neighbor(dir_idx);
             }
@@ -529,6 +567,20 @@ mod tests {
         let id = dict.insert("http://example.org/a");
         assert_eq!(dict.get_term(id).as_deref(), Some("http://example.org/a"));
         assert_eq!(dict.get_id("http://example.org/a"), Some(id));
+    }
+
+    #[test]
+    fn get_term_into_matches_get_term() {
+        let mut dict = Dictionary::with_block_bounds(2, 8);
+        let id = dict.insert("http://example.org/a");
+        let mut buf = Vec::new();
+        assert!(dict.get_term_into(id, &mut buf));
+        assert_eq!(std::str::from_utf8(&buf).unwrap(), "http://example.org/a");
+
+        let missing = TermId(9999);
+        buf.clear();
+        assert!(!dict.get_term_into(missing, &mut buf));
+        assert!(buf.is_empty());
     }
 
     #[test]
@@ -616,5 +668,13 @@ mod tests {
         for t in &term_refs {
             assert!(dict.get_id(t).is_some());
         }
+    }
+
+    #[test]
+    fn block_id_niche_optimization_holds() {
+        assert_eq!(
+            std::mem::size_of::<Option<BlockId>>(),
+            std::mem::size_of::<BlockId>()
+        );
     }
 }

@@ -21,6 +21,7 @@
 
 mod block;
 mod dictionary;
+mod entries_arena;
 mod front_coded_block;
 mod front_coded_dictionary;
 mod plain;
