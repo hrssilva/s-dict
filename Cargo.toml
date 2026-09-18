@@ -6,3 +6,12 @@ license = "MIT"
 description = "A dynamic, incrementally mutable bidirectional RDF term <-> TermId dictionary, built from macro-dynamic lexical blocks over micro-static per-block indexes."
 
 [dependencies]
+# The per-block "micro-FST": a minimal acyclic finite-state transducer over
+# each block's sorted term set (design doc Stage 3, §2-3). Off-the-shelf
+# rather than a hand-rolled Daciuk-style incremental automaton, per the
+# doc's own optimization discipline (§11) -- measure with a well-tested
+# general FST first, only build a custom augmented automaton later if
+# profiling shows it's worth it (its lack of a native rank-preserving
+# unranking primitive is exactly the kind of thing to measure before
+# building around).
+fst = "0.4"

@@ -12,22 +12,36 @@ IRIs/literals get dictionary-encoded into the `u32` ids `s-graph` expects.
 
 ## Status
 
-This crate currently implements the first two stages of a larger design
-(see [DESIGN.md](DESIGN.md) for the full architecture, roadmap, and
-literature grounding):
+This crate currently implements Stages 0, 1, and 3 of a larger design,
+plus one of the required §13 comparison baselines (see [DESIGN.md](DESIGN.md)
+for the full architecture, roadmap, and literature grounding):
 
 - **`PlainDictionary`** -- a plain `HashMap`/`Vec` baseline. Kept
   permanently as the comparison point later stages get measured against,
   not a throwaway.
 - **`Dictionary`** -- lexical blocks with a sorted-array router and
-  split/merge on overflow/underflow. This is the crate's primary,
-  general-purpose implementation.
+  split/merge on overflow/underflow, where each block's forward index is a
+  minimal per-block FST (via the [`fst`](https://docs.rs/fst) crate) --
+  the "micro-FST" the overall architecture is named for, with true
+  O(term length) rank *and* select (via `fst`'s `raw::Fst::get_key`, not
+  a linear scan). This is the crate's primary, general-purpose
+  implementation.
+- **`FrontCodedDictionary`** -- the same block/router/split-merge
+  structure, but each block is shared-prefix delta-coded with restart
+  points instead of an FST. Exists specifically to isolate what automaton
+  minimization buys over blocking + prefix compression alone (design doc
+  §8). Measured against `Dictionary` on 9,000 namespace-clustered terms:
+  the FST is ~1.74x more space-efficient (13.84 vs 24.07 bytes/term), but
+  front coding is ~6.4x faster to rebuild per insert (91.1µs vs 14.1µs)
+  *and* faster at both lookup directions (`get_id` ~1.2x, `get_term`
+  ~3.5x) at this block size -- see DESIGN.md for the full comparison,
+  why the lookup result is the more surprising one, and how to reproduce
+  it.
 
-Per-block finite-state compression (the "micro-FST" the overall
-architecture is named for), a non-trivial router, RDF-aware term
-decomposition, and the full multi-baseline benchmark suite are explicit
-future stages, not yet implemented -- see DESIGN.md's "What's not
-implemented yet".
+A non-trivial router, RDF-aware term decomposition, and the remaining §13
+baselines (global static minimal FST, dynamic compact tries, global FST +
+compressed permutation) are explicit future stages, not yet implemented --
+see DESIGN.md's "What's not implemented yet".
 
 ## Install
 
@@ -36,7 +50,8 @@ implemented yet".
 s-dict = { path = "../s-dict" }  # or a git dependency, once published
 ```
 
-No optional features and no dependencies at this stage.
+One dependency: [`fst`](https://docs.rs/fst), for each block's per-term
+finite-state map.
 
 ## Quick start
 
@@ -51,9 +66,13 @@ let class_id = dict.insert("http://www.w3.org/2000/01/rdf-schema#Class");
 // Idempotent: re-inserting an existing term returns its existing id.
 assert_eq!(dict.insert("http://www.w3.org/1999/02/22-rdf-syntax-ns#type"), type_id);
 
-// Bidirectional lookup.
+// Bidirectional lookup. get_term returns an owned String: a term decoded
+// from a block's FST can't be borrowed past the call (see DESIGN.md).
 assert_eq!(dict.get_id("http://www.w3.org/2000/01/rdf-schema#Class"), Some(class_id));
-assert_eq!(dict.get_term(class_id), Some("http://www.w3.org/2000/01/rdf-schema#Class"));
+assert_eq!(
+    dict.get_term(class_id).as_deref(),
+    Some("http://www.w3.org/2000/01/rdf-schema#Class")
+);
 
 // Batch insertion groups new terms by destination block instead of
 // rebuilding a block once per term.
@@ -77,10 +96,17 @@ constant -- see DESIGN.md §12 for why.
 - `src/plain.rs` -- `PlainDictionary` (Stage 0 / permanent plain baseline).
 - `src/dictionary.rs` -- `Dictionary` (Stage 1: lexical blocks, router,
   split/merge).
-- `src/block.rs` -- the per-block sorted-array structure both consume.
-- `tests/dictionary.rs` -- differential fuzz testing of `Dictionary`
-  against `PlainDictionary` as an oracle, across several block-size
-  configurations chosen to force splits and merges.
+- `src/block.rs` -- the per-block micro-FST (Stage 3): builds, decodes,
+  and queries each block's `fst::Map`.
+- `src/front_coded_dictionary.rs`, `src/front_coded_block.rs` --
+  `FrontCodedDictionary`, the §13 front-coded-blocks baseline: the same
+  macro structure as `Dictionary`, with shared-prefix delta coding
+  instead of an FST.
+- `tests/dictionary.rs` -- differential fuzz testing of `Dictionary` and
+  `FrontCodedDictionary` against `PlainDictionary` as an oracle, in
+  lockstep, across several block-size configurations chosen to force
+  splits and merges; plus `#[ignore]`d perf/space probes (run with
+  `cargo test --release -- --ignored --nocapture`).
 
 ## Testing
 

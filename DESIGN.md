@@ -35,13 +35,13 @@ For a block `b` with sorted terms `(s_0, ..., s_{m-1})`:
 Forward lookup: `term -> block -> rank_b(term) -> P_b[rank] -> TermId`.
 Reverse lookup: `TermId -> block -> local rank -> select_b(rank) -> term`.
 
-`F_b` is eventually meant to be a minimal per-block finite-state
-dictionary (a "micro-FST"), immutable between rebuilds -- Stage 3 in the
-roadmap below. **Not yet implemented**: today `F_b` is a plain sorted
-`Vec<Box<str>>`, searched with binary search. This still gives exact
-rank/select semantics; it just isn't compressed yet.
+`F_b` is a minimal per-block finite-state map (a "micro-FST"), immutable
+between rebuilds -- Stage 3, implemented via the off-the-shelf
+[`fst`](https://docs.rs/fst) crate rather than a hand-rolled Daciuk-style
+incremental automaton (see the Stage 3 section below for what that
+concretely buys and costs).
 
-## What's implemented (Stages 0-1)
+## What's implemented (Stages 0, 1, 3, plus one §13 baseline)
 
 ### Stage 0 -- `PlainDictionary` (`src/plain.rs`)
 
@@ -104,21 +104,236 @@ Both `PlainDictionary` and `Dictionary` implement the shared
 `TermDictionary` trait (`src/lib.rs`), so later stages can be swapped in
 and benchmarked against the same call sites (design doc §13).
 
+### Stage 3 -- micro-FST blocks via the `fst` crate (`src/block.rs`)
+
+Each block's `terms: Vec<Box<str>>` (Stage 1) is replaced by an
+`fst::Map<Vec<u8>>` mapping each sorted term to its local rank as a `u64`,
+plus the same `ids: Vec<TermId>` (`P_b`) as before. A cached `min_key:
+Box<str>` field stores the block's smallest term redundantly, so routing
+and directory maintenance never have to touch the FST (design doc §10:
+separate hot metadata from the compressed cold payload).
+
+The `fst` crate is a well-tested general byte-string FST library. An
+earlier version of this document claimed it had "no native unranking" and
+that getting real `select_b` (§2) would require hand-rolling a custom
+automaton augmented with right-language cardinalities. **That was wrong**,
+caught on review of the design doc's own §2/§3/§6 against what the crate
+actually exposes at its lower `raw` layer:
+
+- **`select_b` is native, not stream-skip.** `Map::as_fst()` exposes the
+  underlying `raw::Fst`, which has `get_key(value: u64) -> Option<Vec<u8>>`
+  (and a buffer-reusing `get_key_into`). Its implementation
+  (`fst-0.4.7/src/raw/mod.rs`) walks from the root and, at each node,
+  takes the *last* outgoing transition whose accumulated output value is
+  `<= remaining value`, subtracts it, and descends -- exactly the
+  right-language-cardinality-guided unranking algorithm §2 asks for
+  ("augmented with right-language cardinalities sufficient to support...
+  `select_b(i)=s_i`"), except the `fst` crate already ships it. Its own
+  doc comment states the precondition plainly: "the values in this FST
+  are not monotonically increasing when sorted lexicographically by key,
+  then this routine has unspecified behavior." Since `Block::build` stores
+  each key's *local rank* as its output value -- which is by construction
+  monotonically increasing in lexicographic key order -- that precondition
+  holds automatically, with no extra bookkeeping required. `Block::term_at`
+  now calls this directly, at O(term length * branching factor per node)
+  instead of the O(local_rank) stream-skip it used before.
+
+  Measured, not assumed: an A/B on the same `perf_probe_default_block_bounds`
+  probe (20,000 terms, default 64..=256 block bounds) gave **2.805µs/op**
+  for the old stream-skip `term_at` vs. **384ns/op** for `get_key` --
+  about **7.3x faster**, and it also cut the differential fuzz suite's
+  wall time from ~1.06s to ~0.68s (that suite calls `get_term` heavily in
+  its lockstep verification, so it was already exercising this path). No
+  custom automaton was needed; the gap was in this crate's usage of the
+  library, not in the library's capabilities.
+- **No incremental mutation.** `fst::Map` is immutable once built (there's
+  no insertion-point primitive for absent keys either, only
+  present/absent). Every mutating `Dictionary` operation --
+  `insert`, `remove`, `split`, `merge_with_neighbor`, and each
+  `insert_batch` block-group -- decodes the affected block(s) into a plain
+  `Vec<(Box<str>, TermId)>`, mutates that Vec, and calls `Block::build` to
+  replace the block wholesale. This is exactly the update procedure design
+  doc §6 prescribes for FST-backed blocks ("enumerate/decode terms into
+  reusable scratch memory... build new minimal FST... atomically
+  replace"), and it's O(block size) either way -- the same complexity
+  class as Stage 1's `Vec::insert` shifting, just via a decode+rebuild
+  pass instead of a memmove.
+
+  §6/§10 specifically call for that decode step to use a *reusable*
+  scratch buffer rather than a fresh allocation per rebuild
+  ("rebuilding an FST should use a reusable per-thread scratch arena...
+  the maximum scratch requirement can itself be bounded or amortized").
+  `Dictionary` does this: `entries_scratch: Vec<(Box<str>, TermId)>` is
+  taken via `mem::take` at the start of a mutation, filled by
+  `Block::decode_into` (which clears and reuses its capacity rather than
+  allocating), and handed back immediately after `Block::build` reads it
+  -- before any nested call (e.g. a cascading split) that might also want
+  it. `Block::decode_all()` remains as a plain-allocation convenience
+  wrapper for colder call sites (the "absorbed" side of a merge, and each
+  `insert_batch` group, which is already amortized across many terms).
+
+  Measured, not assumed: this did **not** produce a measurable
+  improvement. The `(block_min=2, block_max=8)` fuzz suite's wall time was
+  unchanged (~1.06s before and after, same test, same machine). A
+  temporary `#[ignore]`d probe (`tests/dictionary.rs`,
+  `perf_probe_default_block_bounds`; run with
+  `cargo test --release -- --ignored --nocapture`) doing 20,000 sequential
+  inserts then removes at the *default* block bounds (64..=256) measured
+  ~83µs/insert and ~69µs/remove, and an A/B with scratch reuse temporarily
+  disabled on the `insert` hot path measured ~84µs/insert -- within noise
+  of each other. So the outer `Vec`'s allocation churn was never the
+  dominant cost at either block-size regime tried.
+
+  A follow-up probe (`src/block.rs`, `perf_probe_block_rebuild_breakdown`,
+  same `--ignored --nocapture` invocation) isolated *where* the ~83µs
+  actually goes, at a fixed 160-entry block (the midpoint of the default
+  64..=256 bounds), 5,000 iterations each:
+
+  | Step | Cost |
+  |---|---:|
+  | `Block::decode_into` (existing block -> `Vec`) | 11.95µs/op |
+  | `Block::build` (fresh `MapBuilder` insert loop + finalize) | **58.79µs/op** |
+  | pure `Box<str>` clone floor (no FST work at all) | 4.45µs/op |
+  | decode + build (~ one `insert`'s rebuild cost) | 70.74µs/op |
+
+  `Block::build` -- the `fst` crate's own per-key minimization work as
+  `MapBuilder::insert` is called once per sorted key, plus finalization --
+  is unambiguously the dominant cost, ~83% of the decode+build total, and
+  decode+build alone already accounts for essentially all of the ~83µs
+  measured end-to-end for a full `Dictionary::insert` (the remainder is
+  routing/id-allocation/directory bookkeeping, all much smaller).
+  `decode_into` costs about 2.7x the pure-allocation floor, so some of its
+  cost is genuine FST-walking, but it's a minor contributor next to
+  `Block::build`. This rules out both of the earlier candidate
+  explanations (outer-`Vec` churn, per-string allocation) as the
+  bottleneck -- it's specifically the general-purpose `fst` crate doing
+  real automaton minimization work on every one of a block's keys, on
+  every single-term mutation, which by construction only gets cheaper by
+  rebuilding less often (bigger batches/`insert_batch`, already available)
+  or building cheaper (a specialized construction path for small bounded
+  blocks -- the "custom automaton" possibility above), not by touching
+  decode or allocation further.
+
+One API consequence reaches all the way to the crate's public trait:
+`TermDictionary::get_term` now returns `Option<String>` rather than
+`Option<&str>`. `Block::term_at` (via `Fst::get_key`) and `decode_into`
+(via a full stream) both hand back an owned `Vec<u8>`/key slice that has
+to be copied into an owned `String`/`Box<str>` before the function that
+produced it returns -- there's no `&self`-lifetime borrow to hand out
+either way, whether the key comes from a bounded `get_key` descent or a
+`Stream`'s internal buffer. `PlainDictionary::get_term` pays an
+unnecessary allocation it didn't before, purely to keep both
+implementations comparable under one trait (design doc §13); it could
+still return a zero-copy borrow through its own inherent methods if that
+regression ever matters enough to measure.
+
+### Front-coded blocks -- the required §8/§13 baseline (`src/front_coded_block.rs`, `src/front_coded_dictionary.rs`)
+
+§8 poses the actual question this architecture needs to answer, and it
+isn't "can an FST compress RDF strings": *"how much additional
+compression does a minimal finite-state representation obtain over much
+simpler blocked front coding, once both are constrained to the same
+update locality?"* Answering that requires a second compressed block
+representation built the same way, which didn't exist until now --
+`Dictionary` (FST) had nothing to be compared against except the fully
+uncompressed `PlainDictionary`.
+
+`FrontCodedDictionary` is the same macro structure as `Dictionary` --
+identical router, slab, split/merge, `entries_scratch` reuse, batch
+grouping, all duplicated rather than shared behind a generic block
+abstraction (§16 anti-goal: "a highly polymorphic framework of
+interchangeable node objects"; also, sharing machinery between the two
+things being measured against each other risks a bug in the shared part
+masking a real difference) -- with `FrontCodedBlock` in place of the
+FST `Block`. Each sorted term is stored as a delta against its
+predecessor, `(shared_prefix_len, suffix_bytes)`, in plain parallel
+`Vec<u32>`/`Vec<u8>` arrays (§11: no bit-packing yet), with a full string
+stored every `RESTART_INTERVAL = 16` entries (a single fixed constant,
+not yet tuned) so random-access `rank`/`term_at` cost O(RESTART_INTERVAL)
+via a restart-point binary search, not O(block size). `common_prefix_len`
+clamps its raw byte-comparison result back to the nearest UTF-8 char
+boundary before it's used as a slice index -- a real correctness hazard
+this specific technique has and an automaton-based block doesn't, since
+two independently-valid-UTF-8 strings' matching byte span isn't
+guaranteed to end on a codepoint boundary. Verified by adding
+`FrontCodedDictionary` as a third structure (alongside `Dictionary` and
+the `PlainDictionary` oracle) to the existing differential fuzz suite,
+all in lockstep -- it passed clean on the first run, including the
+multibyte-UTF-8 regression test added specifically for the char-boundary
+clamp.
+
+Front coding captures the same shared-*prefix* redundancy an
+automaton does, but not shared *suffixes*/equivalent right-languages,
+and its rebuild is just recomputing prefix deltas -- no minimization
+algorithm. Measured, not assumed (`tests/dictionary.rs`,
+`perf_probe_space_and_rebuild_fst_vs_front_coded`, 9,000 namespace-
+clustered RDF-like terms across 6 real namespaces, default 64..=256
+block bounds, `cargo test --release -- --ignored --nocapture`):
+
+| | FST (`Dictionary`) | Front-coded (`FrontCodedDictionary`) |
+|---|---:|---:|
+| Space | **13.84 bytes/term** | 24.07 bytes/term |
+| Sequential insert (rebuild) | 91.08µs/op | **14.12µs/op** |
+| `get_id` (forward, `rank_b`) | 344ns/op | **291ns/op** |
+| `get_term` (reverse, `select_b`) | 484ns/op | **137ns/op** |
+
+The rebuild/space tradeoff is the clean, decisive one the design doc
+frames block size around: the FST is **~1.74x more space-efficient**,
+front coding is **~6.4x faster to rebuild** -- a real number on each side
+of the "update locality vs. global compression" tension §12 describes,
+instead of an assumption. `size_bytes()` on both types implements the
+same accounting (every live block's compressed payload + `ids` array,
+plus the router `directory` and reverse `id_to_block` directory -- §14's
+explicit requirement not to report compressed-payload size alone), so
+the comparison is apples-to-apples; it does not account for `Vec`
+allocator slack.
+
+The lookup numbers are the more surprising result: front coding isn't
+just cheaper to rebuild, it's also **faster at both lookup directions**
+at this block size (`get_id` ~1.2x, `get_term` ~3.5x) -- despite `get_id`
+walking a genuinely minimized automaton byte-by-byte and `get_term`
+using the same right-language-cardinality-guided `Fst::get_key` descent
+praised above. The design doc's own framing (§2/§3) might suggest an
+automaton should win on lookup speed too, since that's much of its
+stated appeal ("simultaneously serve as... a rank structure; a
+select/unranking structure"); it doesn't, here. The likely reason:
+`Fst::get_key`'s per-node transition scan and `Map::get`'s per-byte
+`find_input` lookup both carry real per-step constant-factor overhead
+(pointer-chasing through the compact node encoding) that a restart-point
+decode -- at most `RESTART_INTERVAL=16` cheap `String::truncate` +
+`push_str` calls, no node/transition indirection at all -- simply
+doesn't pay. This is exactly why §11 says measure before assuming a
+fancier structure is faster, not just smaller: at this specific `(block
+size, RESTART_INTERVAL)` regime, it measurably isn't.
+
+This is one data point at one block-size regime, one fixed
+`RESTART_INTERVAL`, and one (still synthetic, if namespace-clustered)
+term distribution -- not yet the systematic `B` sweep §12 asks for
+(which should also sweep `RESTART_INTERVAL`, now that it visibly matters
+to more than just space), and not yet run against a real RDF corpus
+(§8's other requirement). Both remain open, see below.
+
 ## What's not implemented yet
 
 In the design doc's own stage numbering (§17), this crate currently
-implements Stage 0 and (a slightly pulled-forward) Stage 1. Left for
-later, deliberately, per §11's optimization discipline and §16's
-anti-goals -- do not build compression machinery before measuring whether
-it's needed:
+implements Stage 0, a slightly pulled-forward Stage 1, and Stage 3 (ahead
+of Stage 2, since a router was already needed to make Stage 1 usable at
+all -- see the Stage 1 section above). Left for later, deliberately, per
+§11's optimization discipline and §16's anti-goals -- do not build more
+compression machinery before measuring whether it's needed:
 
 - **Stage 2 proper**: a non-trivial router (Patricia/radix tree, or a
   compact B/B+-tree over separators) if the sorted-array router turns out
   to be a bottleneck at large block counts. Not assumed necessary yet
   (§4: "do not assume which router is best before measurement").
-- **Stage 3**: replace each block's plain sorted `Vec<Box<str>>` with a
-  minimal DAFSA/FST supporting rank and select -- the actual "micro-FST"
-  the architecture is named for.
+- **A custom automaton**, if a realistic workload ever shows the `fst`
+  crate's full-rebuild-per-mutation cost (see Stage 3 above -- now a
+  measured, explained ~59µs/op minimization cost, not a mystery) is a
+  bottleneck a custom incremental-construction automaton (Daciuk et al.)
+  could avoid by reusing untouched subtrees across rebuilds instead of
+  rebuilding a block from scratch every time. Native rank/select (§2) is
+  *not* a reason to do this anymore -- the `fst` crate already provides
+  both, see Stage 3 above.
 - **Stage 4**: systematic measurement of block size `B` across
   `{32, 64, 128, 256, 512, 1024, 2048, 4096, ...}` (§12), to test **H1**
   (does micro-static compression at moderate `B` approach global-FST
@@ -131,12 +346,14 @@ it's needed:
 - **Stage 7 and beyond**: RDF-aware term decomposition (§9: term-kind
   prefixes, structural typed-literal encoding, language-tag dictionaries,
   blank-node encodings), FSST as an alternative block codec, compressed
-  external-id permutations, SIMD-friendly layouts, the full multi-baseline
-  benchmark suite from §13 (front-coded blocks, a global static minimal
-  FST, `m-Bonsai`/Dynamic-Path-Decomposed-Trie-style dynamic tries, global
-  FST + compressed permutation), and the full measurement suite from §14
-  (bits/term, latency percentiles, cache/branch misses, allocation and
-  peak-memory tracking during rebuilds).
+  external-id permutations, SIMD-friendly layouts, the remaining §13
+  baselines (front-coded blocks is now done, see above; still missing: a
+  global static minimal FST, `m-Bonsai`/Dynamic-Path-Decomposed-Trie-style
+  dynamic tries, global FST + compressed permutation), and the full
+  measurement suite from §14 (latency percentiles, cache/branch misses,
+  allocation and peak-memory tracking during rebuilds -- bits/term now has
+  one real data point, see above, but not the systematic `B` sweep or a
+  real RDF corpus).
 
 None of this is assumed necessary; each is an explicit hypothesis (§15)
 to test once there's a working Stage 0/1 baseline to measure against and
@@ -156,15 +373,23 @@ that conversation for the full annotated list.
 
 - Daciuk, Mihov, Watson, Watson. *Incremental Construction of Minimal
   Acyclic Finite-State Automata*. CL 26(1), 2000. Lexicographically
-  ordered incremental construction -- directly relevant to Stage 3, since
-  every block rebuild already receives its terms pre-sorted.
+  ordered incremental construction -- the `fst` crate's `MapBuilder`
+  follows this shape directly (it requires strictly increasing sorted
+  keys), which is why every block rebuild already receives its terms
+  pre-sorted from `decode_all`/the batch grouping pass rather than sorting
+  again inside `Block::build`.
 - Carrasco, Forcada. *Incremental Construction and Maintenance of Minimal
   Finite-State Automata*. CL 28(2), 2002. Addition/deletion while
   preserving minimality -- background for why this design deliberately
-  avoids needing that (rebuild the block instead).
+  avoids needing that (rebuild the block instead), and for what a future
+  in-place-mutable per-block automaton would need if the full-rebuild cost
+  (Stage 3 above) turns out to matter.
 - Cognetta, Allauzen, Riley. *On the Compression of Lexicon Transducers*.
-  FSMNLP 2019. Compact static FST encodings -- the Stage 3/6 target once
-  compression is added.
+  FSMNLP 2019. Compact static FST encodings and right-language-count-based
+  rank/select -- describes the general technique that turned out to
+  already be present, in the form needed here, in the `fst` crate's
+  `raw::Fst::get_key` (see Stage 3 above); the reference point if a more
+  compact custom encoding is ever built to replace it.
 - Brisaboa, Cerdeira-Pena, de Bernardo, Navarro. *Improved Compressed
   String Dictionaries*. 2019. Hierarchical front coding over URI/RDF
   literal collections -- the required Stage-7-era baseline (§13).
@@ -185,5 +410,6 @@ that conversation for the full annotated list.
   evaluated as a §13 baseline.
 - Acton. *Data-Oriented Design and C++*. CppCon 2014. Fabian. *Data-
   Oriented Design*. 2018. The methodology behind the slab/stable-handle
-  choices in `Dictionary` (§10): compact arrays and stable integer handles
-  now, contiguous packed state/transition arrays once Stage 3 exists.
+  choices in `Dictionary` and the cached `min_key` field on `Block`
+  (§10): compact arrays and stable integer handles, hot routing metadata
+  kept separate from the compressed cold FST payload.

@@ -18,6 +18,33 @@ impl PlainDictionary {
     pub fn new() -> Self {
         Self::default()
     }
+
+    /// Total logical byte size, on the same "compressed-payload +
+    /// metadata" accounting as [`crate::Dictionary::size_bytes`] and
+    /// [`crate::FrontCodedDictionary::size_bytes`] -- see their docs for
+    /// exactly what's included, so all three are directly comparable.
+    /// Unlike the blocked dictionaries, `PlainDictionary` genuinely stores
+    /// each term's bytes twice (once as a `HashMap` key, once in the
+    /// dense reverse `Vec`), which this reflects rather than hides -- a
+    /// real, honest part of why it's expected to be the least
+    /// space-efficient baseline. Does not account for `HashMap`/`Vec`
+    /// allocator slack or bucket/control-byte overhead.
+    pub fn size_bytes(&self) -> usize {
+        let forward_bytes: usize = self
+            .forward
+            .keys()
+            .map(|key| key.len() + std::mem::size_of::<TermId>())
+            .sum();
+        let reverse_bytes = self.reverse.len() * std::mem::size_of::<Option<Box<str>>>()
+            + self
+                .reverse
+                .iter()
+                .filter_map(|s| s.as_ref())
+                .map(|s| s.len())
+                .sum::<usize>();
+        let free_ids_bytes = self.free_ids.len() * std::mem::size_of::<u32>();
+        forward_bytes + reverse_bytes + free_ids_bytes
+    }
 }
 
 impl TermDictionary for PlainDictionary {
@@ -25,8 +52,11 @@ impl TermDictionary for PlainDictionary {
         self.forward.get(term).copied()
     }
 
-    fn get_term(&self, id: TermId) -> Option<&str> {
-        self.reverse.get(id.0 as usize)?.as_deref()
+    fn get_term(&self, id: TermId) -> Option<String> {
+        self.reverse
+            .get(id.0 as usize)?
+            .as_deref()
+            .map(str::to_string)
     }
 
     fn insert(&mut self, term: &str) -> TermId {
@@ -75,7 +105,7 @@ mod tests {
     fn round_trips() {
         let mut dict = PlainDictionary::new();
         let id = dict.insert("http://example.org/a");
-        assert_eq!(dict.get_term(id), Some("http://example.org/a"));
+        assert_eq!(dict.get_term(id).as_deref(), Some("http://example.org/a"));
         assert_eq!(dict.get_id("http://example.org/a"), Some(id));
     }
 
@@ -92,7 +122,7 @@ mod tests {
         dict.remove("a");
         let b = dict.insert("b");
         assert_eq!(a, b);
-        assert_eq!(dict.get_term(b), Some("b"));
+        assert_eq!(dict.get_term(b).as_deref(), Some("b"));
     }
 
     #[test]
@@ -100,5 +130,24 @@ mod tests {
         let dict = PlainDictionary::new();
         assert!(dict.is_empty());
         assert_eq!(dict.get_id("anything"), None);
+    }
+
+    #[test]
+    fn size_bytes_grows_with_content_and_shrinks_on_remove() {
+        let mut dict = PlainDictionary::new();
+        assert_eq!(dict.size_bytes(), 0);
+
+        dict.insert("http://example.org/a");
+        let after_one = dict.size_bytes();
+        assert!(after_one > 0);
+
+        dict.insert("http://example.org/b");
+        assert!(dict.size_bytes() > after_one);
+
+        dict.remove("http://example.org/a");
+        dict.remove("http://example.org/b");
+        // The reverse Vec's slots (now None) still cost their Option<Box<str>>
+        // size; only the string content and forward-map entries are freed.
+        assert!(dict.size_bytes() < after_one);
     }
 }

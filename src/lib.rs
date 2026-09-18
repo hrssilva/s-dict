@@ -10,16 +10,23 @@
 //!
 //! Currently implemented: **Stage 0** ([`PlainDictionary`], a plain
 //! `HashMap`/`Vec` baseline -- also the permanent "plain baseline" other
-//! stages are benchmarked against) and **Stage 1** ([`Dictionary`], lexical
-//! blocks with a sorted-array router and split/merge). Per-block
-//! finite-state compression (the "micro-FST" of the full design) is not
-//! yet implemented; see `DESIGN.md` for the roadmap.
+//! stages are benchmarked against), **Stages 1+3** ([`Dictionary`],
+//! lexical blocks routed by a sorted-array router, split/merged on
+//! overflow/underflow, each block's forward index a minimal per-block FST
+//! via the `fst` crate), and the §13 "front-coded blocks" baseline
+//! ([`FrontCodedDictionary`], the same block/router/split-merge structure
+//! with shared-prefix delta coding instead of an FST, to isolate what
+//! automaton minimization specifically buys over blocking alone). See
+//! `DESIGN.md` for the roadmap and what's still not implemented.
 
 mod block;
 mod dictionary;
+mod front_coded_block;
+mod front_coded_dictionary;
 mod plain;
 
 pub use dictionary::{BlockId, Dictionary};
+pub use front_coded_dictionary::{FrontCodedBlockId, FrontCodedDictionary};
 pub use plain::PlainDictionary;
 
 /// A stable identifier for an RDF term, independent of lexical order.
@@ -38,8 +45,12 @@ pub trait TermDictionary {
     /// Looks up the id of `term`, if present.
     fn get_id(&self, term: &str) -> Option<TermId>;
 
-    /// Looks up the term for `id`, if present.
-    fn get_term(&self, id: TermId) -> Option<&str>;
+    /// Looks up the term for `id`, if present. Owned rather than borrowed:
+    /// an FST-backed block (see [`Dictionary`]) can only decode a term by
+    /// walking its automaton into a scratch buffer, which can't outlive
+    /// the call, so the trait returns `String` uniformly rather than
+    /// letting only some implementations borrow.
+    fn get_term(&self, id: TermId) -> Option<String>;
 
     /// Returns `true` if `term` is present.
     fn contains(&self, term: &str) -> bool {
