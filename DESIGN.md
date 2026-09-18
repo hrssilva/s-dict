@@ -41,7 +41,7 @@ between rebuilds -- Stage 3, implemented via the off-the-shelf
 incremental automaton (see the Stage 3 section below for what that
 concretely buys and costs).
 
-## What's implemented (Stages 0, 1, 3, plus one §13 baseline)
+## What's implemented (Stages 0, 1, 3, 5, plus one §13 baseline)
 
 ### Stage 0 -- `PlainDictionary` (`src/plain.rs`)
 
@@ -431,12 +431,153 @@ same probes used throughout this document, not assumed.
   wasn't rerun for every metric here.
 
 None of this touched the *architectural* decisions from earlier sections
-(block rebuild triggers, split/merge thresholds, Variant A reverse
-mapping, the `fst` crate as F_b's base representation) -- it's entirely
-about the DoD shape of scratch/temporary data and field widths, and the
-correctness net (the 3-way differential fuzz suite, extended with a
-`block_id_niche_optimization_holds`-style assertion per type) passed
-clean on the first full rewrite.
+(block rebuild triggers, split/merge thresholds, the `fst` crate as F_b's
+base representation) -- it's entirely about the DoD shape of scratch/
+temporary data and field widths, and the correctness net (the 3-way
+differential fuzz suite, extended with a `block_id_niche_optimization_holds`-
+style assertion per type) passed clean on the first full rewrite. The one
+architectural piece it left alone, Variant A vs. B reverse mapping (§5),
+is the very next thing this document takes on.
+
+### Stage 5 -- Variant A vs. Variant B reverse mapping, resolved (H3)
+
+§5 poses this as an explicit open question -- don't decide from
+asymptotics, benchmark both -- and by the time the optimization pass
+above landed, the balance of costs had visibly shifted: `select_b`
+(`term_at`/`term_at_into`) went from being the dominant cost in a
+`get_term` call to, for front-coded blocks, one of the *cheaper* parts.
+That made Variant A's O(block size) `local_rank_of` scan (linear over
+`ids`, finding which local rank a `TermId` maps to before `select_b` can
+even run) worth measuring in isolation rather than continuing to assume
+it was noise.
+
+Measured (`perf_probe_local_rank_of` in both `src/block.rs` and
+`src/front_coded_block.rs`, 160-entry block, 800,000 total calls each):
+
+| | `local_rank_of` alone | `local_rank_of` + `term_at_into` | scan's share |
+|---|---:|---:|---:|
+| FST (`Block`) | 33ns/op | 531ns/op | 6.3% |
+| Front-coded (`FrontCodedBlock`) | 29ns/op | 74ns/op | **39.7%** |
+
+For front-coded specifically, the scan is not noise -- it's two-fifths of
+the whole reverse-lookup cost. That settled it: implemented **Variant B**,
+`TermId -> (BlockId, local_rank)` stored directly (`id_to_block:
+Vec<Option<(BlockId, u16)>>`; `local_rank` is `u16` since it's bounded by
+`block_max`, which `with_block_bounds` now asserts fits in `u16::MAX`),
+eliminating the scan for O(1) reverse lookup.
+
+The cost §5 warns about is real and now paid on every rebuild, not just
+the changed entry: since a block rebuild reassigns every surviving
+entry's sorted position, `insert`/`remove`/`split`/`merge_with_neighbor`/
+each `insert_batch` group all now call a shared `assign_ranks` helper
+that walks the *entire* rebuilt block's entries (already available from
+the same arena/iterator used to build it) and rewrites their
+`id_to_block` entries -- O(block size) array writes per rebuild, where
+Variant A only ever touched the one changed id (or, for split/merge, the
+ids that physically moved to a different `BlockId`). The hypothesis
+behind choosing B anyway: this extra write cost is array writes on top
+of a rebuild that already costs tens of microseconds (`Block::build`'s
+FST minimization, per the "Optimization pass" section), so it should be
+comparatively invisible.
+
+Measured, both directions:
+
+- **Reads got faster**, cleanly and consistently. Same-process A/B
+  (`perf_probe_default_block_bounds`, 20,000 terms): `get_term` 627ns ->
+  588ns/op, `get_term_into` 533ns -> 494ns/op -- both dropped by the
+  *same* ~39ns, exactly the scan cost this removed, not a coincidence.
+  On the 9,000-term namespace-clustered set, front-coded `get_term`
+  dropped from 108ns to **73ns/op** (a third of it gone, matching the
+  39.7%-of-cost measurement above); FST `get_term` dropped from 837ns to
+  782ns.
+- **Space regressed, by exactly the predicted amount.** `Option<(BlockId,
+  u16)>` is 8 bytes (confirmed by
+  `id_to_block_entry_niche_optimization_holds`), not the 4 bytes
+  `Option<BlockId>` got from the `NonZeroU32` niche trick -- that saved
+  space is now spent storing `local_rank` instead. FST space went back
+  from 9.84 to **13.84 bytes/term** and front-coded from 18.07 back to
+  **22.07 bytes/term** -- both exactly reverting the `4 bytes x 9000 =
+  36,000 byte` saving the niche optimization produced. This is precisely
+  the tradeoff §5 names ("the reverse directory is smaller" is listed as
+  a Variant A advantage) -- now quantified rather than assumed, and it
+  came due *because* of the niche-optimization pass immediately before
+  it: without `NonZeroU32`, Variant A's `id_to_block` was already paying
+  8 bytes via the `Option<u32>` discriminant, so Variant B's 8 bytes
+  would have looked "free" by comparison. Measuring space before *and*
+  after both changes, in the right order, is what surfaced that this
+  specific tradeoff is real and not an artifact of the optimization pass.
+- **Insert cost moved too**, though this leg wasn't rerun as a clean
+  same-session A/B the way `get_term` was: cross-session, FST insert
+  went from ~88.0 to ~91.9µs/op and front-coded from ~14.4 to ~16.9µs/op
+  on the namespace-clustered set. Consistent in *direction* with paying
+  for `assign_ranks`'s O(block size) writes, but per the measurement-
+  hygiene note above, this document treats it as a plausible-not-confirmed
+  effect size until it's rerun as a same-session A/B -- still tiny next
+  to the tens-of-microseconds rebuild cost either way.
+
+`Block::local_rank_of`/`FrontCodedBlock::local_rank_of` (Variant A) are
+kept, `#[cfg(test)]`-only, purely as the benchmark baseline this
+comparison used and that a future `B`-sweep re-evaluation could reuse --
+not called from production code anymore.
+
+### Hardware counters for `get_term` vs. `get_term_into` (`examples/perf_get_term.rs`)
+
+Everything measured so far used `std::time::Instant` wall-clock deltas.
+Design doc §14 explicitly asks for more: "CPU cycles; instructions;
+L1/L2/LLC misses where available; branch misses" -- not just "is it
+faster" but *why*. `perf stat` gives that, but it measures a whole
+process, and the setup cost (20,000 inserts, tens of microseconds each)
+would otherwise swamp a `get_term`-sized signal. `examples/
+perf_get_term.rs` handles this with a `setup_only` mode -- do the
+identical 20,000-term build, run no loop -- whose counts get subtracted
+from the `get_term`/`get_term_into` runs' totals before dividing by
+operation count, canceling the shared setup cost out of the per-op
+estimate. Reproduce with:
+
+```sh
+cargo build --release --example perf_get_term
+perf stat -e cycles,instructions,cache-references,cache-misses,branches,branch-misses \
+    -- ./target/release/examples/perf_get_term setup_only 400
+perf stat -e cycles,instructions,cache-references,cache-misses,branches,branch-misses \
+    -- ./target/release/examples/perf_get_term get_term 400
+perf stat -e cycles,instructions,cache-references,cache-misses,branches,branch-misses \
+    -- ./target/release/examples/perf_get_term get_term_into 400
+```
+
+Per-op deltas (8,000,000 calls each, `setup_only` subtracted), on the
+same 20,000-term flat dataset as `perf_probe_default_block_bounds`:
+
+| metric | `get_term` | `get_term_into` | reduction |
+|---|---:|---:|---:|
+| cycles | 2475.6 | 2004.4 | 19.0% |
+| instructions | 8243.7 | 7281.4 | 11.7% |
+| cache references | 5.17 | 1.55 | **69.9%** |
+| cache misses | 0.112 | 0.059 | 47.0% |
+| branches | 925.4 | 706.7 | 23.6% |
+| branch misses | 1.88 | 2.79 | -48.7% (worse) |
+
+The cycle counts corroborate the wall-clock numbers directly (2475.6
+cycles at this machine's ~3.85GHz implied clock is ~643ns, matching the
+588-627ns/op range `Instant` measured for `get_term` in the same
+region of this document). But the *cache-references* column is the
+actual explanation, not just confirmation: it drops by 70%, far more
+than any other metric. `get_term` allocates a fresh `Vec<u8>`/`String`
+on every single call -- new heap memory, cold for the allocator's
+bookkeeping and for the data itself; `get_term_into` reuses the same
+buffer across all 8,000,000 calls, keeping it resident and hot. That's
+precisely what "reusable scratch memory" (§10) is supposed to buy, now
+shown at the hardware-counter level rather than asserted from
+first principles.
+
+Not every metric moved in `get_term_into`'s favor: branch misses per op
+are *higher* (1.88 -> 2.79, worse in absolute count, and worse as a rate
+too -- 0.20% -> 0.40% of branches mispredicted), even though total
+branches taken dropped 23.6%. The net cycle count still clearly favors
+`get_term_into`, so this doesn't change the conclusion, but it's a real,
+honestly-reported exception, not everything about the allocation-avoiding
+path is strictly better on every axis -- consistent with this document's
+running theme that measuring beats assuming, including when a change is
+already known to be a net win.
 
 ## What's not implemented yet
 
@@ -463,22 +604,22 @@ compression machinery before measuring whether it's needed:
   `{32, 64, 128, 256, 512, 1024, 2048, 4096, ...}` (§12), to test **H1**
   (does micro-static compression at moderate `B` approach global-FST
   compression, thanks to RDF namespace clustering?).
-- **Stage 5**: Variant A vs. Variant B reverse-mapping evaluation (§5),
-  to test **H3**.
 - **Stage 6**: physical FST layout optimization from profiling (contiguous
   state/transition arrays, separated hot/cold block metadata -- §10),
-  to test **H4**.
+  to test **H4**. (Stage 5, Variant A vs. B reverse-mapping, is now done
+  -- see "Stage 5" above; H3 resolved in Variant B's favor at this block
+  size, with the tradeoff quantified, not just the direction.)
 - **Stage 7 and beyond**: RDF-aware term decomposition (§9: term-kind
   prefixes, structural typed-literal encoding, language-tag dictionaries,
   blank-node encodings), FSST as an alternative block codec, compressed
   external-id permutations, SIMD-friendly layouts, the remaining §13
   baselines (front-coded blocks is now done, see above; still missing: a
   global static minimal FST, `m-Bonsai`/Dynamic-Path-Decomposed-Trie-style
-  dynamic tries, global FST + compressed permutation), and the full
-  measurement suite from §14 (latency percentiles, cache/branch misses,
-  allocation and peak-memory tracking during rebuilds -- bits/term now has
-  one real data point, see above, but not the systematic `B` sweep or a
-  real RDF corpus).
+  dynamic tries, global FST + compressed permutation), and the remaining
+  §14 measurement suite (latency percentiles beyond median, allocation and
+  peak-memory tracking during rebuilds -- bits/term and cache/branch
+  misses now have real data points, see above, but not the systematic `B`
+  sweep or a real RDF corpus).
 
 None of this is assumed necessary; each is an explicit hypothesis (§15)
 to test once there's a working Stage 0/1 baseline to measure against and

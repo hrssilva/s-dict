@@ -31,21 +31,24 @@ for the full architecture, roadmap, and literature grounding):
   points instead of an FST. Exists specifically to isolate what automaton
   minimization buys over blocking + prefix compression alone (design doc
   §8). Measured against `Dictionary` on 9,000 namespace-clustered terms:
-  the FST is ~1.4x more space-efficient (9.84 vs 18.07 bytes/term), but
-  front coding is ~6x faster to rebuild per insert and faster at both
-  lookup directions too at this block size -- see DESIGN.md for the full
-  comparison, why the lookup result is the more surprising one, and how
-  to reproduce it.
+  the FST is ~1.4x more space-efficient (13.84 vs 22.07 bytes/term), but
+  front coding is faster to rebuild per insert and at both lookup
+  directions at this block size -- see DESIGN.md for the full comparison
+  and how to reproduce it.
 
 All three implementations have also been through a Data-Oriented-Design
 optimization pass (DESIGN.md's "Optimization pass" section): a
 struct-of-arrays scratch buffer (`EntriesArena`) replacing a
 `Vec<(Box<str>, TermId)>` that allocated per-term on every block rebuild,
-a buffer-reusing `get_term_into` alongside the allocating `get_term`,
-`u16` instead of `u32` for a field genuinely bounded by a single term's
-length, and a `NonZeroU32`-backed `BlockId` so `Option<BlockId>` costs 4
-bytes instead of 8 via Rust's niche optimization -- each change measured
-before and after, not assumed.
+a buffer-reusing `get_term_into` alongside the allocating `get_term`
+(confirmed with `perf`-measured hardware counters, not just wall clock --
+see DESIGN.md), `u16` instead of `u32` for a field genuinely bounded by a
+single term's length, and a `NonZeroU32`-backed `BlockId` for a niche
+optimization. On top of that, `Dictionary`/`FrontCodedDictionary` both
+moved from design doc §5's Variant A reverse mapping to Variant B
+(`TermId -> (BlockId, local_rank)`, no scan) after measuring both --
+faster reverse lookups, more reverse-directory space, exactly the
+tradeoff §5 names, now with real numbers on each side.
 
 A non-trivial router, RDF-aware term decomposition, and the remaining §13
 baselines (global static minimal FST, dynamic compact tries, global FST +
@@ -126,6 +129,11 @@ constant -- see DESIGN.md §12 for why.
   lockstep, across several block-size configurations chosen to force
   splits and merges; plus `#[ignore]`d perf/space probes (run with
   `cargo test --release -- --ignored --nocapture`).
+- `examples/perf_get_term.rs` -- a dedicated `perf stat` target isolating
+  `get_term`/`get_term_into` from setup cost (via a `setup_only` baseline
+  to subtract), for hardware-counter-level measurement (cycles,
+  instructions, cache/branch misses) beyond what the wall-clock probes
+  show -- see DESIGN.md for how to run it and what it found.
 
 ## Testing
 

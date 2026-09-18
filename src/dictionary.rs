@@ -53,9 +53,12 @@ pub struct Dictionary {
     /// everything below its own min_key too, so no `-inf` sentinel is
     /// needed.
     directory: Vec<(Box<str>, BlockId)>,
-    /// `TermId -> BlockId` (§5 Variant A); local rank is recovered with a
-    /// linear scan of the owning block's id array.
-    id_to_block: Vec<Option<BlockId>>,
+    /// `TermId -> (BlockId, local_rank)` (§5 Variant B, chosen over
+    /// Variant A's `TermId -> BlockId` + linear scan after measuring
+    /// both: see DESIGN.md's "H3" section). `local_rank` is `u16`, not
+    /// `usize`/`u32` -- bounded by `block_max`, which `with_block_bounds`
+    /// asserts stays under `u16::MAX`.
+    id_to_block: Vec<Option<(BlockId, u16)>>,
     free_term_ids: Vec<u32>,
     next_term_id: u32,
     block_min: usize,
@@ -98,6 +101,10 @@ impl Dictionary {
             "block_max must be at least twice block_min, so a split always \
              leaves both halves >= block_min"
         );
+        assert!(
+            block_max <= u16::MAX as usize,
+            "block_max must fit in u16: local ranks in the reverse directory are stored as u16"
+        );
         Dictionary {
             blocks: Vec::new(),
             free_block_slots: Vec::new(),
@@ -136,7 +143,8 @@ impl Dictionary {
             .iter()
             .map(|(key, _)| key.len() + std::mem::size_of::<BlockId>())
             .sum();
-        let id_to_block_bytes = self.id_to_block.len() * std::mem::size_of::<Option<BlockId>>();
+        let id_to_block_bytes =
+            self.id_to_block.len() * std::mem::size_of::<Option<(BlockId, u16)>>();
         blocks_bytes + directory_bytes + id_to_block_bytes
     }
 
@@ -150,14 +158,11 @@ impl Dictionary {
     /// allocation) rather than returned as a `String`.
     pub fn get_term_into(&self, id: TermId, buf: &mut Vec<u8>) -> bool {
         buf.clear();
-        let Some(block_id) = self.id_to_block.get(id.0 as usize).and_then(|b| *b) else {
+        let Some((block_id, local_rank)) = self.id_to_block.get(id.0 as usize).and_then(|e| *e)
+        else {
             return false;
         };
-        let block = self.block(block_id);
-        let Some(local_rank) = block.local_rank_of(id) else {
-            return false;
-        };
-        block.term_at_into(local_rank, buf);
+        self.block(block_id).term_at_into(local_rank as usize, buf);
         true
     }
 
@@ -198,12 +203,32 @@ impl Dictionary {
         }
     }
 
-    fn set_id_to_block(&mut self, id: TermId, block_id: BlockId) {
+    fn set_id_to_block(&mut self, id: TermId, block_id: BlockId, local_rank: usize) {
         let idx = id.0 as usize;
         if idx >= self.id_to_block.len() {
             self.id_to_block.resize(idx + 1, None);
         }
-        self.id_to_block[idx] = Some(block_id);
+        self.id_to_block[idx] = Some((block_id, local_rank as u16));
+    }
+
+    /// Reassigns `TermId -> (block_id, local_rank)` for every entry in
+    /// `entries` (their position in iteration order *is* their new local
+    /// rank). Variant B (§5) pays this on every block rebuild -- every
+    /// insert/remove/split/merge changes the sorted-position local rank
+    /// of every surviving entry in the rebuilt block(s), not just the one
+    /// that changed -- in exchange for O(1) reverse lookup instead of
+    /// Variant A's O(block size) scan. Cost is O(block size) array
+    /// writes, which measurement shows is negligible next to the
+    /// decode+rebuild cost that already dominates every one of these
+    /// call sites (see DESIGN.md's "H3" section).
+    fn assign_ranks<'a>(
+        &mut self,
+        block_id: BlockId,
+        entries: impl Iterator<Item = (&'a str, TermId)>,
+    ) {
+        for (local_rank, (_, id)) in entries.enumerate() {
+            self.set_id_to_block(id, block_id, local_rank);
+        }
     }
 
     /// The directory index of the block that owns (or would own) `term`,
@@ -244,15 +269,15 @@ impl Dictionary {
         let left_block = Block::build(arena.range(0, mid));
         let right_block = Block::build(arena.range(mid, arena.len()));
         let right_min: Box<str> = right_block.min_key().into();
-        let moved_ids: Vec<TermId> = (mid..arena.len()).map(|i| arena.id_at(i)).collect();
+
+        *self.block_mut(block_id) = left_block;
+        self.assign_ranks(block_id, arena.range(0, mid));
+
+        let right_block_id = self.alloc_block(right_block);
+        self.assign_ranks(right_block_id, arena.range(mid, arena.len()));
 
         self.scratch_a = arena;
 
-        *self.block_mut(block_id) = left_block;
-        let right_block_id = self.alloc_block(right_block);
-        for id in moved_ids {
-            self.set_id_to_block(id, right_block_id);
-        }
         self.directory
             .insert(dir_idx + 1, (right_min, right_block_id));
     }
@@ -288,19 +313,16 @@ impl Dictionary {
         let mut arena = std::mem::take(&mut self.scratch_a);
         arena.clear();
         self.block(keep_block_id).decode_into(&mut arena);
-        let absorbed_start = arena.len();
         self.block(absorb_block_id).decode_into(&mut arena);
-        let absorbed_ids: Vec<TermId> = (absorbed_start..arena.len())
-            .map(|i| arena.id_at(i))
-            .collect();
 
         let rebuilt = Block::build(arena.iter());
-        self.scratch_a = arena;
-
         *self.block_mut(keep_block_id) = rebuilt;
-        for id in absorbed_ids {
-            self.set_id_to_block(id, keep_block_id);
-        }
+        // Reassigns every entry, not just the absorbed half: Variant B (§5)
+        // needs the whole rebuilt block's local ranks refreshed, not just
+        // which BlockId owns them.
+        self.assign_ranks(keep_block_id, arena.iter());
+
+        self.scratch_a = arena;
 
         self.blocks[absorb_block_id.slot() as usize] = None;
         self.free_block_slots.push(absorb_block_id.slot());
@@ -346,8 +368,8 @@ impl Dictionary {
             );
             let min_key: Box<str> = block.min_key().into();
             let block_id = self.alloc_block(block);
-            for &id in &chunk_ids {
-                self.set_id_to_block(id, block_id);
+            for (local_rank, &id) in chunk_ids.iter().enumerate() {
+                self.set_id_to_block(id, block_id, local_rank);
             }
             self.directory.push((min_key, block_id));
             self.len += end - start;
@@ -365,10 +387,8 @@ impl TermDictionary for Dictionary {
     }
 
     fn get_term(&self, id: TermId) -> Option<String> {
-        let block_id = self.id_to_block.get(id.0 as usize)?.as_ref().copied()?;
-        let block = self.block(block_id);
-        let local_rank = block.local_rank_of(id)?;
-        Some(block.term_at(local_rank))
+        let (block_id, local_rank) = self.id_to_block.get(id.0 as usize)?.as_ref().copied()?;
+        Some(self.block(block_id).term_at(local_rank as usize))
     }
 
     fn insert(&mut self, term: &str) -> TermId {
@@ -377,7 +397,7 @@ impl TermDictionary for Dictionary {
             let block = Block::build(std::iter::once((term, id)));
             let block_id = self.alloc_block(block);
             self.directory.push((term.into(), block_id));
-            self.set_id_to_block(id, block_id);
+            self.set_id_to_block(id, block_id, 0);
             self.len += 1;
             return id;
         }
@@ -401,11 +421,11 @@ impl TermDictionary for Dictionary {
         let rebuilt = Block::build(merged.iter());
         self.directory[dir_idx].0 = rebuilt.min_key().into();
         *self.block_mut(block_id) = rebuilt;
+        self.assign_ranks(block_id, merged.iter());
 
         self.scratch_a = old;
         self.scratch_b = merged;
 
-        self.set_id_to_block(id, block_id);
         self.len += 1;
         self.split_while_oversized(dir_idx);
         id
@@ -487,6 +507,7 @@ impl TermDictionary for Dictionary {
                 let rebuilt = Block::build(merged.iter());
                 self.directory[dir_idx].0 = rebuilt.min_key().into();
                 *self.block_mut(block_id) = rebuilt;
+                self.assign_ranks(block_id, merged.iter());
 
                 self.scratch_a = old;
                 self.scratch_b = merged;
@@ -532,6 +553,7 @@ impl TermDictionary for Dictionary {
             self.directory[dir_idx].0 = rebuilt.min_key().into();
             let remaining = rebuilt.len();
             *self.block_mut(block_id) = rebuilt;
+            self.assign_ranks(block_id, filtered.iter());
 
             self.scratch_a = old;
             self.scratch_b = filtered;
@@ -676,5 +698,37 @@ mod tests {
             std::mem::size_of::<Option<BlockId>>(),
             std::mem::size_of::<BlockId>()
         );
+    }
+
+    #[test]
+    fn id_to_block_entry_niche_optimization_holds() {
+        // The actual `id_to_block` element type: BlockId's NonZeroU32
+        // niche should still let Option<(BlockId, u16)> avoid a separate
+        // discriminant, landing at 8 bytes (4 + 2, padded) rather than 12.
+        assert_eq!(std::mem::size_of::<Option<(BlockId, u16)>>(), 8);
+    }
+
+    #[test]
+    fn get_id_and_get_term_are_consistent_after_many_splits_and_merges() {
+        // Exercises Variant B's per-rebuild rank reassignment specifically:
+        // insert enough to force several splits, remove enough to force
+        // merges, and confirm every surviving term's id_to_block entry
+        // still points at the right (block, local_rank) throughout.
+        let mut dict = Dictionary::with_block_bounds(2, 8);
+        let terms: Vec<String> = (0..200).map(|i| format!("k{i:04}")).collect();
+        let mut ids = Vec::new();
+        for t in &terms {
+            ids.push(dict.insert(t));
+        }
+        for t in terms.iter().step_by(3) {
+            dict.remove(t);
+        }
+        for (t, &id) in terms.iter().zip(&ids) {
+            let still_present = dict.get_id(t).is_some();
+            if still_present {
+                assert_eq!(dict.get_id(t), Some(id));
+                assert_eq!(dict.get_term(id).as_deref(), Some(t.as_str()));
+            }
+        }
     }
 }

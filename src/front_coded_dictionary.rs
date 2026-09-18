@@ -48,7 +48,10 @@ pub struct FrontCodedDictionary {
     blocks: Vec<Option<FrontCodedBlock>>,
     free_block_slots: Vec<u32>,
     directory: Vec<(Box<str>, FrontCodedBlockId)>,
-    id_to_block: Vec<Option<FrontCodedBlockId>>,
+    /// `TermId -> (FrontCodedBlockId, local_rank)` (§5 Variant B); see
+    /// [`crate::Dictionary`]'s identically-shaped field for the full
+    /// rationale and measurement.
+    id_to_block: Vec<Option<(FrontCodedBlockId, u16)>>,
     free_term_ids: Vec<u32>,
     next_term_id: u32,
     block_min: usize,
@@ -77,6 +80,10 @@ impl FrontCodedDictionary {
             block_max >= 2 * block_min,
             "block_max must be at least twice block_min, so a split always \
              leaves both halves >= block_min"
+        );
+        assert!(
+            block_max <= u16::MAX as usize,
+            "block_max must fit in u16: local ranks in the reverse directory are stored as u16"
         );
         FrontCodedDictionary {
             blocks: Vec::new(),
@@ -114,21 +121,18 @@ impl FrontCodedDictionary {
             .map(|(key, _)| key.len() + std::mem::size_of::<FrontCodedBlockId>())
             .sum();
         let id_to_block_bytes =
-            self.id_to_block.len() * std::mem::size_of::<Option<FrontCodedBlockId>>();
+            self.id_to_block.len() * std::mem::size_of::<Option<(FrontCodedBlockId, u16)>>();
         blocks_bytes + directory_bytes + id_to_block_bytes
     }
 
     /// See [`crate::Dictionary::get_term_into`] -- identical contract.
     pub fn get_term_into(&self, id: TermId, buf: &mut Vec<u8>) -> bool {
         buf.clear();
-        let Some(block_id) = self.id_to_block.get(id.0 as usize).and_then(|b| *b) else {
+        let Some((block_id, local_rank)) = self.id_to_block.get(id.0 as usize).and_then(|e| *e)
+        else {
             return false;
         };
-        let block = self.block(block_id);
-        let Some(local_rank) = block.local_rank_of(id) else {
-            return false;
-        };
-        block.term_at_into(local_rank, buf);
+        self.block(block_id).term_at_into(local_rank as usize, buf);
         true
     }
 
@@ -169,12 +173,23 @@ impl FrontCodedDictionary {
         }
     }
 
-    fn set_id_to_block(&mut self, id: TermId, block_id: FrontCodedBlockId) {
+    fn set_id_to_block(&mut self, id: TermId, block_id: FrontCodedBlockId, local_rank: usize) {
         let idx = id.0 as usize;
         if idx >= self.id_to_block.len() {
             self.id_to_block.resize(idx + 1, None);
         }
-        self.id_to_block[idx] = Some(block_id);
+        self.id_to_block[idx] = Some((block_id, local_rank as u16));
+    }
+
+    /// See [`crate::Dictionary::assign_ranks`] -- identical contract.
+    fn assign_ranks<'a>(
+        &mut self,
+        block_id: FrontCodedBlockId,
+        entries: impl Iterator<Item = (&'a str, TermId)>,
+    ) {
+        for (local_rank, (_, id)) in entries.enumerate() {
+            self.set_id_to_block(id, block_id, local_rank);
+        }
     }
 
     fn route(&self, term: &str) -> Option<usize> {
@@ -209,15 +224,15 @@ impl FrontCodedDictionary {
         let left_block = FrontCodedBlock::build(arena.range(0, mid));
         let right_block = FrontCodedBlock::build(arena.range(mid, arena.len()));
         let right_min: Box<str> = right_block.min_key().into();
-        let moved_ids: Vec<TermId> = (mid..arena.len()).map(|i| arena.id_at(i)).collect();
+
+        *self.block_mut(block_id) = left_block;
+        self.assign_ranks(block_id, arena.range(0, mid));
+
+        let right_block_id = self.alloc_block(right_block);
+        self.assign_ranks(right_block_id, arena.range(mid, arena.len()));
 
         self.scratch_a = arena;
 
-        *self.block_mut(block_id) = left_block;
-        let right_block_id = self.alloc_block(right_block);
-        for id in moved_ids {
-            self.set_id_to_block(id, right_block_id);
-        }
         self.directory
             .insert(dir_idx + 1, (right_min, right_block_id));
     }
@@ -244,19 +259,13 @@ impl FrontCodedDictionary {
         let mut arena = std::mem::take(&mut self.scratch_a);
         arena.clear();
         self.block(keep_block_id).decode_into(&mut arena);
-        let absorbed_start = arena.len();
         self.block(absorb_block_id).decode_into(&mut arena);
-        let absorbed_ids: Vec<TermId> = (absorbed_start..arena.len())
-            .map(|i| arena.id_at(i))
-            .collect();
 
         let rebuilt = FrontCodedBlock::build(arena.iter());
-        self.scratch_a = arena;
-
         *self.block_mut(keep_block_id) = rebuilt;
-        for id in absorbed_ids {
-            self.set_id_to_block(id, keep_block_id);
-        }
+        self.assign_ranks(keep_block_id, arena.iter());
+
+        self.scratch_a = arena;
 
         self.blocks[absorb_block_id.slot() as usize] = None;
         self.free_block_slots.push(absorb_block_id.slot());
@@ -298,8 +307,8 @@ impl FrontCodedDictionary {
             );
             let min_key: Box<str> = block.min_key().into();
             let block_id = self.alloc_block(block);
-            for &id in &chunk_ids {
-                self.set_id_to_block(id, block_id);
+            for (local_rank, &id) in chunk_ids.iter().enumerate() {
+                self.set_id_to_block(id, block_id, local_rank);
             }
             self.directory.push((min_key, block_id));
             self.len += end - start;
@@ -317,10 +326,8 @@ impl TermDictionary for FrontCodedDictionary {
     }
 
     fn get_term(&self, id: TermId) -> Option<String> {
-        let block_id = self.id_to_block.get(id.0 as usize)?.as_ref().copied()?;
-        let block = self.block(block_id);
-        let local_rank = block.local_rank_of(id)?;
-        Some(block.term_at(local_rank))
+        let (block_id, local_rank) = self.id_to_block.get(id.0 as usize)?.as_ref().copied()?;
+        Some(self.block(block_id).term_at(local_rank as usize))
     }
 
     fn insert(&mut self, term: &str) -> TermId {
@@ -329,7 +336,7 @@ impl TermDictionary for FrontCodedDictionary {
             let block = FrontCodedBlock::build(std::iter::once((term, id)));
             let block_id = self.alloc_block(block);
             self.directory.push((term.into(), block_id));
-            self.set_id_to_block(id, block_id);
+            self.set_id_to_block(id, block_id, 0);
             self.len += 1;
             return id;
         }
@@ -353,11 +360,11 @@ impl TermDictionary for FrontCodedDictionary {
         let rebuilt = FrontCodedBlock::build(merged.iter());
         self.directory[dir_idx].0 = rebuilt.min_key().into();
         *self.block_mut(block_id) = rebuilt;
+        self.assign_ranks(block_id, merged.iter());
 
         self.scratch_a = old;
         self.scratch_b = merged;
 
-        self.set_id_to_block(id, block_id);
         self.len += 1;
         self.split_while_oversized(dir_idx);
         id
@@ -437,6 +444,7 @@ impl TermDictionary for FrontCodedDictionary {
                 let rebuilt = FrontCodedBlock::build(merged.iter());
                 self.directory[dir_idx].0 = rebuilt.min_key().into();
                 *self.block_mut(block_id) = rebuilt;
+                self.assign_ranks(block_id, merged.iter());
 
                 self.scratch_a = old;
                 self.scratch_b = merged;
@@ -481,6 +489,7 @@ impl TermDictionary for FrontCodedDictionary {
             self.directory[dir_idx].0 = rebuilt.min_key().into();
             let remaining = rebuilt.len();
             *self.block_mut(block_id) = rebuilt;
+            self.assign_ranks(block_id, filtered.iter());
 
             self.scratch_a = old;
             self.scratch_b = filtered;
@@ -624,5 +633,29 @@ mod tests {
             std::mem::size_of::<Option<FrontCodedBlockId>>(),
             std::mem::size_of::<FrontCodedBlockId>()
         );
+    }
+
+    #[test]
+    fn id_to_block_entry_niche_optimization_holds() {
+        assert_eq!(std::mem::size_of::<Option<(FrontCodedBlockId, u16)>>(), 8);
+    }
+
+    #[test]
+    fn get_id_and_get_term_are_consistent_after_many_splits_and_merges() {
+        let mut dict = FrontCodedDictionary::with_block_bounds(2, 8);
+        let terms: Vec<String> = (0..200).map(|i| format!("k{i:04}")).collect();
+        let mut ids = Vec::new();
+        for t in &terms {
+            ids.push(dict.insert(t));
+        }
+        for t in terms.iter().step_by(3) {
+            dict.remove(t);
+        }
+        for (t, &id) in terms.iter().zip(&ids) {
+            if dict.get_id(t).is_some() {
+                assert_eq!(dict.get_id(t), Some(id));
+                assert_eq!(dict.get_term(id).as_deref(), Some(t.as_str()));
+            }
+        }
     }
 }

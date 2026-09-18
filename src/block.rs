@@ -76,6 +76,13 @@ impl Block {
         self.ids[local_rank]
     }
 
+    /// The design doc §5 Variant A reverse lookup: an O(block size) linear
+    /// scan of `ids`. `Dictionary` no longer calls this in production --
+    /// it moved to Variant B, storing `(BlockId, local_rank)` directly in
+    /// the reverse directory (see `dictionary.rs`) after measuring both.
+    /// Kept, `#[cfg(test)]`-only, purely as the comparison baseline the
+    /// `perf_probe_local_rank_of` benchmark measures against.
+    #[cfg(test)]
     pub(crate) fn local_rank_of(&self, id: TermId) -> Option<usize> {
         self.ids.iter().position(|&x| x == id)
     }
@@ -229,6 +236,53 @@ mod tests {
             build_elapsed / ITERS as u32,
             clone_elapsed / ITERS as u32,
             (decode_elapsed + build_elapsed) / ITERS as u32,
+        );
+    }
+
+    /// Isolates `local_rank_of`'s cost (§5 Variant A's linear scan over
+    /// `ids`) from `term_at_into`'s (the part already optimized to native
+    /// unranking). A `get_term` call pays both in sequence; this measures
+    /// each separately and their sum, to judge whether the scan is worth
+    /// replacing with Variant B (`TermId -> (BlockId, local_rank)`, no
+    /// scan) now that decode itself is cheap.
+    #[test]
+    #[ignore = "manual perf probe, not part of the regular suite"]
+    fn perf_probe_local_rank_of() {
+        const N: usize = 160; // midpoint of the default block bounds, 64..=256
+        const ITERS: usize = 5_000;
+
+        let entries = sample_entries(N);
+        let block = build_from(&entries);
+        let ids: Vec<TermId> = entries.iter().map(|(_, id)| *id).collect();
+
+        let start = Instant::now();
+        for _ in 0..ITERS {
+            for &id in &ids {
+                std::hint::black_box(block.local_rank_of(id));
+            }
+        }
+        let scan_elapsed = start.elapsed();
+
+        let mut buf = Vec::new();
+        let start = Instant::now();
+        for _ in 0..ITERS {
+            for &id in &ids {
+                let rank = block.local_rank_of(id).unwrap();
+                block.term_at_into(rank, &mut buf);
+                std::hint::black_box(&buf);
+            }
+        }
+        let full_elapsed = start.elapsed();
+
+        let total_ops = (ITERS * N) as u32;
+        eprintln!(
+            "block size {N}, {total_ops} total calls:\n\
+             local_rank_of alone:            {scan_elapsed:?} ({:?}/op)\n\
+             local_rank_of + term_at_into:    {full_elapsed:?} ({:?}/op)\n\
+             scan's share of the full cost:   {:.1}%",
+            scan_elapsed / total_ops,
+            full_elapsed / total_ops,
+            100.0 * scan_elapsed.as_secs_f64() / full_elapsed.as_secs_f64(),
         );
     }
 }
