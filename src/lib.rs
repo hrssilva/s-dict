@@ -19,6 +19,7 @@
 //! automaton minimization specifically buys over blocking alone). See
 //! `DESIGN.md` for the roadmap and what's still not implemented.
 
+mod batch;
 mod block;
 mod dictionary;
 mod entries_arena;
@@ -26,6 +27,7 @@ mod front_coded_block;
 mod front_coded_dictionary;
 mod plain;
 
+pub use batch::{PreparedBatch, TermBatch};
 pub use dictionary::{BlockId, Dictionary};
 pub use front_coded_dictionary::{FrontCodedBlockId, FrontCodedDictionary};
 pub use plain::PlainDictionary;

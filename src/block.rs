@@ -52,8 +52,12 @@ impl Block {
     /// §10's "avoid a pointer-heavy... prefer compact arrays" applied to
     /// the rebuild path itself, not just the final representation.
     pub(crate) fn build<'a>(entries: impl ExactSizeIterator<Item = (&'a str, TermId)>) -> Block {
-        let mut builder =
-            MapBuilder::new(Vec::new()).expect("building into an in-memory Vec<u8> cannot fail");
+        // A micro-block needs a much smaller construction cache than the
+        // generic builder's 20,000 cells. Keep the original upper bound for
+        // large blocks; collisions affect compression, never term semantics.
+        let rows = entries.len().saturating_mul(4).clamp(64, 10_000);
+        let mut builder = MapBuilder::with_registry_rows(Vec::new(), rows)
+            .expect("building into an in-memory Vec<u8> cannot fail");
         let mut ids = Vec::with_capacity(entries.len());
         let mut min_key: Option<Box<str>> = None;
         for (rank, (term, id)) in entries.enumerate() {

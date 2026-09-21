@@ -994,3 +994,29 @@ that conversation for the full annotated list.
   choices in `Dictionary` and the cached `min_key` field on `Block`
   (§10): compact arrays and stable integer handles, hot routing metadata
   kept separate from the compressed cold FST payload.
+
+
+### Prepared ingestion batches
+
+`TermBatch` owns one caller-bounded text arena and reuses flat arrays of sorted
+input indices and duplicate-group boundaries. Parser workers can prepare it
+without accessing the dictionary. `Dictionary::insert_prepared` scatters IDs
+back to original input positions; the existing `insert_batch` borrows caller
+strings and uses the same insertion engine. Neither retains a dataset-wide
+uncompressed term index.
+
+The writer routes once per sorted destination run. For a run with at least
+`max(8, block_len / 4)` distinct incoming terms, it decodes the old block once
+and merges in lexical order, identifying duplicates and new IDs in that pass.
+Smaller runs use point lookups, avoiding whole-block decoding for sparse
+repeated terms. Rebuilt output still goes directly to final-sized blocks.
+Scratch arenas are taken once per batch; empty replacements allocate nothing.
+They store valid UTF-8 in a String with end offsets, so reading a term needs
+no repeated UTF-8 scan. Bootstrap also reuses the temporary block-ID vector.
+
+FST construction uses a two-way registry with `clamp(4 * entries, 64, 10000)`
+rows instead of allocating the upstream fixed 10000 rows for every tiny block.
+The vendored patch exposes only the existing row-count parameter; upstream
+constructors keep their default. Evictions can reduce state deduplication and
+increase encoded size but cannot alter key/value semantics. Constructor
+parity tests cover disabled, tiny, adaptive-sized, and original caches.

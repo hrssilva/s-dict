@@ -16,8 +16,8 @@ use crate::TermId;
 /// free. Callers that want fresh content call `clear()` first.
 #[derive(Debug)]
 pub(crate) struct EntriesArena {
-    text: Vec<u8>,
-    /// CSR-style offsets into `text`; length is always `ids.len() + 1`.
+    text: String,
+    /// End offsets into `text`, one per ID; an empty arena needs no allocation.
     offsets: Vec<u32>,
     ids: Vec<TermId>,
 }
@@ -31,8 +31,8 @@ impl Default for EntriesArena {
 impl EntriesArena {
     pub(crate) fn new() -> Self {
         EntriesArena {
-            text: Vec::new(),
-            offsets: vec![0],
+            text: String::new(),
+            offsets: Vec::new(),
             ids: Vec::new(),
         }
     }
@@ -41,7 +41,6 @@ impl EntriesArena {
     pub(crate) fn clear(&mut self) {
         self.text.clear();
         self.offsets.clear();
-        self.offsets.push(0);
         self.ids.clear();
     }
 
@@ -50,10 +49,9 @@ impl EntriesArena {
     }
 
     pub(crate) fn term_at(&self, i: usize) -> &str {
-        let start = self.offsets[i] as usize;
-        let end = self.offsets[i + 1] as usize;
-        std::str::from_utf8(&self.text[start..end])
-            .expect("arena bytes were pushed from valid UTF-8 str slices")
+        let start = if i == 0 { 0 } else { self.offsets[i - 1] as usize };
+        let end = self.offsets[i] as usize;
+        &self.text[start..end]
     }
 
     pub(crate) fn id_at(&self, i: usize) -> TermId {
@@ -62,8 +60,9 @@ impl EntriesArena {
 
     /// Appends one entry to the end.
     pub(crate) fn push(&mut self, term: &str, id: TermId) {
-        self.text.extend_from_slice(term.as_bytes());
-        self.offsets.push(self.text.len() as u32);
+        self.text.push_str(term);
+        self.offsets
+            .push(u32::try_from(self.text.len()).expect("scratch arena exceeds 32-bit offsets"));
         self.ids.push(id);
     }
 
@@ -113,6 +112,26 @@ mod tests {
     use super::*;
 
     #[test]
+    fn taken_arena_leaves_allocation_free_default_and_retains_empty_unicode_terms() {
+        let mut arena = EntriesArena::new();
+        arena.push("", TermId(0));
+        arena.push("é中", TermId(1));
+        arena.push("", TermId(2));
+        let mut taken = std::mem::take(&mut arena);
+        assert_eq!(arena.text.capacity(), 0);
+        assert_eq!(arena.offsets.capacity(), 0);
+        assert_eq!(arena.ids.capacity(), 0);
+        assert_eq!(taken.term_at(0), "");
+        assert_eq!(taken.term_at(1), "é中");
+        assert_eq!(taken.term_at(2), "");
+        let capacity = taken.text.capacity();
+        taken.clear();
+        taken.push("中", TermId(3));
+        assert_eq!(taken.term_at(0), "中");
+        assert_eq!(taken.text.capacity(), capacity);
+    }
+
+    #[test]
     fn push_and_read_back() {
         let mut arena = EntriesArena::new();
         arena.push("a", TermId(0));
@@ -131,7 +150,7 @@ mod tests {
     }
 
     #[test]
-    fn clear_resets_csr_invariant() {
+    fn clear_resets_end_offsets() {
         let mut arena = EntriesArena::new();
         arena.push("x", TermId(0));
         arena.clear();

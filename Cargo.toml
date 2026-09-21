@@ -14,7 +14,8 @@ description = "A dynamic, incrementally mutable bidirectional RDF term <-> TermI
 # profiling shows it's worth it (its lack of a native rank-preserving
 # unranking primitive is exactly the kind of thing to measure before
 # building around).
-fst = "0.4"
+# Local 0.4.7 patch exposes configurable builder registry size.
+fst = { path = "vendor/fst" }
 
 # A separate profile from plain `release`, purely so `perf record`'s
 # call-graph sampling gets meaningful symbols (source-level line info)

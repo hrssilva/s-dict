@@ -141,6 +141,31 @@ assert_eq!(dict.get_id("http://www.w3.org/1999/02/22-rdf-syntax-ns#type"), None)
 # let _ = ids;
 ```
 
+For ingestion with parser workers, prepare a reusable owned batch before
+passing it to the single dictionary writer. Preparation sorts indices and
+stores duplicate positions in flat arrays. Returned IDs retain input order.
+
+```rust
+use s_dict::{Dictionary, TermBatch};
+let mut batch = TermBatch::new();
+batch.push("example");
+batch.push("example");
+batch.prepare(); // Can run on a parser worker, independently of the dictionary.
+let mut dict = Dictionary::new();
+let ids = dict.insert_prepared(batch.prepared().unwrap());
+assert_eq!(ids[0], ids[1]);
+batch.clear(); // Reuse text and metadata capacity for the next bounded batch.
+```
+
+`push` and `clear` invalidate preparation. The borrowed `PreparedBatch` view
+prevents modification during insertion. Callers choose the batch size; the
+library does not collect the entire input. Ordinary `insert_batch` remains
+available with borrowed strings.
+
+FST construction uses a block-sized state cache from a small vendored patch
+to `fst` 0.4.7 (see `vendor/fst/LOCAL_CHANGES.md`). The encoding and lookups
+are unchanged; reduced cache reuse can slightly increase compressed size.
+
 `TermId` is `u32`-width, matching `s-graph`'s subject/predicate/object id
 space directly.
 

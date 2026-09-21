@@ -1,5 +1,6 @@
 use std::num::NonZeroU32;
 
+use crate::batch::{BatchOrder, PreparedBatch};
 use crate::block::Block;
 use crate::entries_arena::{EntriesArena, merge_into};
 use crate::{TermDictionary, TermId};
@@ -146,6 +147,118 @@ impl Dictionary {
         let id_to_block_bytes =
             self.id_to_block.len() * std::mem::size_of::<Option<(BlockId, u16)>>();
         blocks_bytes + directory_bytes + id_to_block_bytes
+    }
+
+    /// Insert a worker-prepared batch without sorting or deduplicating it again.
+    /// Returns IDs in original input order, including duplicate occurrences.
+    /// Preparation owns only one caller-bounded batch; no global term copy or
+    /// dataset-wide uncompressed index is retained.
+    pub fn insert_prepared(&mut self, prepared: PreparedBatch<'_>) -> Vec<TermId> {
+        let batch = prepared.batch;
+        self.insert_ordered(&batch.order, |u| batch.term(batch.order.first(u)))
+    }
+
+    fn insert_ordered<'a>(
+        &mut self,
+        order: &BatchOrder,
+        term: impl Fn(usize) -> &'a str,
+    ) -> Vec<TermId> {
+        let mut result = vec![TermId(0); order.len()];
+        if order.unique_len() == 0 {
+            return result;
+        }
+        if self.directory.is_empty() {
+            self.bootstrap(order, &term, &mut result);
+            return result;
+        }
+
+        // Take once per batch; empty replacement arenas allocate nothing.
+        let mut old = std::mem::take(&mut self.scratch_a);
+        let mut merged = std::mem::take(&mut self.scratch_b);
+        let mut new_entries = Vec::new();
+        let mut u = 0;
+        while u < order.unique_len() {
+            let dir_idx = self.route(term(u)).expect("directory is non-empty");
+            let mut run_end = u + 1;
+            // Sorted input stays in this destination until the next minimum.
+            // No repeated binary search for each term in the run.
+            if let Some((next_min, _)) = self.directory.get(dir_idx + 1) {
+                while run_end < order.unique_len() && term(run_end) < next_min.as_ref() {
+                    run_end += 1;
+                }
+            } else {
+                run_end = order.unique_len();
+            }
+            let block_id = self.directory[dir_idx].1;
+            let block_len = self.block(block_id).len();
+            let dense = run_end - u >= (block_len / 4).max(8);
+            let added;
+            if dense {
+                // One ordered traversal supplies both duplicate IDs and old
+                // terms for rebuilding. Avoid point lookups followed by a
+                // second decode of the same block for larger groups.
+                old.clear();
+                self.block(block_id).decode_into(&mut old);
+                merged.clear();
+                let mut i = 0;
+                let mut new_count = 0;
+                for k in u..run_end {
+                    let incoming = term(k);
+                    while i < old.len() && old.term_at(i) < incoming {
+                        merged.push(old.term_at(i), old.id_at(i));
+                        i += 1;
+                    }
+                    let id = if i < old.len() && old.term_at(i) == incoming {
+                        let id = old.id_at(i);
+                        i += 1;
+                        id
+                    } else {
+                        new_count += 1;
+                        self.alloc_term_id()
+                    };
+                    merged.push(incoming, id);
+                    for &pos in order.positions(k) {
+                        result[pos] = id;
+                    }
+                }
+                while i < old.len() {
+                    merged.push(old.term_at(i), old.id_at(i));
+                    i += 1;
+                }
+                added = new_count;
+            } else {
+                // Sparse duplicate-only groups should not decode whole blocks.
+                new_entries.clear();
+                for k in u..run_end {
+                    let incoming = term(k);
+                    let id = match self.block(block_id).rank(incoming) {
+                        Some(rank) => self.block(block_id).id_at(rank),
+                        None => {
+                            let id = self.alloc_term_id();
+                            new_entries.push((incoming, id));
+                            id
+                        }
+                    };
+                    for &pos in order.positions(k) {
+                        result[pos] = id;
+                    }
+                }
+                added = new_entries.len();
+                if added > 0 {
+                    old.clear();
+                    self.block(block_id).decode_into(&mut old);
+                    merge_into(&old, &new_entries, &mut merged);
+                }
+            }
+            if added > 0 {
+                self.rebuild_batch_block(dir_idx, &merged);
+                self.len += added;
+            }
+            u = run_end;
+        }
+        self.scratch_a = old;
+        self.scratch_b = merged;
+        result
     }
 
     /// Like [`TermDictionary::get_term`], but decodes into a caller-
@@ -410,36 +523,34 @@ impl Dictionary {
     /// chunks them directly into balanced `<= block_max`-sized blocks
     /// (evening out the remainder rather than leaving a small trailing
     /// chunk), bypassing the single-term bootstrap path entirely.
-    fn bootstrap(
+    fn bootstrap<'a>(
         &mut self,
-        unique_terms: &[&str],
-        positions: &[Vec<usize>],
+        order: &BatchOrder,
+        term: &impl Fn(usize) -> &'a str,
         result: &mut [TermId],
     ) {
-        let total = unique_terms.len();
+        let total = order.unique_len();
         let num_chunks = total.div_ceil(self.block_max).max(1);
         let base = total / num_chunks;
         let extra = total % num_chunks;
 
         let mut start = 0;
+        let mut chunk_ids = Vec::with_capacity(self.block_max.min(total));
         for chunk_idx in 0..num_chunks {
             let size = base + if chunk_idx < extra { 1 } else { 0 };
             let end = start + size;
 
-            let mut chunk_ids: Vec<TermId> = Vec::with_capacity(end - start);
+            chunk_ids.clear();
             for offset in 0..(end - start) {
                 let id = self.alloc_term_id();
                 chunk_ids.push(id);
-                for &pos in &positions[start + offset] {
+                for &pos in order.positions(start + offset) {
                     result[pos] = id;
                 }
             }
 
             let block = Block::build(
-                unique_terms[start..end]
-                    .iter()
-                    .copied()
-                    .zip(chunk_ids.iter().copied()),
+                (start..end).map(term).zip(chunk_ids.iter().copied()),
             );
             let min_key: Box<str> = block.min_key().into();
             let block_id = self.alloc_block(block);
@@ -507,90 +618,9 @@ impl TermDictionary for Dictionary {
     }
 
     fn insert_batch(&mut self, terms: &[&str]) -> Vec<TermId> {
-        if terms.is_empty() {
-            return Vec::new();
-        }
-
-        // Group by destination up front instead of routing (and rebuilding
-        // a block) once per term (design doc §10/H5).
-        let mut order: Vec<usize> = (0..terms.len()).collect();
-        order.sort_by(|&a, &b| terms[a].cmp(terms[b]));
-
-        let mut unique_terms: Vec<&str> = Vec::new();
-        let mut positions: Vec<Vec<usize>> = Vec::new();
-        let mut i = 0;
-        while i < order.len() {
-            let term = terms[order[i]];
-            let mut group = vec![order[i]];
-            let mut j = i + 1;
-            while j < order.len() && terms[order[j]] == term {
-                group.push(order[j]);
-                j += 1;
-            }
-            unique_terms.push(term);
-            positions.push(group);
-            i = j;
-        }
-
-        let mut result = vec![TermId(0); terms.len()];
-
-        if self.directory.is_empty() {
-            self.bootstrap(&unique_terms, &positions, &mut result);
-            return result;
-        }
-
-        let mut u = 0;
-        while u < unique_terms.len() {
-            let dir_idx = self.route(unique_terms[u]).expect("directory is non-empty");
-            let mut run_end = u + 1;
-            while run_end < unique_terms.len() && self.route(unique_terms[run_end]) == Some(dir_idx)
-            {
-                run_end += 1;
-            }
-
-            let block_id = self.directory[dir_idx].1;
-            let mut new_entries: Vec<(&str, TermId)> = Vec::new();
-            for k in u..run_end {
-                let term = unique_terms[k];
-                match self.block(block_id).rank(term) {
-                    Some(local_rank) => {
-                        let id = self.block(block_id).id_at(local_rank);
-                        for &pos in &positions[k] {
-                            result[pos] = id;
-                        }
-                    }
-                    None => {
-                        let id = self.alloc_term_id();
-                        for &pos in &positions[k] {
-                            result[pos] = id;
-                        }
-                        new_entries.push((term, id));
-                    }
-                }
-            }
-
-            if !new_entries.is_empty() {
-                let added = new_entries.len();
-
-                let mut old = std::mem::take(&mut self.scratch_a);
-                old.clear();
-                self.block(block_id).decode_into(&mut old);
-
-                let mut merged = std::mem::take(&mut self.scratch_b);
-                merge_into(&old, &new_entries, &mut merged);
-
-                self.rebuild_batch_block(dir_idx, &merged);
-
-                self.scratch_a = old;
-                self.scratch_b = merged;
-
-                self.len += added;
-            }
-
-            u = run_end;
-        }
-
-        result
+        let mut order = BatchOrder::default();
+        order.prepare(terms.len(), |i| terms[i]);
+        self.insert_ordered(&order, |u| terms[order.first(u)])
     }
 
     fn remove(&mut self, term: &str) -> Option<TermId> {
