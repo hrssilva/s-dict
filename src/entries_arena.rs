@@ -49,7 +49,11 @@ impl EntriesArena {
     }
 
     pub(crate) fn term_at(&self, i: usize) -> &str {
-        let start = if i == 0 { 0 } else { self.offsets[i - 1] as usize };
+        let start = if i == 0 {
+            0
+        } else {
+            self.offsets[i - 1] as usize
+        };
         let end = self.offsets[i] as usize;
         &self.text[start..end]
     }

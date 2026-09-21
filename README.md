@@ -202,6 +202,17 @@ constant -- see DESIGN.md §12 for why.
   second in a single 2,000,000-term pass, checking whether the same
   per-op advantage holds (it does, and gets cleaner) at bulk-decode
   scale -- see DESIGN.md for how to run them and what they found.
+- `examples/batch_sweep.rs` -- sweeps `TermBatch` flush thresholds (term
+  count and byte size) against `Dictionary::rebuild_stats()`, wall time,
+  retained allocation (via a counting global allocator), and RSS, to
+  measure whether larger bounded batches reduce block-rebuild frequency
+  and by how much -- see DESIGN.md's "Bounded-batch sweep" section.
+- `examples/perf_insert_single_flush.rs` -- a focused `perf stat` target
+  for single-term-flush insertion into a preloaded dictionary; hardware
+  counters (cycles, instructions, cache-misses), not wall time, are what
+  actually settled whether the single-walk merge refactor was a real win
+  -- see DESIGN.md's "Single-walk merge" section for why wall-clock alone
+  was misleading here.
 
 ## Testing
 

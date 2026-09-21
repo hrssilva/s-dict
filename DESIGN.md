@@ -1020,3 +1020,514 @@ The vendored patch exposes only the existing row-count parameter; upstream
 constructors keep their default. Evictions can reduce state deduplication and
 increase encoded size but cannot alter key/value semantics. Constructor
 parity tests cover disabled, tiny, adaptive-sized, and original caches.
+
+### Bounded-batch sweep: does batching reduce rebuild frequency?
+
+A `perf`-sampled profile outside this crate (during ingestion) attributed
+roughly 40% of CPU cycles to block rebuilding and roughly 21% to batch-sort
+preparation (already overlapping insertion). Before deciding whether the
+next lever should be "rebuild less often" or "make each rebuild cheaper",
+`examples/batch_sweep.rs` measures the first question directly: does a
+larger caller-chosen flush threshold on `TermBatch` actually reduce how
+often blocks get rebuilt, and by how much, against real cost (time,
+retained allocation, RSS)?
+
+Methodology: preload a fresh `Dictionary` (default block bounds) with
+200,000 terms via one prepared batch (unmeasured setup), then stream
+200,000 more terms -- disjoint from the preload by construction, cycling
+through 7 differently-shaped synthetic namespaces (IRIs, a long literal
+shape, blank nodes) rather than one sequential numeric suffix, since the
+"Correction" section above found that shape manufactures artificial
+branching factor; this sweep is much less sensitive to that than the
+earlier binary-search measurement was, since it's measuring rebuild/
+allocation bookkeeping, not FST transition-decode cost. Terms are pushed
+into a `TermBatch` and flushed (`prepare` + `insert_prepared`) once a
+configured cap is hit. `Dictionary::rebuild_stats()` (new: `blocks_rebuilt`,
+`entries_decoded`, cumulative counters incremented at every `Block::build`/
+`decode_into` call site) is snapshotted before and after the streaming
+phase and diffed, so the one-time preload never pollutes the measurement.
+Retained allocation is tracked with a counting `#[global_allocator]`
+wrapping `System` (current live bytes, not peak -- peak is reported
+separately, since a batch's transient decode/merge/build working set can
+spike well above what it leaves behind); RSS comes from `/proc/self/status`
+and is reported as a coarser, laggier cross-check (glibc doesn't always
+return freed pages to the OS promptly).
+
+Results (`cargo run --release --example batch_sweep`; `dec/new` and
+`rblt/new` are entries-decoded and blocks-rebuilt per newly inserted term):
+
+| batch cap | flushes | time | dec/new | rblt/new | retained | phase peak |
+|---|---|---|---|---|---|---|
+| terms<=1 | 200,000 | 42.5s | 191.60 | 1.0076 | 4.2MiB | 62.9MiB |
+| terms<=16 | 12,500 | 17.5s | 83.79 | 0.4453 | 4.2MiB | 62.9MiB |
+| terms<=64 | 3,125 | 4.5s | 20.83 | 0.1175 | 4.2MiB | 63.0MiB |
+| terms<=256 | 782 | 1.35s | 5.54 | 0.0349 | 4.1MiB | 62.9MiB |
+| terms<=1024 | 196 | 434ms | 1.19 | 0.0143 | 4.1MiB | 62.8MiB |
+| terms<=4096 | 49 | 282ms | 0.46 | 0.0072 | 3.7MiB | 62.4MiB |
+| terms<=16384 | 13 | 230ms | 0.19 | 0.0051 | 4.0MiB | 62.8MiB |
+| terms<=65536 | 4 | 222ms | 0.11 | 0.0045 | 4.1MiB | 63.1MiB |
+| bytes<=1KiB | 8,164 | 11.5s | 54.78 | 0.2937 | 4.2MiB | 62.9MiB |
+| bytes<=64KiB | 133 | 410ms | 1.10 | 0.0103 | 3.6MiB | 62.4MiB |
+| bytes<=1MiB | 9 | 223ms | 0.15 | 0.0048 | 4.0MiB | 62.8MiB |
+
+(full output, including the byte-cap and combined sweeps, is reproducible
+via the command above; not all rows are reproduced here).
+
+**Batching reduces rebuild frequency dramatically, confirming H5, and the
+effect is the dominant lever, not a marginal one.** Going from
+`terms<=1` (equivalent to sequential `insert`: every new term is its own
+flush) to `terms<=1024` cuts blocks rebuilt per new term by ~70x (1.008 ->
+0.014) and entries decoded per new term by ~161x (191.6 -> 1.19), and wall
+time by ~97x (42.5s -> 434ms) for the same 200,000 inserted terms into the
+same starting dictionary. This is exactly what grouping same-destination
+terms into one decode-merge-rebuild cycle (`insert_ordered`'s per-run
+grouping, already in `src/dictionary.rs`) predicts: at `terms<=1`, nearly
+every flush is a lone term hitting the sparse single-point-lookup path,
+paying a full ~192-entry (the default block's steady-state size) decode +
+rebuild for one new term; at `terms<=1024`, many new terms destined for
+the same block get grouped into a single such cycle.
+
+**Diminishing returns set in around a few times `block_max`** (default
+256): `terms<=256` -> `terms<=1024` still roughly halves rebuild cost
+(0.035 -> 0.014 rblt/new) and time (1.35s -> 434ms), but `terms<=4096` ->
+`terms<=65536` (16x more) only takes rblt/new from 0.0072 to 0.0045 and
+time from 282ms to 222ms -- most of a batch beyond a few thousand terms
+is spread across many different destination blocks anyway, so raising the
+cap further mostly just amortizes `prepare()`'s one sort per flush (item 4
+of the report this sweep answers) rather than finding more same-block
+grouping opportunity.
+
+**Retained allocation and phase-peak allocation are flat across the whole
+sweep** (~4.0-4.7MiB retained, ~62-64MiB phase peak, regardless of batch
+cap) -- batching wins on time and rebuild count with no retained-memory
+tradeoff at this scale; the final dictionary ends up the same size either
+way, since `rebuild_batch_block`/`bootstrap`'s balanced chunking targets
+the same final block sizes regardless of how the input was grouped to get
+there. This is a real, reportable negative result specifically against
+**item 3** of the report this sweep responds to (a measured 5.4% retained-
+allocation increase) -- that increase is not explained by batch sizing
+itself; it's a separate axis (almost certainly the FST registry-row-count/
+compression tradeoff, which this sweep does not touch) and needs its own
+measurement, not inference from this one. Byte-capped flushing (`bytes<=`)
+tracks the term-capped results closely at comparable effective batch sizes
+here, because this synthetic corpus's term-size variance (43 bytes/term
+average, ~15-140 byte range) isn't extreme; a real corpus with a heavier
+tail of long literals mixed with short IRIs would likely separate the two
+cap strategies more, since a byte cap bounds peak batch memory that a
+term-count cap alone wouldn't.
+
+**Conclusion for prioritization**: the next implementation should
+primarily target *rebuild frequency* (i.e., default to a substantially
+larger `TermBatch` flush threshold than 1, on the order of a few times
+`block_max`, in any ingestion pipeline built on this crate) rather than
+*cheapening each rebuild* (report item 2, buffer reuse) -- at this
+dictionary size and term shape, batching alone already captures ~97% of
+the achievable wall-time reduction between the two extremes measured, and
+the remaining ~3% (`terms<=1024` down to `terms<=65536`) is a much smaller
+prize than the ~70x already on the table just by not flushing per-term.
+Buffer reuse (item 2) and the registry/compression tradeoff (item 3)
+remain worth pursuing but are now secondary, not primary, levers; item 4
+(batch-sort cost) becomes the more visible remaining cost specifically
+once a large flush threshold is adopted, matching the report's own note
+that its priority rises "as the writer gets faster."
+
+### Single-walk merge: removing the dense/sparse split
+
+The dense/sparse branch inside `insert_ordered` (the bounded-batch sweep
+above) turned out to have a real inefficiency, independent of batch
+sizing: the sparse path did per-term `rank()` point lookups first, and
+*if any of them missed*, fell through to a completely separate
+`decode_into` walk of the whole block plus a second merge pass over the
+result -- paying for both the lookups and the full decode whenever a run
+turned out not to be all-duplicates. The dense path had a related, milder
+version of the same problem: `decode_into` wrote every surviving entry
+into a scratch arena, then a second loop read that arena back out while
+merging -- every surviving entry written twice.
+
+`Block::merge_into` (`block.rs`) replaces both: one method, one streaming
+walk of the FST's own `Streamer`, merged directly against the (already
+sorted, from `BatchOrder`) incoming run, writing the union straight into
+the rebuilt block's content and resolving each incoming term's id (hit or
+freshly allocated) as a side effect of the same walk. `insert_ordered` and
+`TermDictionary::insert` (the single-term path) both now call this
+unconditionally -- there is no dense/sparse heuristic left to tune or get
+wrong. The cost: every touched block is now always fully walked, even
+when nothing in the run turns out to be new, which the old sparse path
+could sometimes avoid entirely. This crate's own workloads always
+route real, new-term-containing runs to touched blocks in practice (see
+above), so that tradeoff was accepted deliberately, not by default.
+
+Wiring this into `Dictionary` needed one non-obvious borrow-checker
+pattern: `insert_ordered` needs a `&Block` (to call `merge_into`) live at
+the same time as `&mut self.free_term_ids`/`&mut self.next_term_id` (for
+the id-allocation closure `merge_into` calls back into) -- which the
+existing `self.block(id)` *method* can't give, since a method call borrows
+`self` as a whole, opaque to the borrow checker even though it only reads
+`self.blocks` internally. The fix is to index `self.blocks` directly at
+the call site instead of going through that method; Rust's borrow checker
+does support disjoint borrows of named fields accessed directly, just not
+through an intervening method call. Same technique, same reason, applied
+to the single-term `insert` path.
+
+**Measurement caught a real methodology trap here, not just a result.**
+`examples/batch_sweep.rs`'s wall-clock numbers showed this refactor as a
+*regression* -- `terms<=1` went from ~34.8s (forced-`dense=true`, the
+prior turn's experiment) to ~40.4s, reproducibly, across repeated runs in
+the same session. Read at face value, that would mean single-walk is
+worse despite doing strictly less work. An isolated microbenchmark
+(`block::tests::perf_probe_merge_into_vs_decode_then_merge`, one new term
+into a 160-entry block, 20,000 iterations, no `Dictionary`-level machinery
+in the way) showed the opposite: `merge_into` at 13.8us/op vs. the old
+two-step's 15.9us/op, ~13% *faster*, matching the algorithmic prediction
+(one array write per surviving entry instead of two). Wall-clock and a
+controlled microbenchmark disagreeing this sharply meant one of them was
+wrong, so this got settled with `perf stat` hardware counters instead of
+more wall-clock runs, per the user's steer -- a same-session, back-to-back
+`git stash`-based A/B (`examples/perf_insert_single_flush.rs`, 50,000
+preload + 50,000 single-term-flush inserts, `setup_only` subtracted) on
+the *exact* pre-refactor vs. post-refactor code:
+
+| metric (per insert, setup subtracted) | original dense/sparse | single-walk | delta |
+|---|---|---|---|
+| cycles | 693,908 | 687,914 | -0.9% |
+| instructions | 1,645,215 | 1,623,677 | -1.3% |
+| cache-misses | 250.4 | 221.1 | -11.7% |
+| wall-clock (this run) | 184.5us | 222.4us | **+20.5%** |
+
+Every CPU-work counter (cycles, instructions, cache-misses) says
+single-walk is equal-or-better, matching the microbenchmark. Wall-clock,
+measured in the same process, says the opposite. The only consistent
+explanation is that the two runs executed at different effective clock
+frequencies (DVFS/thermal state varying between consecutive `perf stat`
+invocations) -- exactly the "cross-run wall-clock noise" hazard this
+document's earlier measurement-hygiene notes already named, now caught
+concretely rather than just asserted. **Conclusion: the single-walk
+refactor is a real, small, unambiguous improvement by every hardware
+counter; the wall-clock numbers from `batch_sweep` runs separated by other
+work in between (as in the bounded-batch sweep above) should be treated
+as directionally suggestive only, not trusted for a delta this size.**
+`perf stat` cycles/instructions, not wall-clock, is now the standard for
+any A/B this close going forward; wall-clock stays fine for the
+order-of-magnitude effects the bounded-batch sweep found (70x is not
+going to be a frequency-scaling artifact).
+
+### Skipping unchanged reverse-map entries on rebuild
+
+`assign_ranks` (`dictionary.rs`) rewrites `id_to_block` for every entry in
+a rebuilt block, unconditionally -- Variant B's known cost (see "Stage 5"
+above): a rebuild changes every surviving entry's local rank, not just the
+one that triggered it, so the whole reverse mapping for that block needs
+refreshing. Two things narrow that unconditionally:
+
+- `Block::merge_into` (see "Single-walk merge" above) already knows, as a
+  side effect of the streaming walk, the position of the first entry that
+  differs from the block's pre-merge content -- everything before it kept
+  its exact old position. It now returns this as `unchanged_prefix`
+  (`MergeOutcome`), and `assign_ranks` takes a `skip` count so that prefix
+  is never rewritten. Wired through `insert_ordered` (via
+  `rebuild_batch_block`, which only applies the skip to chunk 0 -- any
+  later chunk gets a fresh `BlockId` and renumbers from 0 regardless, so
+  no old position carries over) and the single-term `insert` path.
+  `remove` gets the equivalent for free: the removed entry's own
+  `local_rank` *is* the skip count, no merge walk needed to find it.
+- `split` and `merge_with_neighbor` don't go through `merge_into` at all,
+  but the same fact applies more starkly: `split`'s left half keeps the
+  original `BlockId` *and* occupies the exact same 0-based ranks it had
+  before splitting (it's the block's own first half, in the same order) --
+  its `assign_ranks` call was pure no-op writes and is now deleted
+  outright, not just skipped. `merge_with_neighbor`'s `keep` block is the
+  same story for its own entries (decoded first into the merge arena, so
+  still at their original positions); only the absorbed neighbor's entries
+  are actually new to that `BlockId`. The removed code's own comment
+  claimed a full refresh was needed there -- it wasn't; this was a real,
+  previously-unnoticed redundancy, not a new capability being added.
+
+**Measured impact, honestly scoped**: an isolated microbenchmark
+(`dictionary::tests::perf_probe_assign_ranks_skip`, a 256-entry block,
+skip=0 vs. skip=128 -- the average case for one insert landing mid-block)
+shows `assign_ranks` itself genuinely faster: 481ns/op unskipped vs.
+283ns/op at the average skip, ~41%. But `perf stat` on the full
+`examples/perf_insert_single_flush.rs` pipeline (50,000 preload + 50,000
+single-flush inserts, same A/B method as the single-walk section above)
+showed only a ~0.2% instructions-per-op reduction end to end
+(1,623,524 -> 1,619,925), with cycles and cache-misses too noisy at that
+size to read at all (the same DVFS-between-runs hazard as before). Both
+numbers are true and consistent: `assign_ranks` is a small fraction of
+total insert cost to begin with -- `Block::build`'s FST construction
+dominates by orders of magnitude (see the "block rebuild breakdown" probe
+in `block.rs`) -- so cutting it in half, even reliably, barely moves the
+total. The `split`/`merge_with_neighbor` deletions are kept regardless:
+they cost nothing (less code, not more) and are strictly correct, not a
+speed bet. This is the accurate scope of "integrating the reverse map and
+the blocks reduces wasted work" -- real, verified, and small, not the
+large win the batching or single-walk changes were.
+
+### Custom incremental micro-FST: stages 1-2 (bulk construction, proven correct)
+
+`src/micro_fst.rs` is a from-scratch, self-contained minimal acyclic
+automaton -- no dependency on `fst` or `crate::TermId` -- built toward
+eventually replacing `Block`'s full-rebuild-per-mutation contract with
+true incremental insertion (Daciuk, Mihov, Watson, Watson 2000, sorted-
+input specialization; the transducer/output half per Mihov & Daciuk 1998;
+deletion, when it's tackled, per Carrasco & Forcada 2002 -- full citations
+and the rest of the literature considered, including why an unrolled
+linked list was chosen for per-state transitions over double-array tries,
+are in the approved plan this was built from). Staged deliberately, and
+this session only covers the first two stages: bulk construction
+(`Automaton::build_sorted`) and differential correctness testing against
+the current `fst`-backed `Block` -- not incremental `insert` yet, and
+nothing outside this module's own tests calls into it. `Block` and
+`vendor/fst` are untouched; this changes no existing behavior.
+
+Each state's outgoing transitions are stored as an unrolled linked list:
+a `TransitionChunk` of up to 4 entries inline (no allocation), spilling
+into a `Vec<TransitionChunk>` only for the rare wide node -- sized against
+this project's own earlier finding that real RDF terms have low branching
+factor at most nodes (the `s-bench` real-corpus profiling that produced
+the binary-search "Correction" above), not assumed.
+
+Minimization uses the standard register (a `HashMap` keyed by a state's
+own transition set + finality, deduplicating equivalent states); rank
+(the transition output value) isn't tracked incrementally during descent
+-- it's derived once a state is confirmed, as the prefix sum over
+lexicographically earlier sibling transitions of each sibling's subtree
+word-count (`State::count`), itself a pure function of a state's own
+(already-confirmed) subtree.
+
+**A real bug, caught by the differential test, not by inspection.** The
+first version of that output formula was `output(child) = sum of counts
+of earlier siblings`, which passed simple cases (a single term; a term
+that's nobody's prefix) but failed on real namespace-clustered data:
+`automaton.rank("_:b10")` returned 1 where `Block::rank` (trusted, and
+independently hand-verified) said 2. Root cause: a state that is *itself*
+final and *also* has further transitions (e.g. the state after `"_:b1"`,
+since `"_:b1"` is a complete term for `i=1` and also a prefix of
+`"_:b10"`, `"_:b11"`, ...) accepts a word that's lexicographically smaller
+than everything reachable through any of its children -- a prefix always
+sorts before its own extensions -- so that state's own acceptance must
+shift *every* child's output by one, not just contribute to the state's
+own `count` for its parent's benefit. Fixed by seeding the running prefix
+sum with `1` when the state is final, before folding in any child
+(`finalize_outputs_and_count` in `micro_fst.rs`). Caught specifically
+because the differential test used real, prefix-heavy, namespace-
+clustered synthetic terms (8,000 of them, mixing IRIs, blank nodes, and
+`urn:` terms) rather than only small hand-picked cases -- the exact kind
+of case this project's "Correction" section already warned small/
+artificial test data can hide.
+
+### Custom incremental micro-FST: stage 3 (incremental insert, proven minimal)
+
+`Automaton::insert(term)` adds one term to an already-finished, already-
+minimal automaton -- a genuinely different problem from `build_sorted`'s
+sorted-batch construction, not just "the same algorithm called once per
+term". Bulk construction never needs to touch a state that's already
+shared: sharing only happens *after* a state is confirmed and frozen. An
+already-minimal automaton is full of shared states from the start, so
+inserting into it safely requires copy-on-write: walk existing transitions
+as far as `term` matches; clone every *non-root* state on that matched
+path (any of them might be referenced by other terms, so none can be
+mutated in place -- root is always safe, since nothing ever points back to
+it, so it's exempt); extend the last clone with brand-new states for the
+unmatched suffix; then re-confirm the whole modified path bottom-up
+through the same register `build_sorted` populated, so a clone that
+happens to now equal some other existing state gets merged away exactly
+like any other duplicate, not as a special case.
+
+**A second real bug, structurally different from the first, and again
+only caught by testing at real scale with more than one insertion
+order.** The initial implementation passed every hand-written small case
+(idempotency, a term that's a prefix of another inserted either order,
+inserting next to unrelated existing terms) but failed a differential test
+against a fresh `build_sorted` at just 4 terms once shuffled into a
+specific order. Root cause: `push_sorted` (the transition-list append used
+while extending a path) assumed every new transition sorts after every
+existing one at that node -- true for `build_sorted`, since sorted input
+can never introduce a byte smaller than one already at a node once
+construction has moved past it, but false in general for `insert`, which
+accepts terms in *any* order. Inserting `"_:b0"` (byte `'_'`, 0x5F) after
+`"urn:isbn:..."` (byte `'u'`, 0x75) had already been inserted left the
+root's transitions as `['u', '_']` -- silently unsorted, which corrupted
+every downstream computation depending on byte-sorted order (confirmation's
+prefix-sum output calculation, `rank`, `term_at_into`) without ever
+producing an out-of-range value or a panic, just wrong ranks that still
+formed a valid permutation of `0..n` -- exactly the kind of bug a
+narrower, single-seed test can pass by chance and a differential test
+across several seeds reliably catches. Fixed by replacing the blind
+append with `insert_transition`, which finds the correct sorted position
+(rebuilding the chunk list from a small sorted `Vec`, cheap at this
+corpus's measured branching factors) rather than assuming one.
+
+Verified with `incremental_insert_matches_bulk_build_and_stays_minimal`:
+500 unique ids (2,000 namespace-clustered terms) inserted one at a time,
+across four different shuffles, each checked for (a) every rank/unrank
+pair matching a trusted fresh `build_sorted`, (b) `reachable_state_count`
+exactly equal to that fresh build's -- the actual minimality claim, not
+just correct answers over a silently bloated structure -- and (c) a full
+second pass re-inserting every term, confirming idempotency doesn't
+regress minimality either. An ad hoc stress pass during development (not
+kept, but worth recording) pushed this to 15,000 terms across five seeds
+plus a double-insert pass with no failures, before paring back to the
+scope above for the standing suite.
+
+**Known, deliberate gap**: discarded clones and superseded originals are
+left as unreachable garbage in the state slab rather than reclaimed --
+correct (every read-path method only ever touches the reachable graph
+from `root`) but a real, unaddressed memory-growth cost under sustained
+incremental mutation. Slot reuse (mirroring `Dictionary`'s own
+`free_block_slots` pattern) is future work, not attempted here, and
+explicitly out of scope per the approved plan alongside deletion
+(Carrasco & Forcada 2002) and wiring this into `Block` as a measured,
+optional comparison implementation.
+
+### Custom incremental micro-FST: measuring the actual hypothesis
+
+The whole exercise was to test one hypothesis: does one insert into an
+already-populated structure cost O(term length), independent of how many
+other terms already exist, instead of `Block`'s O(block size) full
+decode-and-rebuild -- the cost this session's own earlier measurements
+(the single-walk merge refactor, the `assign_ranks` skip) confirmed
+dominates every mutation by a wide margin. `micro_fst.rs`'s
+`perf_probe_insert_cost_block` and `perf_probe_insert_cost_automaton` measure
+exactly that, isolated from each other (two separate tests, not one
+process running both loops, so `perf stat` can attribute hardware counters
+to either side): 160 baseline terms (`block_max`'s midpoint, matching
+`block::tests::perf_probe_block_rebuild_breakdown`'s own choice), one new
+distinct term inserted per iteration, 20,000 iterations. `Block`'s timed
+region is its whole real per-insert cost (decode, merge, rebuild --
+nothing about a real `Dictionary::insert` call can skip any of it);
+`Automaton`'s timed region is `insert` alone, with the per-iteration
+`clone()` that resets it back to the 160-term baseline deliberately
+excluded (a benchmark-harness artifact, not something a real caller
+mutating one live automaton would ever pay).
+
+Wall-clock (`cargo test --release -- --ignored --nocapture`): 34.8us/op
+for `Block`, 8.5us/op for `Automaton::insert`, ~4.1x. Given this session
+already found wall-clock-only comparisons misleading twice for effects far
+smaller than this one, the same `perf stat` A/B discipline applied here
+too rather than trusting a single large-looking number:
+
+| metric (per op) | Block | Automaton::insert | ratio |
+|---|---|---|---|
+| cycles | 137,057 | 42,171 | 3.25x |
+| instructions | 427,474 | 128,601 | 3.32x |
+| cache-misses | 9.1 | 2.2 | 4.10x |
+| branch-misses | 241.4 | 76.3 | 3.16x |
+
+Every hardware counter agrees, independently, on roughly the same
+magnitude (3.2-3.3x by cycles/instructions, the two least frequency-
+sensitive metrics; a larger 4.1x on cache-misses, consistent with
+`Block`'s rebuild touching all 160 entries' worth of FST bytes and
+constructing a whole new compressed structure, versus `Automaton::insert`
+touching only the one root-to-leaf path -- about 35 bytes here -- plus a
+handful of register/`HashMap` operations). Wall-clock's 4.1x sits inside
+that same range rather than contradicting it, unlike the two earlier
+cases this session flagged -- this is what a real, unambiguous effect
+looks like under the same measurement discipline that caught the fake
+ones.
+
+**What this does and doesn't establish.** The hypothesis behind building
+this at all is confirmed, with real numbers, not just complexity-class
+argument: incremental insertion into this automaton is a genuinely
+different, and substantially cheaper, cost class than `Block`'s
+full-rebuild contract, at a block size in the middle of this crate's
+actual default bounds. It does *not* yet establish that swapping `Block`
+for this would make `Dictionary::insert` 3x faster end to end -- `Block`
+construction (`Block::build`'s own cost, not just the decode+merge around
+it) was never the *only* cost in a real `Dictionary::insert` call
+(routing, `assign_ranks`, batch grouping all still apply and are
+unaffected by this), deletion isn't implemented on `Automaton` at all yet
+(today's numbers only cover insert), and the known slot-reclamation gap
+(discarded clones/originals left as unreachable garbage) is a real memory
+cost under sustained mutation that this benchmark's single-shot
+per-iteration `clone()`-and-discard pattern doesn't exercise. Those are
+exactly the remaining items the approved plan already named before this
+could be wired into `Dictionary` as an actual, measured comparison
+implementation -- this result is the evidence that doing so would be
+worth the remaining work, not a substitute for it.
+
+### Custom incremental micro-FST: decode speed (the other half of the question)
+
+The insert-cost result above only covers writes. Reads -- `rank` and
+`term_at_into`, both directions -- went unmeasured, and there was a real
+reason to expect either outcome: `Block::rank`/`term_at_into` walk `fst`'s
+compact, bit-packed transition encoding, and this project's own earlier
+profiling (the "Correction" section above) found that *bit-unpacking*
+itself, not the search strategy around it, was the dominant per-transition
+cost there. `Automaton`'s transitions are a plain unrolled array of
+`(u8, u32, Option<StateId>)` -- no bit-unpacking at all -- so decode could
+plausibly have gone either way, and needed its own measurement rather than
+riding on the insert-cost result's coattails.
+
+`perf_probe_decode_cost_block`/`_automaton` (same isolation-for-`perf
+stat` pattern as the insert-cost probes; 2,000 namespace-clustered terms,
+not a sequential digit suffix, for the same reason as always) measured it.
+Wall-clock, `Block` is faster both directions: 189ns vs 273ns for `rank`
+(~1.4x), 359ns vs 949ns for `term_at_into` (~2.6x). `perf stat`, blended
+across both operations (one process runs both loops, so hardware counters
+can't be split further than that without another round of test-splitting):
+
+| metric (per op, rank+unrank blended) | Block | Automaton | ratio |
+|---|---|---|---|
+| cycles | 1,133.9 | 2,099.0 | 1.85x (worse) |
+| instructions | 4,302.4 | 4,173.7 | 0.97x (fewer!) |
+| branches | 619.2 | 509.1 | 0.82x (fewer!) |
+| cache-misses | 0.5 | 0.5 | 0.99x (same) |
+| branch-miss rate | 0.43% | 0.56% | 1.31x |
+
+This is a real, `perf`-confirmed slowdown, not wall-clock noise -- but the
+*shape* of the counters says it's an implementation-overhead problem, not
+evidence that the unrolled-list structure is inherently worse for decode.
+`Automaton` does fewer instructions and fewer branches than `Block`
+per op, yet burns 85% more cycles doing it: cache-misses are essentially
+identical (ruling out memory latency), so the likely cause is a genuine
+instructions-per-cycle problem in `get`/`iter`/`term_at_into`'s current
+form -- `std::iter::once(&self.inline).chain(self.overflow.iter())
+.flat_map(...)` plus `.take_while(...).last()` and `.find(...)`, all
+generic `Iterator` combinator machinery, matching exactly the shape of
+overhead `block.rs`'s own `term_at_into` history already diagnosed once
+before (`get_key_into`'s linear scan through generic-`Iterator` machinery
+being ~41.5% of that function's runtime, well before bit-unpacking
+entered the picture) and fixed by replacing it with a direct,
+non-generic loop. `Automaton::term_at_into` still carries the doc comment
+"correctness-first... once wired in and measured, not before" -- this is
+that measurement, and it points at the same fix `Block` already needed:
+replace the generic iterator chain with direct indexing over `inline`/
+`overflow`, and only reach for binary search if a further profile shows
+linear scan itself (not the iterator overhead around it) is the
+remaining cost at the branching factors this corpus actually has.
+Not done in this pass -- reported as found, per this project's practice
+of keeping negative and unfinished results as visible as favorable ones.
+
+**Fixed and remeasured.** `Transitions::get` and a new
+`Transitions::last_output_at_most` (replacing `term_at_into`'s
+`iter().take_while(..).last()`) now walk `inline`/`overflow` with direct
+loops -- same answer, no `chain`/`flat_map`/`find`/`take_while` generic
+`Iterator` machinery. `iter()` itself is kept, for the call sites that
+genuinely want a full iterator (register-signature computation,
+reachability walks, confirmation's per-target output pass) and aren't on
+the hot decode path. Same `perf stat` A/B, same terms, same isolation:
+
+| metric (per op, rank+unrank blended) | Block | Automaton | speedup |
+|---|---|---|---|
+| cycles | 1,201.4 | 574.3 | 2.09x |
+| instructions | 4,239.7 | 1,258.7 | 3.37x |
+| cache-misses | 0.5 | 0.4 | 1.32x |
+| branches | 629.2 | 312.5 | 2.01x |
+
+The direction fully reversed, not just narrowed: `Automaton` now does
+3.37x *fewer* instructions (not the roughly-equal count from before the
+fix) and takes 2.09x fewer cycles. That the instruction count itself
+dropped this much, not just IPC improving, confirms the earlier
+diagnosis: the generic iterator chain was genuinely doing more work, not
+just executing the same work less efficiently. Wall-clock agrees in
+direction and rough magnitude (`rank`: 340ns -> Block, 168ns ->
+`Automaton`, ~2.0x; `term_at_into`: 612ns -> Block, 235ns -> `Automaton`,
+~2.6x), consistent with the hardware counters rather than contradicting
+them, same as the insert-cost result -- both reads and writes now
+genuinely favor `Automaton` over `Block`, each confirmed the same way.
+
+All differential/minimality tests (`matches_block_rank_and_unrank_on_
+namespace_clustered_terms`, `incremental_insert_matches_bulk_build_and_
+stays_minimal`, and the rest) still pass unchanged after this rewrite --
+the fix only touched how an already-correct answer is computed, not what
+answer is computed.

@@ -25,10 +25,11 @@ mod dictionary;
 mod entries_arena;
 mod front_coded_block;
 mod front_coded_dictionary;
+mod micro_fst;
 mod plain;
 
 pub use batch::{PreparedBatch, TermBatch};
-pub use dictionary::{BlockId, Dictionary};
+pub use dictionary::{BlockId, Dictionary, RebuildStats};
 pub use front_coded_dictionary::{FrontCodedBlockId, FrontCodedDictionary};
 pub use plain::PlainDictionary;
 

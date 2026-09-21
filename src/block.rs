@@ -43,6 +43,21 @@ pub(crate) struct Block {
     min_key: Box<str>,
 }
 
+/// The result of [`Block::merge_into`]: how many `incoming` terms were new,
+/// and how much of the merged output's leading portion is identical, entry
+/// for entry, to the block's pre-merge content -- see `unchanged_prefix`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct MergeOutcome {
+    pub(crate) added: usize,
+    /// The count of leading entries in the merged output whose position
+    /// matches their position in this block's existing content exactly
+    /// (same term, same id, same index) -- i.e. entries that occurred
+    /// before the first new/shifted entry. A caller maintaining a reverse
+    /// index keyed by `(block, position)` only needs to update entries
+    /// from this point on; everything before it is already correct.
+    pub(crate) unchanged_prefix: usize,
+}
+
 impl Block {
     /// Builds an immutable block from an already sorted, deduplicated,
     /// exact-size sequence of `(term, id)` pairs. The only way to
@@ -175,6 +190,81 @@ impl Block {
                 .expect("keys were inserted as valid UTF-8 str bytes");
             out.push(term, self.ids[i]);
             i += 1;
+        }
+    }
+
+    /// Merges this block's existing content with `incoming` (already
+    /// sorted and deduplicated) in a single streaming walk of the FST,
+    /// appending the union onto `out` (not cleared first). For every
+    /// `incoming` term not already present, `alloc_id` supplies a fresh
+    /// id; `resolved` is then called once per `incoming` term, in order,
+    /// with its final id (existing or freshly allocated), so a caller can
+    /// scatter results back to original positions without a second pass.
+    ///
+    /// Replaces what used to be two separate strategies picked by a
+    /// run-size heuristic: point `rank()` lookups per term, falling back
+    /// to a *second*, independent `decode_into` walk if any of them
+    /// missed (paying for both once a miss was found), or an upfront
+    /// `decode_into` followed by a separate merge pass over the result
+    /// (writing every surviving entry twice: once into the decoded
+    /// buffer, once into the merged output). This walks the FST's stream
+    /// exactly once, and every surviving entry is written exactly once,
+    /// directly into `out` -- at the cost of always paying O(block size)
+    /// even when nothing in `incoming` turns out to be new, which the old
+    /// point-lookup path could sometimes avoid entirely.
+    pub(crate) fn merge_into<'a>(
+        &self,
+        incoming: impl Iterator<Item = &'a str>,
+        out: &mut EntriesArena,
+        mut alloc_id: impl FnMut() -> TermId,
+        mut resolved: impl FnMut(TermId),
+    ) -> MergeOutcome {
+        let mut incoming = incoming.peekable();
+        let mut stream = self.fst.stream();
+        let mut i = 0usize;
+        let mut added = 0usize;
+        // Set the first time any entry's position could differ from its
+        // position in this block's existing content -- i.e. the first
+        // time something new is inserted before the rest has been
+        // written. Every entry written to `out` before that point is
+        // still at the same index it already occupied, so a caller
+        // maintaining a reverse index keyed by that position doesn't
+        // need to touch those entries at all.
+        let mut unchanged_prefix = None;
+        while let Some((key_bytes, _)) = stream.next() {
+            let old_term = std::str::from_utf8(key_bytes)
+                .expect("keys were inserted as valid UTF-8 str bytes");
+            while let Some(&inc) = incoming.peek() {
+                if inc < old_term {
+                    unchanged_prefix.get_or_insert(out.len());
+                    let id = alloc_id();
+                    added += 1;
+                    out.push(inc, id);
+                    resolved(id);
+                    incoming.next();
+                } else {
+                    break;
+                }
+            }
+            let matched = incoming.peek().is_some_and(|&inc| inc == old_term);
+            let id = self.ids[i];
+            out.push(old_term, id);
+            if matched {
+                incoming.next();
+                resolved(id);
+            }
+            i += 1;
+        }
+        for inc in incoming {
+            unchanged_prefix.get_or_insert(out.len());
+            let id = alloc_id();
+            added += 1;
+            out.push(inc, id);
+            resolved(id);
+        }
+        MergeOutcome {
+            added,
+            unchanged_prefix: unchanged_prefix.unwrap_or(out.len()),
         }
     }
 
@@ -314,6 +404,66 @@ mod tests {
             build_elapsed / ITERS as u32,
             clone_elapsed / ITERS as u32,
             (decode_elapsed + build_elapsed) / ITERS as u32,
+        );
+    }
+
+    /// Isolates `merge_into`'s cost against the two-step pattern it
+    /// replaced (`decode_into` into a scratch arena, then a second pass
+    /// reading that arena back out while merging), on the same
+    /// one-new-term-into-an-existing-block scenario, with no `Dictionary`-
+    /// level machinery (routing, id allocation bookkeeping, stats) in the
+    /// way -- purely to check the single-walk refactor is actually
+    /// cheaper in isolation, not just assumed to be from writing one
+    /// fewer array.
+    #[test]
+    #[ignore = "manual perf probe, not part of the regular suite"]
+    fn perf_probe_merge_into_vs_decode_then_merge() {
+        const N: usize = 160; // midpoint of the default block bounds, 64..=256
+        const ITERS: usize = 20_000;
+
+        let entries = sample_entries(N);
+        let block = build_from(&entries);
+        // A term that sorts partway through the block, so the merge does
+        // real comparison work on both sides, not just a boundary case.
+        let new_term = format!("http://example.org/term-{:06}-new", N / 2);
+
+        let mut old = EntriesArena::new();
+        let mut merged = EntriesArena::new();
+        let start = Instant::now();
+        for i in 0..ITERS {
+            old.clear();
+            block.decode_into(&mut old);
+            merged.clear();
+            crate::entries_arena::merge_into(
+                &old,
+                &[(new_term.as_str(), TermId((N + i) as u32))],
+                &mut merged,
+            );
+            std::hint::black_box(&merged);
+        }
+        let two_step_elapsed = start.elapsed();
+
+        let mut merged = EntriesArena::new();
+        let start = Instant::now();
+        for i in 0..ITERS {
+            merged.clear();
+            let next_id = TermId((N + i) as u32);
+            block.merge_into(
+                std::iter::once(new_term.as_str()),
+                &mut merged,
+                || next_id,
+                |_| {},
+            );
+            std::hint::black_box(&merged);
+        }
+        let single_walk_elapsed = start.elapsed();
+
+        eprintln!(
+            "block size {N}, {ITERS} iters, one new term per rebuild:\n\
+             decode_into + entries_arena::merge_into: {two_step_elapsed:?} ({:?}/op)\n\
+             Block::merge_into (single walk):         {single_walk_elapsed:?} ({:?}/op)",
+            two_step_elapsed / ITERS as u32,
+            single_walk_elapsed / ITERS as u32,
         );
     }
 

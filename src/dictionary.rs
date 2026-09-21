@@ -2,7 +2,7 @@ use std::num::NonZeroU32;
 
 use crate::batch::{BatchOrder, PreparedBatch};
 use crate::block::Block;
-use crate::entries_arena::{EntriesArena, merge_into};
+use crate::entries_arena::EntriesArena;
 use crate::{TermDictionary, TermId};
 
 /// A stable handle for a block: an index into `Dictionary`'s block slab.
@@ -31,6 +31,22 @@ impl BlockId {
 
 const DEFAULT_BLOCK_MIN: usize = 64;
 const DEFAULT_BLOCK_MAX: usize = 256;
+
+/// Cumulative counts of rebuild work, for measuring how batch shape affects
+/// rebuild frequency and decode volume (design doc H2/H5). `blocks_rebuilt`
+/// counts every [`Block::build`] call (splits and merge-driven rebuilds
+/// each count their constituent blocks separately); `entries_decoded`
+/// counts every entry read back out of an existing block via `decode_into`
+/// across all of those rebuilds. Neither counts the one-time initial
+/// `bootstrap` of an empty dictionary, since that has no "old" block to
+/// decode -- callers comparing configurations should snapshot
+/// [`Dictionary::rebuild_stats`] after their initial load and diff against
+/// a later snapshot to isolate steady-state insertion cost.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RebuildStats {
+    pub blocks_rebuilt: u64,
+    pub entries_decoded: u64,
+}
 
 /// Design-doc Stages 1 and 3: terms partitioned into contiguous lexical
 /// blocks bounded to `[block_min, block_max]` terms, each block a minimal
@@ -77,6 +93,7 @@ pub struct Dictionary {
     /// at once.
     scratch_a: EntriesArena,
     scratch_b: EntriesArena,
+    stats: RebuildStats,
 }
 
 impl Default for Dictionary {
@@ -118,12 +135,22 @@ impl Dictionary {
             len: 0,
             scratch_a: EntriesArena::new(),
             scratch_b: EntriesArena::new(),
+            stats: RebuildStats::default(),
         }
     }
 
     /// The number of live blocks, for introspection/testing.
     pub fn block_count(&self) -> usize {
         self.directory.len()
+    }
+
+    /// Cumulative rebuild/decode counts since this dictionary was created
+    /// (see [`RebuildStats`]). Snapshot before and after a phase of
+    /// interest and diff the two to isolate that phase's cost -- e.g. to
+    /// exclude an initial bootstrap load from a steady-state insertion
+    /// measurement.
+    pub fn rebuild_stats(&self) -> RebuildStats {
+        self.stats
     }
 
     /// Total logical byte size: every block's compressed FST payload plus
@@ -172,10 +199,8 @@ impl Dictionary {
             return result;
         }
 
-        // Take once per batch; empty replacement arenas allocate nothing.
-        let mut old = std::mem::take(&mut self.scratch_a);
+        // Take once per batch; empty replacement arena allocates nothing.
         let mut merged = std::mem::take(&mut self.scratch_b);
-        let mut new_entries = Vec::new();
         let mut u = 0;
         while u < order.unique_len() {
             let dir_idx = self.route(term(u)).expect("directory is non-empty");
@@ -190,73 +215,46 @@ impl Dictionary {
                 run_end = order.unique_len();
             }
             let block_id = self.directory[dir_idx].1;
-            let block_len = self.block(block_id).len();
-            let dense = run_end - u >= (block_len / 4).max(8);
-            let added;
-            if dense {
-                // One ordered traversal supplies both duplicate IDs and old
-                // terms for rebuilding. Avoid point lookups followed by a
-                // second decode of the same block for larger groups.
-                old.clear();
-                self.block(block_id).decode_into(&mut old);
-                merged.clear();
-                let mut i = 0;
-                let mut new_count = 0;
-                for k in u..run_end {
-                    let incoming = term(k);
-                    while i < old.len() && old.term_at(i) < incoming {
-                        merged.push(old.term_at(i), old.id_at(i));
-                        i += 1;
-                    }
-                    let id = if i < old.len() && old.term_at(i) == incoming {
-                        let id = old.id_at(i);
-                        i += 1;
+
+            merged.clear();
+            // Direct field access (not the `self.block(id)` method) so this
+            // borrows only `self.blocks`, leaving `self.free_term_ids`/
+            // `self.next_term_id` free for the id-allocation closure below --
+            // both run inside one FST walk now, not two passes needing `self`
+            // shared in incompatible ways.
+            let block_ref = self.blocks[block_id.slot() as usize]
+                .as_ref()
+                .expect("BlockId must reference a live block");
+            self.stats.entries_decoded += block_ref.len() as u64;
+
+            let mut k = u;
+            let free_term_ids = &mut self.free_term_ids;
+            let next_term_id = &mut self.next_term_id;
+            let outcome = block_ref.merge_into(
+                (u..run_end).map(&term),
+                &mut merged,
+                || match free_term_ids.pop() {
+                    Some(slot) => TermId(slot),
+                    None => {
+                        let id = TermId(*next_term_id);
+                        *next_term_id += 1;
                         id
-                    } else {
-                        new_count += 1;
-                        self.alloc_term_id()
-                    };
-                    merged.push(incoming, id);
+                    }
+                },
+                |id| {
                     for &pos in order.positions(k) {
                         result[pos] = id;
                     }
-                }
-                while i < old.len() {
-                    merged.push(old.term_at(i), old.id_at(i));
-                    i += 1;
-                }
-                added = new_count;
-            } else {
-                // Sparse duplicate-only groups should not decode whole blocks.
-                new_entries.clear();
-                for k in u..run_end {
-                    let incoming = term(k);
-                    let id = match self.block(block_id).rank(incoming) {
-                        Some(rank) => self.block(block_id).id_at(rank),
-                        None => {
-                            let id = self.alloc_term_id();
-                            new_entries.push((incoming, id));
-                            id
-                        }
-                    };
-                    for &pos in order.positions(k) {
-                        result[pos] = id;
-                    }
-                }
-                added = new_entries.len();
-                if added > 0 {
-                    old.clear();
-                    self.block(block_id).decode_into(&mut old);
-                    merge_into(&old, &new_entries, &mut merged);
-                }
-            }
-            if added > 0 {
-                self.rebuild_batch_block(dir_idx, &merged);
-                self.len += added;
+                    k += 1;
+                },
+            );
+
+            if outcome.added > 0 {
+                self.rebuild_batch_block(dir_idx, &merged, outcome.unchanged_prefix);
+                self.len += outcome.added;
             }
             u = run_end;
         }
-        self.scratch_a = old;
         self.scratch_b = merged;
         result
     }
@@ -372,12 +370,18 @@ impl Dictionary {
     /// writes, which measurement shows is negligible next to the
     /// decode+rebuild cost that already dominates every one of these
     /// call sites (see DESIGN.md's "H3" section).
+    /// `skip` leading entries are assumed already correct in
+    /// `id_to_block` at their current position (see
+    /// [`crate::block::MergeOutcome::unchanged_prefix`] and the
+    /// `split`/`merge_with_neighbor` call sites, which know a prefix is
+    /// untouched without needing a merge at all) and are not rewritten.
     fn assign_ranks<'a>(
         &mut self,
         block_id: BlockId,
         entries: impl Iterator<Item = (&'a str, TermId)>,
+        skip: usize,
     ) {
-        for (local_rank, (_, id)) in entries.enumerate() {
+        for (local_rank, (_, id)) in entries.enumerate().skip(skip) {
             self.set_id_to_block(id, block_id, local_rank);
         }
     }
@@ -398,7 +402,20 @@ impl Dictionary {
     /// The merged arena contains only this destination's old and incoming
     /// terms. Build each final FST once, without constructing an oversized
     /// FST and decoding/rebuilding it through recursive splits.
-    fn rebuild_batch_block(&mut self, dir_idx: usize, merged: &EntriesArena) {
+    ///
+    /// `unchanged_prefix` (from the [`crate::block::MergeOutcome`] that
+    /// produced `merged`) is only meaningful for chunk 0: it keeps the
+    /// original `BlockId` and the same 0-based local ranks the block had
+    /// before this rebuild, so a leading run of entries there can still be
+    /// exactly where they were. Every later chunk gets a fresh `BlockId`
+    /// and renumbers from 0 regardless, so no prefix of it can match what
+    /// any entry had before -- `assign_ranks` always runs unskipped there.
+    fn rebuild_batch_block(
+        &mut self,
+        dir_idx: usize,
+        merged: &EntriesArena,
+        unchanged_prefix: usize,
+    ) {
         let total = merged.len();
         debug_assert!(total > 0);
         let chunks = total.div_ceil(self.block_max);
@@ -414,6 +431,7 @@ impl Dictionary {
         for chunk in 0..chunks {
             let end = start + base + usize::from(chunk < extra);
             let block = Block::build(merged.range(start, end));
+            self.stats.blocks_rebuilt += 1;
             let min_key: Box<str> = block.min_key().into();
             let block_id = if chunk == 0 {
                 *self.block_mut(original_id) = block;
@@ -424,11 +442,17 @@ impl Dictionary {
                 new_directory.push((min_key, id));
                 id
             };
-            self.assign_ranks(block_id, merged.range(start, end));
+            let skip = if chunk == 0 {
+                unchanged_prefix.min(end)
+            } else {
+                0
+            };
+            self.assign_ranks(block_id, merged.range(start, end), skip);
             start = end;
         }
         // Shift the router's tail once, rather than once per split.
-        self.directory.splice(dir_idx + 1..dir_idx + 1, new_directory);
+        self.directory
+            .splice(dir_idx + 1..dir_idx + 1, new_directory);
     }
 
     /// Repeatedly splits the block at `start_dir_idx` (and any newly
@@ -452,17 +476,22 @@ impl Dictionary {
         let mut arena = std::mem::take(&mut self.scratch_a);
         arena.clear();
         self.block(block_id).decode_into(&mut arena);
+        self.stats.entries_decoded += arena.len() as u64;
         let mid = arena.len() / 2;
 
         let left_block = Block::build(arena.range(0, mid));
         let right_block = Block::build(arena.range(mid, arena.len()));
+        self.stats.blocks_rebuilt += 2;
         let right_min: Box<str> = right_block.min_key().into();
 
+        // The left half keeps `block_id` *and* exactly the same 0-based
+        // local ranks it already had (it's `arena`'s first `mid` entries,
+        // in the same order, under the same id) -- id_to_block is already
+        // correct for every one of them, so there's nothing to reassign.
         *self.block_mut(block_id) = left_block;
-        self.assign_ranks(block_id, arena.range(0, mid));
 
         let right_block_id = self.alloc_block(right_block);
-        self.assign_ranks(right_block_id, arena.range(mid, arena.len()));
+        self.assign_ranks(right_block_id, arena.range(mid, arena.len()), 0);
 
         self.scratch_a = arena;
 
@@ -493,6 +522,7 @@ impl Dictionary {
 
         let keep_block_id = self.directory[keep_idx].1;
         let absorb_block_id = self.directory[absorb_idx].1;
+        let keep_len = self.block(keep_block_id).len();
 
         // Blocks partition sorted space contiguously and keep_idx < absorb_idx,
         // so `keep`'s entries are already all lexically smaller: decoding
@@ -502,13 +532,16 @@ impl Dictionary {
         arena.clear();
         self.block(keep_block_id).decode_into(&mut arena);
         self.block(absorb_block_id).decode_into(&mut arena);
+        self.stats.entries_decoded += arena.len() as u64;
 
         let rebuilt = Block::build(arena.iter());
+        self.stats.blocks_rebuilt += 1;
         *self.block_mut(keep_block_id) = rebuilt;
-        // Reassigns every entry, not just the absorbed half: Variant B (§5)
-        // needs the whole rebuilt block's local ranks refreshed, not just
-        // which BlockId owns them.
-        self.assign_ranks(keep_block_id, arena.iter());
+        // `keep`'s own entries stay at `keep_block_id`, in the same order,
+        // at the same 0-based ranks they already had (they were decoded
+        // first, into a fresh arena) -- only the absorbed half, appended
+        // after them, is actually new at this BlockId and needs assigning.
+        self.assign_ranks(keep_block_id, arena.iter(), keep_len);
 
         self.scratch_a = arena;
 
@@ -549,9 +582,8 @@ impl Dictionary {
                 }
             }
 
-            let block = Block::build(
-                (start..end).map(term).zip(chunk_ids.iter().copied()),
-            );
+            let block = Block::build((start..end).map(term).zip(chunk_ids.iter().copied()));
+            self.stats.blocks_rebuilt += 1;
             let min_key: Box<str> = block.min_key().into();
             let block_id = self.alloc_block(block);
             for (local_rank, &id) in chunk_ids.iter().enumerate() {
@@ -595,21 +627,41 @@ impl TermDictionary for Dictionary {
             return self.block(block_id).id_at(local_rank);
         }
 
-        let id = self.alloc_term_id();
-
-        let mut old = std::mem::take(&mut self.scratch_a);
-        old.clear();
-        self.block(block_id).decode_into(&mut old);
-
         let mut merged = std::mem::take(&mut self.scratch_b);
-        merge_into(&old, &[(term, id)], &mut merged);
+        merged.clear();
+        // Same single-walk primitive as the batch path: one FST stream
+        // finds the miss (already known from the `rank` check above, but
+        // `merge_into` re-derives it as a side effect of producing the
+        // rebuilt content) and allocates its id in the same pass, instead
+        // of a separate decode-then-merge.
+        let block_ref = self.blocks[block_id.slot() as usize]
+            .as_ref()
+            .expect("BlockId must reference a live block");
+        self.stats.entries_decoded += block_ref.len() as u64;
+        let free_term_ids = &mut self.free_term_ids;
+        let next_term_id = &mut self.next_term_id;
+        let mut id = None;
+        let outcome = block_ref.merge_into(
+            std::iter::once(term),
+            &mut merged,
+            || match free_term_ids.pop() {
+                Some(slot) => TermId(slot),
+                None => {
+                    let new_id = TermId(*next_term_id);
+                    *next_term_id += 1;
+                    new_id
+                }
+            },
+            |resolved_id| id = Some(resolved_id),
+        );
+        let id = id.expect("the single incoming term always resolves to exactly one id");
 
         let rebuilt = Block::build(merged.iter());
+        self.stats.blocks_rebuilt += 1;
         self.directory[dir_idx].0 = rebuilt.min_key().into();
         *self.block_mut(block_id) = rebuilt;
-        self.assign_ranks(block_id, merged.iter());
+        self.assign_ranks(block_id, merged.iter(), outcome.unchanged_prefix);
 
-        self.scratch_a = old;
         self.scratch_b = merged;
 
         self.len += 1;
@@ -632,6 +684,7 @@ impl TermDictionary for Dictionary {
         let mut old = std::mem::take(&mut self.scratch_a);
         old.clear();
         self.block(block_id).decode_into(&mut old);
+        self.stats.entries_decoded += old.len() as u64;
 
         self.id_to_block[id.0 as usize] = None;
         self.free_term_ids.push(id.0);
@@ -651,10 +704,14 @@ impl TermDictionary for Dictionary {
             }
 
             let rebuilt = Block::build(filtered.iter());
+            self.stats.blocks_rebuilt += 1;
             self.directory[dir_idx].0 = rebuilt.min_key().into();
             let remaining = rebuilt.len();
             *self.block_mut(block_id) = rebuilt;
-            self.assign_ranks(block_id, filtered.iter());
+            // Entries before the removed rank keep the same index they
+            // already had (nothing before it moved); only entries from
+            // the removed position onward shifted down by one.
+            self.assign_ranks(block_id, filtered.iter(), local_rank);
 
             self.scratch_a = old;
             self.scratch_b = filtered;
@@ -674,6 +731,54 @@ impl TermDictionary for Dictionary {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Instant;
+
+    /// Isolates `assign_ranks`'s own cost with vs. without the
+    /// `unchanged_prefix` skip, on a fixed 256-entry block (the default
+    /// `block_max`) with a fresh id-to-block insertion at the midpoint --
+    /// the average case for a single insert into an already-full block,
+    /// skipping about half the writes. Run alongside `perf stat` on
+    /// `examples/perf_insert_single_flush.rs` for the full-pipeline
+    /// picture: this isolates whether the skip is worth anything at all,
+    /// separate from the much larger, noisier per-insert total that also
+    /// includes `Block::build`'s FST construction.
+    #[test]
+    #[ignore = "manual perf probe, not part of the regular suite"]
+    fn perf_probe_assign_ranks_skip() {
+        const N: usize = 256;
+        const ITERS: usize = 200_000;
+
+        let entries: Vec<(String, TermId)> = (0..N)
+            .map(|i| (format!("http://example.org/term-{i:06}"), TermId(i as u32)))
+            .collect();
+        let block_id = BlockId::from_slot(0);
+
+        let mut dict = Dictionary::with_block_bounds(2, N);
+        let start = Instant::now();
+        for _ in 0..ITERS {
+            dict.assign_ranks(block_id, entries.iter().map(|(t, id)| (t.as_str(), *id)), 0);
+        }
+        let no_skip_elapsed = start.elapsed();
+
+        let mut dict = Dictionary::with_block_bounds(2, N);
+        let start = Instant::now();
+        for _ in 0..ITERS {
+            dict.assign_ranks(
+                block_id,
+                entries.iter().map(|(t, id)| (t.as_str(), *id)),
+                N / 2,
+            );
+        }
+        let half_skip_elapsed = start.elapsed();
+
+        eprintln!(
+            "assign_ranks on a {N}-entry block, {ITERS} iters:\n\
+             skip=0 (current behavior before this change):    {no_skip_elapsed:?} ({:?}/op)\n\
+             skip=N/2 (average case for one mid-block insert): {half_skip_elapsed:?} ({:?}/op)",
+            no_skip_elapsed / ITERS as u32,
+            half_skip_elapsed / ITERS as u32,
+        );
+    }
 
     #[test]
     fn insert_is_idempotent() {
