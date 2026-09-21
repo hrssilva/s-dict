@@ -136,6 +136,34 @@ impl FrontCodedDictionary {
         true
     }
 
+    /// See [`crate::Dictionary::get_terms_into`] -- identical contract.
+    pub fn get_terms_into(&self, ids: &[TermId], out: &mut Vec<Option<String>>) {
+        out.clear();
+        out.resize(ids.len(), None);
+
+        let mut by_block: std::collections::HashMap<FrontCodedBlockId, Vec<(usize, u16)>> =
+            std::collections::HashMap::new();
+        for (pos, &id) in ids.iter().enumerate() {
+            if let Some((block_id, local_rank)) =
+                self.id_to_block.get(id.0 as usize).copied().flatten()
+            {
+                by_block
+                    .entry(block_id)
+                    .or_default()
+                    .push((pos, local_rank));
+            }
+        }
+
+        let mut arena = EntriesArena::new();
+        for (block_id, positions) in by_block {
+            arena.clear();
+            self.block(block_id).decode_into(&mut arena);
+            for (pos, local_rank) in positions {
+                out[pos] = Some(arena.term_at(local_rank as usize).to_string());
+            }
+        }
+    }
+
     fn block(&self, id: FrontCodedBlockId) -> &FrontCodedBlock {
         self.blocks[id.slot() as usize]
             .as_ref()
@@ -539,6 +567,32 @@ mod tests {
         buf.clear();
         assert!(!dict.get_term_into(missing, &mut buf));
         assert!(buf.is_empty());
+    }
+
+    #[test]
+    fn get_terms_into_matches_individual_lookups_across_blocks() {
+        let mut dict = FrontCodedDictionary::with_block_bounds(2, 8);
+        let terms: Vec<String> = (0..100).map(|i| format!("term-{i:04}")).collect();
+        let ids: Vec<TermId> = terms.iter().map(|t| dict.insert(t)).collect();
+        assert!(dict.block_count() > 1, "should span multiple blocks");
+
+        let mut query: Vec<TermId> = vec![ids[50], ids[3], ids[99], ids[50], ids[0]];
+        query.push(TermId(999_999)); // absent
+
+        let mut out = Vec::new();
+        dict.get_terms_into(&query, &mut out);
+        assert_eq!(out.len(), query.len());
+        for (i, &id) in query.iter().enumerate() {
+            assert_eq!(out[i], dict.get_term(id), "mismatch at query position {i}");
+        }
+    }
+
+    #[test]
+    fn get_terms_into_empty_input() {
+        let dict = FrontCodedDictionary::with_block_bounds(2, 8);
+        let mut out = vec![Some("stale".to_string())];
+        dict.get_terms_into(&[], &mut out);
+        assert!(out.is_empty());
     }
 
     #[test]

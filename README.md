@@ -41,19 +41,46 @@ optimization pass (DESIGN.md's "Optimization pass" section): a
 struct-of-arrays scratch buffer (`EntriesArena`) replacing a
 `Vec<(Box<str>, TermId)>` that allocated per-term on every block rebuild,
 a buffer-reusing `get_term_into` alongside the allocating `get_term`
-(confirmed with `perf`-measured hardware counters, not just wall clock --
-see DESIGN.md), `u16` instead of `u32` for a field genuinely bounded by a
-single term's length, and a `NonZeroU32`-backed `BlockId` for a niche
-optimization. On top of that, `Dictionary`/`FrontCodedDictionary` both
-moved from design doc §5's Variant A reverse mapping to Variant B
+(confirmed with `perf`-measured hardware counters on both synthetic *and*
+real-corpus data -- see DESIGN.md), `u16` instead of `u32` for a field
+genuinely bounded by a single term's length, and a `NonZeroU32`-backed
+`BlockId` for a niche optimization. `Dictionary`/`FrontCodedDictionary`
+also moved from design doc §5's Variant A reverse mapping to Variant B
 (`TermId -> (BlockId, local_rank)`, no scan) after measuring both --
 faster reverse lookups, more reverse-directory space, exactly the
-tradeoff §5 names, now with real numbers on each side. `Block::term_at_into`
-also now walks the FST's `raw` API directly with a binary search instead
-of calling the `fst` crate's own `get_key_into` (a linear scan) -- a
-`perf record` call-graph profile found that scan's generic-`Iterator`
+tradeoff §5 names, now with real numbers on each side.
+
+`Block::term_at_into` also walks the FST's `raw` API directly with a
+binary search instead of calling the `fst` crate's own `get_key_into` (a
+linear scan) -- a `perf record` call-graph profile on synthetic
+high-branching-factor keys found that scan's generic-`Iterator`
 overhead, not per-transition data decoding, was 41.5% of that function's
-runtime; the fix cuts wall-clock decode time ~13% at bulk scale.
+runtime. **A follow-up profile on real RDF terms (the W3C test corpus,
+via a sibling `s-bench` profiling harness) found this doesn't generalize**:
+real IRIs have low branching factor at most nodes (long shared literal
+path segments dominate), so there's rarely more than one or two
+candidates to search among, and `perf annotate` showed the true cost is
+`node.transition(idx)`'s bit-unpacking itself, paid once per transition
+regardless of how it was found. The binary search is kept (it's never
+worse, and is a real backstop on pathological data) but isn't the actual
+lever for real-world `get_term` cost -- see DESIGN.md's "Correction"
+subsection for the full story, including why that matters more than the
+result itself (a synthetic benchmark quietly encoded an assumption that
+doesn't hold for real RDF terms, and only a real-corpus measurement
+caught it). What *does* generalize to real data: the `get_term`/
+`get_term_into` allocation gap, and a new finding -- `Node::new` (walking
+to each node while decoding) is a distinct, substantial cost, motivating
+`get_terms_into`: a bulk decode entry point that decodes each affected
+block once (reusing the existing streaming machinery) instead of
+re-walking the FST from the root once per id, for callers resolving many
+ids at once (dictionary dumps, or any workload where requested ids
+cluster within blocks). Measured on a 2,000,000-term dictionary:
+**3.8x faster** than repeated `get_term_into` calls when dumping
+(nearly) everything, and, just as expected and just as important to
+report, **~19x slower** for ids scattered one-per-block -- `get_terms_into`
+decodes a whole block to serve a single id from it in that case, exactly
+the documented tradeoff, not a special case to hide. See DESIGN.md for
+both numbers and how to reproduce them.
 
 A non-trivial router, RDF-aware term decomposition, and the remaining §13
 baselines (global static minimal FST, dynamic compact tries, global FST +
@@ -96,6 +123,14 @@ assert_eq!(
 let mut buf = Vec::new();
 dict.get_term_into(class_id, &mut buf);
 assert_eq!(std::str::from_utf8(&buf).unwrap(), "http://www.w3.org/2000/01/rdf-schema#Class");
+
+// get_terms_into decodes many ids in one call, one streaming pass per
+// affected block instead of one FST walk per id -- for bulk lookups
+// (dictionary dumps, or any workload where requested ids cluster within
+// a block, e.g. namespace-clustered real RDF data).
+let mut terms = Vec::new();
+dict.get_terms_into(&[type_id, class_id], &mut terms);
+assert_eq!(terms[0].as_deref(), Some("http://www.w3.org/1999/02/22-rdf-syntax-ns#type"));
 
 // Batch insertion groups new terms by destination block instead of
 // rebuilding a block once per term.

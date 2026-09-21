@@ -166,6 +166,44 @@ impl Dictionary {
         true
     }
 
+    /// Decodes many ids in one call, grouped by block and decoded once per
+    /// affected block (via the existing `decode_into`/`EntriesArena`
+    /// streaming machinery) instead of one independent root-to-leaf FST
+    /// walk per id -- see DESIGN.md's "Bulk decode" section for why and
+    /// when this wins over repeated `get_term_into` calls (bulk/clustered
+    /// access) versus when it doesn't (a few ids scattered across many
+    /// blocks, where this still decodes each whole affected block).
+    ///
+    /// `ids` need not be sorted or deduplicated. `out` is cleared first
+    /// and filled in the same order as `ids`; `None` marks an id not
+    /// present.
+    pub fn get_terms_into(&self, ids: &[TermId], out: &mut Vec<Option<String>>) {
+        out.clear();
+        out.resize(ids.len(), None);
+
+        let mut by_block: std::collections::HashMap<BlockId, Vec<(usize, u16)>> =
+            std::collections::HashMap::new();
+        for (pos, &id) in ids.iter().enumerate() {
+            if let Some((block_id, local_rank)) =
+                self.id_to_block.get(id.0 as usize).copied().flatten()
+            {
+                by_block
+                    .entry(block_id)
+                    .or_default()
+                    .push((pos, local_rank));
+            }
+        }
+
+        let mut arena = EntriesArena::new();
+        for (block_id, positions) in by_block {
+            arena.clear();
+            self.block(block_id).decode_into(&mut arena);
+            for (pos, local_rank) in positions {
+                out[pos] = Some(arena.term_at(local_rank as usize).to_string());
+            }
+        }
+    }
+
     fn block(&self, id: BlockId) -> &Block {
         self.blocks[id.slot() as usize]
             .as_ref()
@@ -241,6 +279,43 @@ impl Dictionary {
             .directory
             .partition_point(|(min_key, _)| min_key.as_ref() <= term);
         Some(idx.saturating_sub(1))
+    }
+
+    /// Replace one batch destination with final-sized, balanced blocks.
+    /// The merged arena contains only this destination's old and incoming
+    /// terms. Build each final FST once, without constructing an oversized
+    /// FST and decoding/rebuilding it through recursive splits.
+    fn rebuild_batch_block(&mut self, dir_idx: usize, merged: &EntriesArena) {
+        let total = merged.len();
+        debug_assert!(total > 0);
+        let chunks = total.div_ceil(self.block_max);
+        let base = total / chunks;
+        let extra = total % chunks;
+        // For an overflowing block, block_max >= 2 * block_min guarantees
+        // every balanced chunk is also at least block_min terms long.
+        debug_assert!(chunks == 1 || base >= self.block_min);
+
+        let original_id = self.directory[dir_idx].1;
+        let mut new_directory = Vec::with_capacity(chunks - 1);
+        let mut start = 0;
+        for chunk in 0..chunks {
+            let end = start + base + usize::from(chunk < extra);
+            let block = Block::build(merged.range(start, end));
+            let min_key: Box<str> = block.min_key().into();
+            let block_id = if chunk == 0 {
+                *self.block_mut(original_id) = block;
+                self.directory[dir_idx].0 = min_key;
+                original_id
+            } else {
+                let id = self.alloc_block(block);
+                new_directory.push((min_key, id));
+                id
+            };
+            self.assign_ranks(block_id, merged.range(start, end));
+            start = end;
+        }
+        // Shift the router's tail once, rather than once per split.
+        self.directory.splice(dir_idx + 1..dir_idx + 1, new_directory);
     }
 
     /// Repeatedly splits the block at `start_dir_idx` (and any newly
@@ -504,16 +579,12 @@ impl TermDictionary for Dictionary {
                 let mut merged = std::mem::take(&mut self.scratch_b);
                 merge_into(&old, &new_entries, &mut merged);
 
-                let rebuilt = Block::build(merged.iter());
-                self.directory[dir_idx].0 = rebuilt.min_key().into();
-                *self.block_mut(block_id) = rebuilt;
-                self.assign_ranks(block_id, merged.iter());
+                self.rebuild_batch_block(dir_idx, &merged);
 
                 self.scratch_a = old;
                 self.scratch_b = merged;
 
                 self.len += added;
-                self.split_while_oversized(dir_idx);
             }
 
             u = run_end;
@@ -606,6 +677,33 @@ mod tests {
     }
 
     #[test]
+    fn get_terms_into_matches_individual_lookups_across_blocks() {
+        let mut dict = Dictionary::with_block_bounds(2, 8);
+        let terms: Vec<String> = (0..100).map(|i| format!("term-{i:04}")).collect();
+        let ids: Vec<TermId> = terms.iter().map(|t| dict.insert(t)).collect();
+        assert!(dict.block_count() > 1, "should span multiple blocks");
+
+        // Arbitrary order, with a duplicate and a missing id mixed in.
+        let mut query: Vec<TermId> = vec![ids[50], ids[3], ids[99], ids[50], ids[0]];
+        query.push(TermId(999_999)); // absent
+
+        let mut out = Vec::new();
+        dict.get_terms_into(&query, &mut out);
+        assert_eq!(out.len(), query.len());
+        for (i, &id) in query.iter().enumerate() {
+            assert_eq!(out[i], dict.get_term(id), "mismatch at query position {i}");
+        }
+    }
+
+    #[test]
+    fn get_terms_into_empty_input() {
+        let dict = Dictionary::with_block_bounds(2, 8);
+        let mut out = vec![Some("stale".to_string())];
+        dict.get_terms_into(&[], &mut out);
+        assert!(out.is_empty());
+    }
+
+    #[test]
     fn remove_absent_is_none() {
         let mut dict = Dictionary::with_block_bounds(2, 8);
         assert_eq!(dict.remove("nope"), None);
@@ -690,6 +788,88 @@ mod tests {
         for t in &term_refs {
             assert!(dict.get_id(t).is_some());
         }
+    }
+
+    #[test]
+    fn large_incremental_batch_builds_balanced_blocks_and_preserves_ids() {
+        // Exercise both the minimum allowed max/min ratio and odd maxima,
+        // including batches leaving a one-term remainder before balancing.
+        for (min, max) in [(1, 2), (2, 4), (2, 5), (3, 8)] {
+            for total in [max, max + 1, max * 8 + 1] {
+                let mut dict = Dictionary::with_block_bounds(min, max);
+                let terms: Vec<String> = (0..total).map(|i| format!("t{i:04}")).collect();
+                let old_id = dict.insert(&terms[total / 2]);
+                let original_block = dict.directory[0].1;
+                let mut refs: Vec<&str> = terms.iter().rev().map(String::as_str).collect();
+                refs.push(&terms[total / 2]);
+                let ids = dict.insert_batch(&refs);
+                assert_eq!(dict.len(), total);
+                assert_eq!(dict.block_count(), total.div_ceil(max));
+                assert_eq!(dict.directory[0].1, original_block);
+                assert_eq!(dict.get_id(&terms[total / 2]), Some(old_id));
+                for (&term, &id) in refs.iter().zip(&ids) {
+                    assert_eq!(dict.get_id(term), Some(id));
+                    assert_eq!(dict.get_term(id).as_deref(), Some(term));
+                }
+                let sizes: Vec<_> = dict
+                    .directory
+                    .iter()
+                    .map(|(_, id)| dict.block(*id).len())
+                    .collect();
+                assert!(sizes.iter().all(|&n| n >= min && n <= max));
+                assert!(sizes.iter().max().unwrap() - sizes.iter().min().unwrap() <= 1);
+            }
+        }
+    }
+
+    #[test]
+    fn incremental_batches_route_across_expanding_blocks_and_reuse_slots() {
+        let mut dict = Dictionary::with_block_bounds(2, 4);
+        let seed = ["b", "d", "f", "h", "j", "l", "n", "p", "r", "t", "v", "x"];
+        let seed_ids = dict.insert_batch(&seed);
+        // Free a block slot and some term IDs before the bulk update.
+        for term in &seed[4..] {
+            dict.remove(term);
+        }
+        assert!(!dict.free_block_slots.is_empty());
+        let terms: Vec<String> = ["a", "c", "e", "g", "i", "z"]
+            .into_iter()
+            .flat_map(|prefix| (0..17).map(move |i| format!("{prefix}{i:03}")))
+            .collect();
+        let mut refs: Vec<&str> = terms.iter().rev().map(String::as_str).collect();
+        refs.extend_from_slice(&seed[..4]);
+        refs.extend_from_slice(&["a000", "z016", "b"]);
+        let ids = dict.insert_batch(&refs);
+        assert_eq!(dict.len(), terms.len() + 4);
+        for (&term, &id) in refs.iter().zip(&ids) {
+            assert_eq!(dict.get_id(term), Some(id));
+            assert_eq!(dict.get_term(id).as_deref(), Some(term));
+        }
+        for (&term, &id) in seed[..4].iter().zip(&seed_ids) {
+            assert_eq!(dict.get_id(term), Some(id));
+        }
+        for pair in dict.directory.windows(2) {
+            assert!(pair[0].0 < pair[1].0);
+        }
+        for (key, id) in &dict.directory {
+            let block = dict.block(*id);
+            assert_eq!(key.as_ref(), block.min_key());
+            assert!((2..=4).contains(&block.len()));
+        }
+        assert_eq!(dict.insert_batch(&refs), ids);
+        // Later ordinary mutations must still find and update all mappings.
+        for term in terms
+            .iter()
+            .map(String::as_str)
+            .chain(seed[..4].iter().copied())
+        {
+            let id = dict.get_id(term).unwrap();
+            assert_eq!(dict.remove(term), Some(id));
+            assert_eq!(dict.get_term(id), None);
+        }
+        assert!(dict.is_empty());
+        let id = dict.insert("after");
+        assert_eq!(dict.get_term(id).as_deref(), Some("after"));
     }
 
     #[test]

@@ -728,6 +728,172 @@ gains would mean touching the FST's own byte-level decode routines
 (`common_input`, `unpack_delta`) rather than how we call into them, a
 larger step than this one.
 
+#### Correction: the win above doesn't generalize to real RDF terms
+
+The section above is left intact rather than quietly edited, because it's
+a real measurement on the dataset it names -- but that dataset
+(`http://example.org/term-{i:08}`, an 8-digit sequential numeric suffix)
+turned out to be an unrepresentative stress test, and a follow-up
+investigation using a *real* corpus found something materially
+different. Credit: a parallel investigation built
+`s-bench/src/bin/dict_profile.rs`, `s-dict`'s own profiling-harness
+pattern (`perf_get_term.rs`/`perf_decode_bulk.rs`) pointed at the actual
+W3C RDF test suite terms instead of synthetic keys, plus `perf
+annotate` on `term_at_into`'s disassembly -- a level of detail this
+document hadn't gone to.
+
+The synthetic digit suffix forces up to 10-way branching at every one of
+8 byte positions specifically *because* sequential integers spread
+evenly across all 10 digits at each position -- that's what made the
+linear-scan-vs-binary-search comparison count meaningful enough to
+matter in the first place. Real IRIs don't look like that: long shared
+literal path segments (namespace prefixes, common local-name structure)
+dominate, and most nodes along a real term's decode path have low
+branching factor -- often exactly one viable transition, sometimes a
+handful, rarely anywhere near 10. On the real corpus (832 real terms,
+5,000 repeats), `get_term`/`get_term_into`'s cycle and wall-clock numbers
+came back statistically flat between the linear-scan and binary-search
+versions: **there was rarely more than one or two candidates to search
+among at a node in the first place**, so changing an O(k) scan to an
+O(log k) search saves close to nothing when k itself is already small.
+
+`perf annotate` on `term_at_into` confirms *why* directly, at the
+instruction level: the dominant cost inside the function is not the
+comparison/branch logic that decides which transition index to fetch at
+all -- it's `node.transition(idx)` itself, specifically the shifts,
+ANDs, and conditional moves needed to unpack *one* compactly bit-packed
+transition record out of the FST's succinct encoding. That cost is paid
+once per transition *decoded*, regardless of whether the index to decode
+was found by a linear scan or a binary search -- the search algorithm
+only changes how many candidates get examined before finding the right
+one, not the cost of examining each one, and on real data that candidate
+count was never large enough for the difference to matter.
+
+The binary search change itself isn't wrong to keep -- O(log k) is never
+worse than O(k), and on pathological high-branching-factor data (however
+rare in practice) it remains a real backstop -- but it should not be
+cited as *the* fix for real-world `get_term` cost, because on real data
+it isn't. This is exactly the kind of thing §11's discipline exists to
+catch, and this correction is itself evidence the discipline works: a
+synthetic dataset chosen to be easy to reason about (sequential integers)
+quietly encoded an assumption -- uniform, high branching factor -- that
+doesn't hold for the actual target domain, and only a real-corpus
+measurement caught it.
+
+Reconfirmed on the real corpus, generalizing cleanly from the earlier
+synthetic result: the `get_term` vs. `get_term_into` allocation-avoidance
+gap is real and holds. Per-op deltas (`setup_only` subtracted):
+
+| metric | `get_term` | `get_term_into` | ratio |
+|---|---:|---:|---:|
+| cycles | 2234 | 1795 | 1.24x |
+| instructions | 7302 | 6472 | 1.13x |
+| cache-references | 1.04 | 0.42 | **2.48x** |
+| branches | 1090 | 907 | 1.20x |
+
+The cache-references gap (2.48x) stands out from the others (~1.2x) --
+the same signature as the earlier 20,000-term/2,000,000-term
+measurements: `get_term`'s fresh per-call allocation touching cold heap
+memory, `get_term_into`'s reused buffer staying resident. `perf report`
+self-time confirms it's isolated cleanly: `get_term` spends 61.4% of
+self-time in `term_at_into`, 19.9% in `fst::raw::node::Node::new` (node
+construction/decode while walking), and ~13.5% spread across
+malloc/realloc/free internals; `get_term_into` spends 73.6% in
+`term_at_into`, 25.1% in `Node::new`, and allocator activity drops to
+near zero -- the ~13.5% in `get_term` is entirely the avoidable
+allocation, nothing else moved.
+
+`Node::new` showing up as a distinct, substantial cost (~20-25% of
+self-time, separate from `term_at_into`'s own transition-decode work) is
+the new finding this investigation surfaced that the earlier one didn't:
+every `get_term_into` call walks from the FST root and re-decodes every
+node along the path, including nodes shared with the *previous* call if
+the two requested ids happen to be lexically close (namespace-clustered
+real data, §8, makes this likely for anything resembling bulk access).
+Point lookups can't avoid this -- each call is independent by design --
+but a caller resolving *many* ids at once could, by reusing the
+existing streaming decode (`decode_into`/`EntriesArena`, already O(block
+size) with zero per-entry allocation after the arena work above) instead
+of re-walking from the root once per id.
+
+Priorities out of this, in order:
+
+1. **Already correct, keep using it as the default hot path:**
+   `get_term_into`. The allocator overhead it avoids is real, confirmed
+   again on real data, and there's already an API for it.
+2. **Worth building:** a bulk/multi-id decode entry point using the
+   existing block-level streaming machinery, for callers resolving many
+   ids at once -- exactly a "dump the dictionary" workload. Implemented
+   below as `get_terms_into`.
+3. **Deprioritized based on this evidence:** further tuning the
+   transition-search algorithm. The bottleneck is per-transition *decode*
+   cost inside `fst`, not comparison count -- real, low-branching-factor
+   data doesn't have much comparison count left to cut.
+4. **Speculative, needs its own investigation if 1-2 aren't enough:**
+   whether `fst`'s own encoding parameters (transition/output byte
+   widths) could be tuned for cheaper per-transition decode. That's
+   inside a third-party dependency's internals, a materially bigger step
+   than anything else in this section.
+
+### Bulk decode: `get_terms_into`
+
+Acting on priority 2 above. `Dictionary::get_terms_into`/
+`FrontCodedDictionary::get_terms_into`/`PlainDictionary::get_terms_into`
+decode many `TermId`s in one call: group the requested ids by which
+block owns them (`id_to_block` is already O(1) per id via Variant B),
+then for each affected block, decode it *once* via the existing
+`decode_into`/`EntriesArena` machinery and pull every requested term
+straight out of the resulting arena (`EntriesArena::term_at`, a cheap
+slice, no further FST walking) instead of one independent
+root-to-leaf `get_term_into` walk per id.
+
+This trades "decode only what's asked for" against "decode a whole
+block once, however many of its entries are actually wanted." For bulk
+materialization -- dumping most or all of a dictionary, or any workload
+where requested ids cluster within blocks (namespace-clustered data
+makes this the common case, §8) -- that's a clear win: shared-prefix
+node decode that `get_term_into` would re-pay per call happens once per
+block instead. For a handful of ids scattered across many different
+blocks, it's a net loss (an entire block gets decoded to serve one id
+from it) -- `get_term_into` remains the right choice there. The
+docstring says so; this crate doesn't try to guess which case a caller
+is in and switch automatically, matching §11's discipline of not
+building adaptive machinery ahead of a measured need.
+
+`PlainDictionary::get_terms_into` exists for API parity across all three
+types (matching `get_term_into`'s precedent) even though the shared-
+decode rationale doesn't apply to it -- there's no FST walk to amortize,
+just a direct array lookup per id.
+
+Measured, both the win and the honestly-expected loss (`examples/
+perf_decode_bulk.rs`'s `get_terms_into`/`get_terms_into_scattered` modes,
+2,000,000-term `Dictionary`, default 64..=256 block bounds, wall clock
+via `time`, `setup_only` subtracted, averaged over 2 runs each):
+
+| Scenario | `get_term_into` (repeated) | `get_terms_into` (bulk) | change |
+|---|---:|---:|---:|
+| Dump everything (2,000,000 ids, all blocks) | 850ms (425ns/op) | **222ms (111ns/op)** | **3.8x faster** |
+| Scattered (6,667 ids, one per block, stride 300 > block_max) | ~3ms (too small to separate from noise at this scale) | 55ms (8.25us/op) | **~19x slower** |
+
+Both land exactly where the design predicts. "Dump everything" is
+`get_terms_into`'s target case: requested ids span nearly every block,
+so each block's `decode_into` (already O(block size) with zero
+per-entry allocation, from the arena work earlier) is paid once and
+amortized across ~256 ids instead of once per id via `get_term_into`'s
+independent root-to-leaf walks -- a **3.8x** wall-clock win, well past
+what the per-call `Node::new`-amortization argument alone would suggest,
+because it also collapses the router lookup and `id_to_block` access
+that `get_term_into` still pays per call down to one grouping pass. The
+scattered case is the flip side working as documented: with one
+requested id per block (stride chosen specifically to guarantee this),
+`get_terms_into` decodes an entire block to serve a single id from it,
+6,667 times -- **~19x slower** than just calling `get_term_into` 6,667
+times. This isn't a bug or a case to special-case away; it's `get_terms_into`'s
+documented cost model working exactly as described, and it's why this
+crate doesn't try to auto-detect which case a caller is in -- the two
+measurements above are the actual data a caller (or a future adaptive
+heuristic, if one ever proves worth building) would need.
+
 ## What's not implemented yet
 
 In the design doc's own stage numbering (§17), this crate currently

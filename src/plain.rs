@@ -60,6 +60,21 @@ impl PlainDictionary {
         buf.extend_from_slice(s.as_bytes());
         true
     }
+
+    /// See [`crate::Dictionary::get_terms_into`] -- same signature, for
+    /// API parity across all three dictionary types. There's no FST walk
+    /// to amortize here (`reverse` is a direct array, no block/decode
+    /// concept at all), so this is just a per-id loop, not a real
+    /// optimization the way it is for `Dictionary`/`FrontCodedDictionary`.
+    pub fn get_terms_into(&self, ids: &[TermId], out: &mut Vec<Option<String>>) {
+        out.clear();
+        out.extend(ids.iter().map(|&id| {
+            self.reverse
+                .get(id.0 as usize)
+                .and_then(|s| s.as_ref())
+                .map(|s| s.to_string())
+        }));
+    }
 }
 
 impl TermDictionary for PlainDictionary {
@@ -178,5 +193,24 @@ mod tests {
         buf.clear();
         assert!(!dict.get_term_into(missing, &mut buf));
         assert!(buf.is_empty());
+    }
+
+    #[test]
+    fn get_terms_into_matches_individual_lookups() {
+        let mut dict = PlainDictionary::new();
+        let a = dict.insert("a");
+        let b = dict.insert("b");
+        let query = [b, a, b, TermId(9999)];
+        let mut out = Vec::new();
+        dict.get_terms_into(&query, &mut out);
+        assert_eq!(
+            out,
+            vec![
+                Some("b".to_string()),
+                Some("a".to_string()),
+                Some("b".to_string()),
+                None
+            ]
+        );
     }
 }

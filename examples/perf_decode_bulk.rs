@@ -74,6 +74,43 @@ fn main() {
                 }
             }
         }
-        other => panic!("unknown mode {other:?}; expected setup_only, get_term, or get_term_into"),
+        // "Dump everything" case: requested ids span (nearly) every block,
+        // so get_terms_into's per-block decode is amortized over many ids.
+        // Compare against the plain "get_term_into" mode above (same ids,
+        // repeated single-id calls) as the baseline.
+        "get_terms_into" => {
+            let mut out = Vec::new();
+            for _ in 0..repeats {
+                dict.get_terms_into(&ids, &mut out);
+                std::hint::black_box(&out);
+            }
+        }
+        // Scattered case: one id sampled every 300 (> block_max=256), so
+        // consecutive requests almost always land in different blocks --
+        // the case get_terms_into is expected to lose in.
+        "get_terms_into_scattered" => {
+            let scattered: Vec<_> = ids.iter().step_by(300).copied().collect();
+            eprintln!("scattered sample size: {}", scattered.len());
+            let mut out = Vec::new();
+            for _ in 0..repeats {
+                dict.get_terms_into(&scattered, &mut out);
+                std::hint::black_box(&out);
+            }
+        }
+        "get_term_into_scattered" => {
+            let scattered: Vec<_> = ids.iter().step_by(300).copied().collect();
+            eprintln!("scattered sample size: {}", scattered.len());
+            let mut buf = Vec::new();
+            for _ in 0..repeats {
+                for &id in &scattered {
+                    dict.get_term_into(id, &mut buf);
+                    std::hint::black_box(&buf);
+                }
+            }
+        }
+        other => panic!(
+            "unknown mode {other:?}; expected setup_only, get_term, get_term_into, \
+             get_terms_into, get_terms_into_scattered, or get_term_into_scattered"
+        ),
     }
 }
