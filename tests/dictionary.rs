@@ -1,14 +1,23 @@
 //! Differential testing between `Dictionary` (Stage 1+3, FST blocks),
-//! `FrontCodedDictionary` (the §8/§13 front-coded-blocks baseline), and
-//! `PlainDictionary` (Stage 0, the oracle) across randomized insert/remove
-//! sequences and several block-bound configurations small enough to force
-//! splits and merges during the run. This is the main correctness signal
-//! for the router/split/merge logic in both blocked dictionaries, since
-//! `PlainDictionary` has no such moving parts to get wrong -- and, for
-//! `FrontCodedDictionary` specifically, for the restart-point binary
-//! search and UTF-8 char-boundary handling in its delta coding.
+//! `FrontCodedDictionary` (the §8/§13 front-coded-blocks baseline),
+//! `AutomatonDictionary` (the custom incremental micro-FST, `AutomatonBlock`
+//! in place of `Block` -- DESIGN.md's "wiring into the dictionary"
+//! sections), and `PlainDictionary` (Stage 0, the oracle) across
+//! randomized insert/remove sequences and several block-bound
+//! configurations small enough to force splits and merges during the run.
+//! This is the main correctness signal for the router/split/merge logic
+//! in all three blocked dictionaries, since `PlainDictionary` has no such
+//! moving parts to get wrong -- and, for `FrontCodedDictionary`
+//! specifically, for the restart-point binary search and UTF-8
+//! char-boundary handling in its delta coding, and for
+//! `AutomatonDictionary`, the first end-to-end exercise of the whole
+//! macro structure (router, split/merge, reverse mapping) driving
+//! `AutomatonBlock`, as opposed to `micro_fst`/`automaton_block`'s own
+//! isolated, block-level-only differential tests.
 
-use s_dict::{Dictionary, FrontCodedDictionary, PlainDictionary, TermDictionary, TermId};
+use s_dict::{
+    AutomatonDictionary, Dictionary, FrontCodedDictionary, PlainDictionary, TermDictionary, TermId,
+};
 
 /// A small deterministic xorshift64* PRNG, avoiding a `rand` dependency for
 /// this stage (design doc §11: minimize unnecessary structure).
@@ -77,6 +86,7 @@ fn run_fuzz(seed: u64, block_min: usize, block_max: usize, steps: usize) {
     let mut plain = PlainDictionary::new();
     let mut fst_blocked = Dictionary::with_block_bounds(block_min, block_max);
     let mut front_coded = FrontCodedDictionary::with_block_bounds(block_min, block_max);
+    let mut automaton_blocked = AutomatonDictionary::with_block_bounds(block_min, block_max);
     let mut present: std::collections::HashSet<String> = std::collections::HashSet::new();
 
     for step in 0..steps {
@@ -93,27 +103,37 @@ fn run_fuzz(seed: u64, block_min: usize, block_max: usize, steps: usize) {
             let a = plain.insert(term);
             let b = fst_blocked.insert(term);
             let c = front_coded.insert(term);
+            let d = automaton_blocked.insert(term);
             assert_eq!(a, b, "step {step}: id diverged inserting {term:?} (fst)");
             assert_eq!(
                 a, c,
                 "step {step}: id diverged inserting {term:?} (front-coded)"
+            );
+            assert_eq!(
+                a, d,
+                "step {step}: id diverged inserting {term:?} (automaton)"
             );
             present.insert(term.clone());
         } else {
             let a = plain.remove(term);
             let b = fst_blocked.remove(term);
             let c = front_coded.remove(term);
+            let d = automaton_blocked.remove(term);
             assert_eq!(a, b, "step {step}: id diverged removing {term:?} (fst)");
             assert_eq!(
                 a, c,
                 "step {step}: id diverged removing {term:?} (front-coded)"
             );
+            assert_eq!(
+                a, d,
+                "step {step}: id diverged removing {term:?} (automaton)"
+            );
             present.remove(term.as_str());
         }
 
         // Full lockstep check: every term currently believed present must
-        // round-trip identically through all three dictionaries, and all
-        // three must agree on total size.
+        // round-trip identically through all four dictionaries, and all
+        // four must agree on total size.
         assert_eq!(
             plain.len(),
             fst_blocked.len(),
@@ -124,12 +144,19 @@ fn run_fuzz(seed: u64, block_min: usize, block_max: usize, steps: usize) {
             front_coded.len(),
             "step {step}: length diverged (front-coded)"
         );
+        assert_eq!(
+            plain.len(),
+            automaton_blocked.len(),
+            "step {step}: length diverged (automaton)"
+        );
         for t in &present {
             let a: Option<TermId> = plain.get_id(t);
             let b: Option<TermId> = fst_blocked.get_id(t);
             let c: Option<TermId> = front_coded.get_id(t);
+            let d: Option<TermId> = automaton_blocked.get_id(t);
             assert_eq!(a, b, "step {step}: get_id diverged for {t:?} (fst)");
             assert_eq!(a, c, "step {step}: get_id diverged for {t:?} (front-coded)");
+            assert_eq!(a, d, "step {step}: get_id diverged for {t:?} (automaton)");
             assert_eq!(
                 plain.get_term(a.unwrap()).as_deref(),
                 fst_blocked.get_term(b.unwrap()).as_deref(),
@@ -139,6 +166,11 @@ fn run_fuzz(seed: u64, block_min: usize, block_max: usize, steps: usize) {
                 plain.get_term(a.unwrap()).as_deref(),
                 front_coded.get_term(c.unwrap()).as_deref(),
                 "step {step}: get_term diverged for {t:?} (front-coded)"
+            );
+            assert_eq!(
+                plain.get_term(a.unwrap()).as_deref(),
+                automaton_blocked.get_term(d.unwrap()).as_deref(),
+                "step {step}: get_term diverged for {t:?} (automaton)"
             );
         }
     }
@@ -189,6 +221,49 @@ fn dictionary_round_trips_real_rdf_terms() {
             continue;
         }
         assert_eq!(dict.get_id(term), Some(id));
+    }
+}
+
+/// Same round-trip as `dictionary_round_trips_real_rdf_terms`, through
+/// `AutomatonDictionary` instead -- a small block size (4, 16) so this
+/// specific 7-term set actually forces a split, not just an insert path
+/// that happens to fit in one block.
+#[test]
+fn automaton_dictionary_round_trips_real_rdf_terms() {
+    let mut dict = AutomatonDictionary::with_block_bounds(4, 16);
+    let terms = [
+        "http://www.w3.org/1999/02/22-rdf-syntax-ns#type",
+        "http://www.w3.org/2000/01/rdf-schema#Class",
+        "http://dbpedia.org/resource/Berlin",
+        "http://dbpedia.org/ontology/populationTotal",
+        "\"Berlin\"@en",
+        "\"42\"^^http://www.w3.org/2001/XMLSchema#integer",
+        "_:b0",
+    ];
+
+    let ids: Vec<TermId> = terms.iter().map(|t| dict.insert(t)).collect();
+    for (term, &id) in terms.iter().zip(&ids) {
+        assert_eq!(dict.get_id(term), Some(id));
+        assert_eq!(dict.get_term(id).as_deref(), Some(*term));
+    }
+
+    let removed = dict.remove(terms[2]).unwrap();
+    assert_eq!(dict.get_term(removed), None);
+    assert_eq!(dict.get_id(terms[2]), None);
+    for (term, &id) in terms.iter().zip(&ids) {
+        if *term == terms[2] {
+            continue;
+        }
+        assert_eq!(dict.get_id(term), Some(id));
+    }
+
+    // insert_batch: same terms, fresh dictionary, one call instead of
+    // sequential inserts -- exercises insert_ordered/bootstrap directly.
+    let mut batch_dict = AutomatonDictionary::with_block_bounds(4, 16);
+    let batch_ids = batch_dict.insert_batch(&terms);
+    for (term, &id) in terms.iter().zip(&batch_ids) {
+        assert_eq!(batch_dict.get_id(term), Some(id));
+        assert_eq!(batch_dict.get_term(id).as_deref(), Some(*term));
     }
 }
 

@@ -35,16 +35,34 @@ for the full architecture, roadmap, and literature grounding):
   front coding is faster to rebuild per insert and at both lookup
   directions at this block size -- see DESIGN.md for the full comparison
   and how to reproduce it.
+- **`AutomatonDictionary`** -- the same block/router/split-merge structure
+  again, `AutomatonBlock` (a from-scratch, incrementally mutable minimal
+  automaton -- `src/micro_fst.rs`, no dependency on the `fst` crate) in
+  place of `Block`. Exists to test whether a custom automaton that
+  supports true incremental insert/remove (`perf`-confirmed ~3x faster
+  single-term insert, ~2x faster decode, ~16-26x faster batch insert than
+  `Block`'s full-rebuild-per-mutation contract -- see DESIGN.md) is worth
+  the added complexity over reaching for the well-tested `fst` crate.
+  Currently a smaller-scope comparison implementation (no prepared-batch
+  or buffer-reusing decode APIs yet); `Dictionary` remains the crate's
+  primary, general-purpose implementation unless and until this one earns
+  that spot on the numbers -- see DESIGN.md's "custom incremental
+  micro-FST" sections for the full history, including two real bugs this
+  effort found and fixed by writing failing tests *before* trusting a fix,
+  not after.
 
-All three implementations have also been through a Data-Oriented-Design
-optimization pass (DESIGN.md's "Optimization pass" section): a
-struct-of-arrays scratch buffer (`EntriesArena`) replacing a
+The first three implementations have also been through a
+Data-Oriented-Design optimization pass (DESIGN.md's "Optimization pass"
+section): a struct-of-arrays scratch buffer (`EntriesArena`) replacing a
 `Vec<(Box<str>, TermId)>` that allocated per-term on every block rebuild,
 a buffer-reusing `get_term_into` alongside the allocating `get_term`
 (confirmed with `perf`-measured hardware counters on both synthetic *and*
 real-corpus data -- see DESIGN.md), `u16` instead of `u32` for a field
 genuinely bounded by a single term's length, and a `NonZeroU32`-backed
-`BlockId` for a niche optimization. `Dictionary`/`FrontCodedDictionary`
+`BlockId` for a niche optimization. `AutomatonDictionary` shares the
+structural pieces (`EntriesArena`, the `u16`/`NonZeroU32` reverse-mapping
+layout) but not yet `get_term_into`/`get_terms_into` -- one of the scope
+reductions named above. `Dictionary`/`FrontCodedDictionary`
 also moved from design doc §5's Variant A reverse mapping to Variant B
 (`TermId -> (BlockId, local_rank)`, no scan) after measuring both --
 faster reverse lookups, more reverse-directory space, exactly the
@@ -189,11 +207,21 @@ constant -- see DESIGN.md §12 for why.
   buffer both `Dictionary` and `FrontCodedDictionary` decode into and
   rebuild from, instead of a `Vec<(Box<str>, TermId)>` that allocated
   per term on every block rebuild.
-- `tests/dictionary.rs` -- differential fuzz testing of `Dictionary` and
-  `FrontCodedDictionary` against `PlainDictionary` as an oracle, in
-  lockstep, across several block-size configurations chosen to force
-  splits and merges; plus `#[ignore]`d perf/space probes (run with
-  `cargo test --release -- --ignored --nocapture`).
+- `src/micro_fst.rs` -- `Automaton`, a from-scratch, incrementally
+  mutable minimal acyclic finite-state automaton (build/insert/
+  insert_sorted/remove/rank/term_at_into), no dependency on the `fst`
+  crate; see DESIGN.md's "custom incremental micro-FST" sections for the
+  literature grounding and every measurement.
+- `src/automaton_block.rs`, `src/automaton_dictionary.rs` --
+  `AutomatonDictionary`, the same macro structure as `Dictionary` again,
+  `AutomatonBlock` (pairs `Automaton` with the external `TermId` array
+  `Block` also carries) in place of `Block`.
+- `tests/dictionary.rs` -- differential fuzz testing of `Dictionary`,
+  `FrontCodedDictionary`, and `AutomatonDictionary` against
+  `PlainDictionary` as an oracle, in lockstep, across several block-size
+  configurations chosen to force splits and merges; plus `#[ignore]`d
+  perf/space probes (run with `cargo test --release -- --ignored
+  --nocapture`).
 - `examples/perf_get_term.rs`, `examples/perf_decode_bulk.rs` -- dedicated
   `perf stat` targets isolating `get_term`/`get_term_into` from setup cost
   (via a `setup_only` baseline to subtract), for hardware-counter-level

@@ -17,6 +17,24 @@ description = "A dynamic, incrementally mutable bidirectional RDF term <-> TermI
 # Local 0.4.7 patch exposes configurable builder registry size.
 fst = { path = "vendor/fst" }
 
+# Thin LTO: measured, not assumed (DESIGN.md's "implementing the levers"
+# section). Without it, `s-dict` never inlines across the crate boundary
+# into `fst` at all -- every call into `fst::raw::build::Builder` stays a
+# real function call. Enabling LTO cut `Block::build`'s isolated
+# construction cost by ~27% (`perf stat`, `examples/
+# perf_micro_fst_build.rs`), the single largest lever found in this
+# whole investigation, bigger than any change made to `fst`-free code.
+# `Automaton`'s own construction improved too (~15%), just by less --
+# expected, since it's already same-crate and had less cross-boundary
+# call overhead to unlock. `codegen-units = 1` alone (no LTO) was also
+# tried and measured to change nothing for either side -- not added,
+# since it would only cost build time for no benefit. Only affects
+# builds where this crate is the workspace root (Cargo ignores
+# `[profile.*]` from dependencies), so this is safe for any future
+# consumer of `s-dict` as a library dependency.
+[profile.release]
+lto = "thin"
+
 # A separate profile from plain `release`, purely so `perf record`'s
 # call-graph sampling gets meaningful symbols (source-level line info)
 # into the `fst` crate's own internals, not just this crate's. Doesn't

@@ -19,6 +19,8 @@
 //! automaton minimization specifically buys over blocking alone). See
 //! `DESIGN.md` for the roadmap and what's still not implemented.
 
+mod automaton_block;
+mod automaton_dictionary;
 mod batch;
 mod block;
 mod dictionary;
@@ -28,10 +30,38 @@ mod front_coded_dictionary;
 mod micro_fst;
 mod plain;
 
+pub use automaton_dictionary::{AutomatonBlockId, AutomatonDictionary};
 pub use batch::{PreparedBatch, TermBatch};
 pub use dictionary::{BlockId, Dictionary, RebuildStats};
 pub use front_coded_dictionary::{FrontCodedBlockId, FrontCodedDictionary};
 pub use plain::PlainDictionary;
+
+/// Not part of this crate's public API -- thin wrappers exposing
+/// otherwise-`pub(crate)` construction primitives to `examples/
+/// perf_micro_fst_build.rs`, which isolates `Automaton::build_sorted`
+/// against `Block::build` specifically (DESIGN.md's "closing the
+/// bulk-construction gap" analysis). `#[doc(hidden)]` since it exists
+/// only for that one benchmark, not for external use.
+#[doc(hidden)]
+pub mod __internal_bench {
+    use crate::TermId;
+    use crate::block::Block;
+    use crate::micro_fst::Automaton;
+
+    pub fn build_automaton(terms: &[String]) -> usize {
+        let automaton = Automaton::build_sorted(terms.iter().map(String::as_str));
+        automaton.len()
+    }
+
+    pub fn build_block(terms: &[String]) -> usize {
+        let entries: Vec<(&str, TermId)> = terms
+            .iter()
+            .enumerate()
+            .map(|(i, t)| (t.as_str(), TermId(i as u32)))
+            .collect();
+        Block::build(entries.into_iter()).len()
+    }
+}
 
 /// A stable identifier for an RDF term, independent of lexical order.
 ///

@@ -1531,3 +1531,1010 @@ namespace_clustered_terms`, `incremental_insert_matches_bulk_build_and_
 stays_minimal`, and the rest) still pass unchanged after this rewrite --
 the fix only touched how an already-correct answer is computed, not what
 answer is computed.
+
+### Custom incremental micro-FST: closing the batch-insert gap
+
+Everything measured so far about `Automaton` was single-term cost.
+`Block::merge_into` earns its batching win (DESIGN.md's "Bounded-batch
+sweep": ~70x fewer rebuilds going from per-term to batched flushing) by
+merging many sorted incoming terms into one block in a single walk.
+`Automaton::insert` had no equivalent -- calling it once per term in a
+batch would re-walk from root and pay a fresh clone-on-write for every
+term, even ones sharing a prefix *with each other* that the batch itself
+just created. That gap was the stated reason not to consider `Automaton`
+for `Dictionary`'s default yet, since this project's own data says
+batching, not single-op cost, is the lever that matters most.
+
+`Automaton::insert_sorted` closes it: one running `path` (the same
+confirm-on-divergence shape `build_sorted` already uses) carried across
+the whole sorted batch instead of reset per term, with a `batch_start_slot`
+marker distinguishing states created during *this* call (safe to mutate
+directly) from pre-existing ones (must be cloned before any write, same
+as single `insert`).
+
+**A suspicion raised, tested, and disproven before touching anything --
+per explicit instruction, not by default.** Hand-tracing the design
+surfaced a concern: `confirm_path` gets invoked on states that were only
+*walked through* while matching an already-present term in the batch,
+never actually modified -- and confirming touches the parent's transition
+table. That looked unsafe on paper. Rather than "fix" it speculatively, a
+naive implementation was written *without* any defense against this, and
+two tests were built specifically to trigger it before any correction was
+made: `insert_sorted_full_hit_before_a_diverging_sibling` (a hand-traceable
+repro -- pre-existing `"xa"`/`"xb"` siblings under a shared parent, batch
+`["xa" (hit), "xc" (new)]`, checking whether processing "xc" after the
+"xa" hit corrupts the shared parent's existing `"xa"`/`"xb"` transitions)
+and `insert_sorted_mixed_hits_and_new_across_rounds` (4 seeds x 8 rounds
+x 40-term batches of mixed hits and new terms, against real
+namespace-clustered branching, differentially checked against a fresh
+`build_sorted` oracle after every round). Both passed against the naive,
+unmodified implementation. The reasoning that explains why, worked out
+*after* the tests confirmed there was nothing to fix: recomputing an
+untouched state's outputs from its own (also unchanged) children
+reproduces the same values it already had, and the register lookup that
+follows then finds that state's own existing entry (or an equivalent one)
+as canonical -- so the "unsafe" redirect is a no-op in effect. Wasted
+work on those untouched entries, confirmed to be exactly that and nothing
+more, not a correctness problem -- the naive version is what shipped as
+`insert_sorted`, unmodified.
+
+**Measured**, same isolation-for-`perf-stat` pattern as every other probe
+in this section: a 2,000-term namespace-clustered baseline, 100 batches of
+~500 new, sorted, disjoint terms each, comparing 500 sequential `insert`
+calls per batch against one `insert_sorted` call:
+
+| metric (per term) | sequential `insert` x N | `insert_sorted` | speedup |
+|---|---|---|---|
+| cycles | 38,706.8 | 2,395.7 | 16.16x |
+| instructions | 103,966.4 | 6,142.6 | 16.93x |
+| cache-misses | 233.4 | 5.8 | 40.55x |
+| branches | 17,624.2 | 1,140.4 | 15.45x |
+| wall-clock | 8.97us | 0.40us | ~22.4x |
+
+A large, real, hardware-counter-confirmed win -- in the same territory as
+`Block`'s own batching win, which was the whole point of closing this gap
+before it could be a fair comparison. The especially large cache-miss
+improvement (40x) makes sense structurally: sequential single-term
+`insert` restarts from root and re-walks/re-clones shared prefixes once
+per term, scattering memory accesses across the state slab call after
+call, while `insert_sorted` processes prefix-sharing terms together,
+keeping the working set hot. Wall-clock (~22.4x) is in the same range as
+the hardware counters, not contradicting them.
+
+**Still open, unchanged from before**: deletion isn't implemented (insert
+only), no slot reclamation yet, and this still hasn't been measured wired
+into an actual `Dictionary` at realistic scale with routing and the
+reverse map in the loop -- this closes one specific, previously-named gap,
+not the whole remaining list before a "default" decision.
+
+### Custom incremental micro-FST: deletion
+
+`Automaton::remove` closes the deletion gap (Carrasco & Forcada 2002's
+territory, cited since Stage 1). Shape: walk the exact matching path (a
+partial match, or a full match landing on a non-final state, means the
+term isn't present -- no-op, same as `insert`'s idempotency); clone every
+non-root state on that path, copy-on-write, for the same reason `insert`
+does (any of them might be shared); clear `is_final` at the (now private)
+leaf; then prune bottom-up -- a state with no transitions left and not
+final has no reason to exist, so its incoming transition is *deleted*
+from its parent outright (`Transitions::remove_transition`, new, the one
+mutation here that isn't a redirect), and the check repeats one level up,
+stopping at the first survivor (still final, or still has transitions).
+Whatever survives is re-confirmed through the same register machinery as
+every other mutation.
+
+**Tested per the explicit instruction this was built under: write tests
+that prove and measure a suspicion before fixing it, not after.** Five
+targeted cases first (absent term is a no-op; removing the only term
+empties the automaton down to just the root; removing a term that's a
+prefix of a surviving longer term stops it being final without pruning
+it away; removing one sibling under a shared parent leaves the other
+sibling's transition untouched; remove-then-reinsert matches a fresh
+build), then the real test:
+`mixed_insert_batch_and_remove_across_rounds_matches_a_fresh_build` --
+4 seeds x 12 rounds randomly choosing between single `insert`, batch
+`insert_sorted`, and `remove` against real namespace-clustered branching
+content, differentially checking every surviving rank *and* unrank *and*
+`reachable_state_count` against a fresh `build_sorted` oracle over the
+exact current live set after every single round. All pass.
+
+### Custom incremental micro-FST: the slot-reclamation gap, measured
+
+The known gap flagged since Stage 3 (discarded clones/originals left as
+unreachable garbage in the state slab, never reclaimed) was measured, not
+assumed, before any decision about fixing it -- per instruction, same
+discipline as the deletion suspicion above. `state_slab_len()` (new,
+`#[cfg(test)]`, exposes `states.len()`) against `reachable_state_count()`
+under `measure_slot_reclamation_gap_under_sustained_churn`: sustained
+one-out-one-in churn (remove one live term, insert one never-seen term,
+keeping the live set size constant at 800) for 2,000 rounds:
+
+| round | slab size | reachable | ratio |
+|---|---|---|---|
+| 0 | 907 | 91 | 1.0x |
+| 200 | 12,731 | 182 | 70.0x |
+| 1,000 | 62,271 | 241 | 258.4x |
+| 2,000 | 126,990 | 244 | **520.5x** |
+
+The result is unambiguous: the slab grows essentially linearly with
+cumulative mutation count (~63 new slab entries per round, matching one
+`remove` plus one `insert` each cloning/creating a handful of states)
+while the reachable/live count stays flat, as it should for a fixed-size
+sliding window. This is a real, severe, unbounded-growth cost under
+sustained mutation -- confirmed with numbers, not a theoretical concern --
+and would make `Automaton` unsuitable for any long-running workload
+without slot reuse (mirroring `Dictionary`'s own `free_block_slots`
+pattern) before it could be trusted as a default. Left unfixed in this
+pass, per instruction: measuring it was the assignment, not fixing it yet.
+
+### Custom incremental micro-FST: wiring into the dictionary (partial)
+
+`src/automaton_block.rs`'s `AutomatonBlock` mirrors `Block`'s exact public
+interface (`build`, `len`, `min_key`, `rank`, `id_at`, `term_at_into`,
+`term_at`, `decode_into`, `merge_into`, and now `remove`) but backed by
+`Automaton` instead of `fst::Map` -- the piece that actually makes the
+automaton usable as a `TermId`-aware block, not just a standalone `term
+<-> rank` structure. `Automaton` itself stays deliberately decoupled from
+`TermId` (per its own module docs); `AutomatonBlock` is the thin layer
+that pairs it with the external `ids: Vec<TermId>` array `Block` already
+carries.
+
+`merge_into`/`remove` here are a real, deliberate simplification, not an
+oversight: rather than tracking an `unchanged_prefix` the way `Block`'s
+own do (an O(changed suffix) reverse-index update -- see the "Skipping
+unchanged reverse-map entries" section above), they rebuild the whole
+`ids` array from a decode of the old content plus the automaton's own
+mutation every time -- O(block size) regardless of how much actually
+changed. This is a smaller first integration step: prove `Automaton` can
+correctly serve the block role at all, before investing in matching
+`Block`'s own incremental-update refinement here too. Tested
+differentially against `Block` (`matches_block_on_build_rank_and_unrank`,
+`decode_into_matches_original_content`) and for its own mutation
+contracts (`merge_into_existing_terms_keep_their_id_new_ones_get_fresh_
+ids`, `remove_drops_the_term_and_keeps_everything_else_correct`) -- ids
+aren't compared byte-for-byte against `Block`'s own allocation order
+(the two implementations allocate in different, equally valid orders),
+but internal consistency (every surviving term keeps its id, every new
+term gets one, round-trips hold) is.
+
+**What this is not yet**: `AutomatonBlock` is not wired into `Dictionary`
+itself. `Dictionary`'s router, split/merge, and batch-grouping machinery
+(`dictionary.rs`, ~700 lines) all assume `Block` specifically; making
+`Automaton` a real alternative there means either a parallel top-level
+type (mirroring how `FrontCodedDictionary` sits alongside `Dictionary`)
+or making `Dictionary` generic over its block type, both of which are a
+substantially larger undertaking than this block-level piece --
+duplicating or restructuring well-tested, currently-correct routing logic
+carries real risk of introducing new bugs under the same kind of subtle
+conditions this whole effort has already found twice (the sortedness
+bug, the output-formula bug). Stopped here deliberately rather than
+rush that next phase in the same pass; `AutomatonBlock` itself is
+solid and tested, ready for whichever integration approach comes next.
+
+### Custom incremental micro-FST: reference-counted slot reclamation
+
+Fixes the measured gap above with reference counting, per explicit
+direction, over the mark-and-compact alternative that was recommended
+instead (lower risk, reuses the already-trusted reachability walk) --
+the tradeoff named at the time (refcounting touches every mutation site,
+real new surface area in code that had already produced two genuine bugs
+this session) turned out to be exactly right: it produced a third.
+
+**Design**: `refcounts: Vec<u32>` parallel to `states`, incremented by
+`acquire` and decremented by `release`; `release` cascades (a dead
+state's own children are released too -- a whole unreachable subtree can
+hang off one redirected transition) and pushes the freed slot onto
+`free_slots`, which `alloc_state` checks before growing the slab.
+`redirect` (used everywhere a transition gets repointed, including
+`confirm_path`'s own register-merge step) acquires the new target
+*before* releasing the old one, specifically because the overwhelmingly
+common case -- a freshly confirmed state registering as its own canonical
+entry, i.e. `new_target == old_target` -- would otherwise see the
+refcount bounce through zero and get wrongly cascade-freed a moment
+before being re-acquired.
+
+**Two real bugs, both caught by tests before being "fixed" on paper,
+exactly per instruction:**
+
+1. `insert_sorted`'s existing "was this state created during the current
+   batch" check compared raw slot *numbers* against a snapshot taken at
+   batch start. Slot reuse breaks that outright: a slot freed and reused
+   *within* the same batch can land below that snapshot's number while
+   being entirely private to the batch, misclassifying it as pre-existing
+   and shared. Caught by reasoning before any code ran, not by a failing
+   test -- fixed by comparing *generations* (a counter stamped on a slot
+   every time `alloc_state` assigns it, fresh or reused) instead of slot
+   numbers, which is correct regardless of reuse.
+2. `clone_state` copies a state's transitions, which duplicates every
+   reference they hold -- the clone is a *new*, independent referrer to
+   each target, same as if each transition had just been created fresh.
+   The first implementation never `acquire`d those targets on the
+   clone's behalf. Result: releasing the *original* later (once its own
+   clone superseded it) wrongly cascaded into freeing children the clone
+   still legitimately pointed at -- a live, still-referenced subtree
+   getting torn down out from under it. This one **was** caught by a
+   test, immediately: 8 of 17 correctness tests failed the moment this
+   landed, several with a direct panic (`redirect`'s "byte must already
+   have a transition here" -- the freed child's transition had vanished
+   from under a state that still needed it). Bisected with a minimal
+   repro (`"xa"`/`"xb"`, passed) escalated to a shared-prefix-length
+   sweep (`n=1,2` passed, `n=3` failed -- the bug needs at least 3 chained
+   clone-loop iterations to manifest, which is why the trivial 1-byte
+   case missed it and a real term like `"http://example.org/a"` vs
+   `"http://example.org/b"` -- 20 shared bytes -- didn't). Fixed by
+   having `clone_state` `acquire` every target the copied transitions
+   point at, immediately after cloning.
+
+**Verified the fix actually does what it's for**, not just that it
+compiles and passes the existing suite: the same
+`measure_slot_reclamation_gap_under_sustained_churn` probe that found the
+500x+ growth now reports:
+
+| round | slab | reachable | ratio |
+|---|---|---|---|
+| 0 | 94 | 91 | 1.03x |
+| 1,000 | 242 | 241 | 1.00x |
+| 2,000 | 253 | 246 | **1.03x** |
+
+The slab stabilizes (253, not growing further) instead of climbing
+linearly forever. One new targeted stress test
+(`insert_sorted_after_churn_reuses_slots_correctly`) specifically forces
+`free_slots` to be non-empty going into large batch inserts (interleaving
+insert-then-immediately-remove churn rounds with 80-term batches, 3
+seeds) -- exactly the generation-vs-slot-number scenario bug #1 was
+about -- and passes.
+
+**The cost, measured, not assumed away**: refcounting bookkeeping isn't
+free. Re-running the earlier insert-cost probe: `Automaton::insert` is now
+~11.5us/op (was ~8.5us/op before this), narrowing its wall-clock margin
+over `Block` from ~4.1x to ~3.0x (the hardware-counter figure was ~3.3x
+before this section; not re-measured with `perf stat` again here, since
+the direction and rough size of the change is unambiguous at this margin
+-- unlike the two cases earlier in this document where `perf stat` caught
+wall-clock giving the *wrong sign*, this one only moved the number, not
+its direction). Decode is unaffected (it never touches refcounts, so
+`perf_probe_decode_cost_*`'s ~2.15-2.25x held exactly). Batch insert's
+*relative* advantage held or slightly widened
+(sequential single-term `insert` now pays the refcounting overhead once
+per term, more exposed to it than `insert_sorted`, which shares more of
+that cost across the batch) -- still on the order of the ~16-26x range
+measured before. The headline results from every earlier section stand;
+the margins are honestly a little smaller now, which is the expected
+price of the correctness this section's fixes bought, not a surprise to
+paper over.
+
+### Custom incremental micro-FST: wired into the dictionary, for real this time
+
+`AutomatonDictionary` (`src/automaton_dictionary.rs`) closes the gap the
+earlier "wiring into the dictionary (partial)" section named: `Dictionary`'s
+exact macro structure (lexical blocks, sorted-array router, split/merge
+on overflow/underflow, `TermId -> (BlockId, local_rank)` reverse mapping),
+`AutomatonBlock` in place of `Block`. This is the crate's fourth
+`TermDictionary` implementation (after `PlainDictionary`, `Dictionary`,
+`FrontCodedDictionary`) and the first point where the custom automaton is
+measurable end to end, through the same trait every other implementation
+shares, rather than only in isolated block-level microbenchmarks.
+`Dictionary` and `Block` are untouched -- this crate's own "alongside,
+promoted only if it wins" rule, unchanged since the plan that started this
+whole effort.
+
+Ported mechanically from `Dictionary` wherever `AutomatonBlock`'s
+interface matches `Block`'s exactly (`route`, `bootstrap`,
+`split_while_oversized`, `split`, `merge_with_neighbor`,
+`remove_empty_block`, the `TermDictionary` methods), reusing
+`Dictionary`'s own proven `mem::take`-scratch-arena pattern rather than
+improvising a new one -- and it compiled clean, and passed its first real
+test run clean, on the first attempt, for exactly that reason: the risky
+part (getting `Automaton`/`AutomatonBlock` correct) was already done and
+tested in the two sections above, and the borrow-checker patterns needed
+here were already worked out by `Dictionary` itself, not new problems to
+solve blind.
+
+**Smaller in scope than `Dictionary`, deliberately, not an oversight**:
+no `PreparedBatch`/`insert_prepared`, no `get_term_into`/`get_terms_into`,
+no `RebuildStats`/`size_bytes`. `assign_ranks` here has no
+`unchanged_prefix` skip either, since `AutomatonBlock::merge_into`/
+`remove` don't report one (they rebuild their whole `ids` array
+internally regardless, per their own documented simplification) -- there
+is nothing to skip on this side, consistent with that choice rather than
+fighting it. All real optimizations `Dictionary` accumulated over this
+project's history; porting them is future work if this comparison proves
+worthwhile, not a prerequisite for measuring it.
+
+**Tested by extending the crate's existing 3-way fuzz differential
+(`tests/dictionary.rs`) into a 4-way one**, rather than writing a new,
+separate test harness: `AutomatonDictionary` now sits in the same
+lockstep loop as `Dictionary`, `FrontCodedDictionary`, and the
+`PlainDictionary` oracle, across the same randomized insert/remove
+sequences and the same small-block-bounds configuration that forces
+splits and merges every run. Every id, every `get_id`, every `get_term`,
+every `len()` is checked against the oracle at every step, for all three
+blocked implementations simultaneously -- not a new, separate test
+philosophy, the same one `FrontCodedDictionary` was already held to,
+now covering a third implementation in the same run. Plus a dedicated
+round-trip test (`automaton_dictionary_round_trips_real_rdf_terms`,
+small block bounds so the 7-term set actually forces a split) and an
+`insert_batch` check. All pass.
+
+One incidental finding while wiring this up: `Automaton::insert` (the
+single-term path) turned out to be genuinely unreachable from non-test
+code once `AutomatonBlock::merge_into` was written to route every
+insertion -- single term included -- through `insert_sorted` uniformly,
+rather than special-casing. Kept, not deleted: it's a distinct,
+separately tested algorithm, not `insert_sorted` with a one-element
+iterator in disguise, and a real candidate to reach for if a future
+profile shows `insert_sorted`'s small extra bookkeeping costs anything
+measurable for the single-term case specifically -- flagged with
+`#[allow(dead_code)]` and a comment explaining exactly this, not a
+silent workaround.
+
+### Custom incremental micro-FST: measured end to end -- a mixed, honest result
+
+Every measurement up to this point was either a correctness check or an
+isolated block-level microbenchmark of `Automaton` alone (insert ~3x
+faster than `Block`'s decode-and-rebuild, decode ~2-3.4x faster,
+batch-insert 16-26x faster than sequential single inserts). None of that
+had yet been checked against `AutomatonDictionary` as a whole
+implementation, through the same `TermDictionary` trait every other
+implementation shares, with routing and split/merge in the loop. New
+example, `examples/perf_dictionary_automaton_vs_fst.rs`: five modes
+(`bulk_insert`, `sequential_insert`, `get_id`, `get_term`, `remove`), each
+runnable as its own process per dictionary kind for clean `perf stat`
+attribution, `_setup`-only variants added for the four modes that
+preload data (needed because `perf stat` times the whole process, not
+just the `Instant`-wrapped operation -- see below for why that mattered).
+Namespace-clustered terms throughout, 20,000 groups (80,000 terms),
+`Dictionary`'s own default block bounds (64..=256) on both sides.
+
+Wall-clock first:
+
+| mode | fst (`Dictionary`) | automaton (`AutomatonDictionary`) | ratio |
+|---|---|---|---|
+| bulk_insert | 539 ns/op | 1.054 us/op | **0.51x** (slower) |
+| sequential_insert | 62.78 us/op | 132.87 us/op | **0.47x** (slower) |
+| get_id | 291 ns/op | 224 ns/op | 1.30x faster |
+| get_term | 498 ns/op | 250 ns/op | 1.99x faster |
+| remove | 28.30 us/op | 92.39 us/op | **0.31x** (slower) |
+
+Three of five modes got *slower*, not faster -- the opposite of what
+every prior block-level number implied. Rather than trust or dismiss
+this on wall-clock alone (this project's own established rule, broken
+twice already this session before it stuck), each headline number was
+cross-checked with `perf stat` hardware counters, isolating setup from
+the measured operation via the `_setup` variants:
+
+- `sequential_insert`: whole-process `perf stat` (setup here is small
+  relative to the 20,000-op timed loop, so no subtraction needed) showed
+  **3.25x more cycles**, 2.76x more instructions, **10.8x more
+  cache-misses**, 6.5x more branch-misses for automaton. Confirms the
+  wall-clock slowdown; if anything understates it.
+- `get_term`: whole-process counters were *not* clean here -- automaton's
+  slower `bulk_insert`-shaped preload (80,000 terms) dominates the total
+  and nearly cancels the lookup-loop win, which is exactly why the
+  `_setup` subtraction exists. After subtracting `get_term_setup` from
+  `get_term`: fst ~2148 cycles/op vs automaton ~1179 cycles/op (**1.82x
+  fewer cycles**), instructions 6691 vs 2404/op (**2.78x fewer**).
+  Confirms the wall-clock win, same direction, different magnitude.
+- `get_id`: same subtraction method, fst ~1251 cycles/op vs automaton
+  ~763 cycles/op (**1.64x fewer**). Confirms.
+- `bulk_insert`: no preload to subtract (dictionary starts empty).
+  Whole-process counters: **1.65x more cycles**, 1.80x more instructions
+  for automaton. Confirms the wall-clock slowdown.
+
+So the lookups (`get_id`, `get_term`) really are faster end to end, at
+roughly the magnitude the block-level decode numbers predicted. But
+`bulk_insert`, `sequential_insert`, and `remove` are genuinely,
+hardware-counter-confirmed *slower* -- this is a real negative result,
+not a measurement artifact.
+
+**Why**, diagnosed the same way every other suspicion in this project was
+handled: written down as a hypothesis, then checked with a targeted test
+before being trusted. Two candidate causes, both already documented as
+"simplifications" when they were built but never actually cost-measured
+against `Block`'s equivalent path:
+
+1. `AutomatonBlock::merge_into` rebuilds its whole `ids` array on every
+   mutation via two full `HashMap<String, TermId>` passes over the
+   block (one to snapshot old term->id, one to look surviving terms back
+   up after the automaton mutates) -- each entry costs a fresh `String`
+   allocation and a hash, on top of `Automaton::insert_sorted`'s own
+   (fast) mutation. `Block::merge_into`, by contrast, does one single
+   FST-stream walk that reads old entries and merges in new ones in the
+   same pass, writing straight into an arena -- no `HashMap`, no
+   per-entry `String` allocation.
+2. `AutomatonDictionary::resync_after_mutation` then does a *second*
+   full block decode (`decode_into`) plus a full `assign_ranks` pass over
+   every entry, unconditionally, on top of whatever `AutomatonBlock`
+   already did -- because `AutomatonBlock::merge_into`/`remove` don't
+   report an `unchanged_prefix`, `assign_ranks` here has no skip and
+   redoes the whole block's reverse mapping every time. `Dictionary`'s
+   own `insert`/`insert_ordered` use `MergeOutcome::unchanged_prefix` to
+   skip re-touching the reverse mapping for everything before the first
+   change.
+
+New isolated test, `automaton_block::tests::
+perf_probe_merge_into_single_term_automaton_vs_block` (`#[ignore]`d,
+wall-clock, block-level only -- no dictionary-level resync on top),
+confirms cause (1) is real and already dominant on its own: 2,000 single-
+term `merge_into` calls into one growing ~256+-entry block, 945 us/op for
+`AutomatonBlock` vs 20.4 us/op for `Block` -- **~46x slower**, well before
+`AutomatonDictionary`'s own extra resync pass gets a chance to add
+anything on top. (The block in this probe grows unboundedly rather than
+being capped at `block_max`, so the absolute ratio here is worse than
+what shows up end to end where blocks stay near 256 -- but it isolates
+that the block-level `ids`-rebuild cost alone, independent of the
+dictionary layer, already outweighs `Automaton`'s own mutation advantage.)
+
+**The honest conclusion**: the "insert 3x faster" and "batch-insert
+16-26x faster" numbers earlier in this file were real, but measured a
+narrower thing than they were being read as -- the bare `Automaton`
+primitive's mutation cost in isolation, not the actual cost of using it
+as a block backend the way `AutomatonBlock`/`AutomatonDictionary`
+currently wrap it. The wrapping's own documented "simplification" (full
+`ids` rebuild instead of `Block`'s single-walk incremental update) was a
+real, unmeasured cost, and it's large enough to flip the sign on every
+mutating operation end to end, even though the underlying automaton
+really is cheaper to mutate. `bulk_insert`'s regression is a separate,
+previously-unmeasured gap: `Automaton::build_sorted`'s from-scratch
+construction speed was never checked against `fst`'s `MapBuilder`
+directly (every earlier "faster" claim was about avoiding a rebuild, not
+about how fast the rebuild itself is when one does happen), and it turns
+out to be slower, plausibly because `fst`'s `MapBuilder` is a mature,
+heavily optimized production implementation, and this project's own
+register-based construction has had no equivalent optimization pass.
+
+Net effect: `AutomatonDictionary` is **not** currently a strict win over
+`Dictionary`, and should not be promoted to default status as it stands.
+It is a strict win for read-heavy, mutation-light workloads (lookups
+faster in both directions, confirmed by hardware counters, not just wall
+clock), and a strict loss for anything insert/remove-heavy, also
+confirmed. The path to actually cashing in the underlying automaton's
+real mutation advantage runs through giving `AutomatonBlock::merge_into`/
+`remove` an `unchanged_prefix`-tracked incremental `ids` update (closing
+gap 1) and `AutomatonDictionary::resync_after_mutation` the same skip
+`Dictionary` already has (closing gap 2) -- both flagged as scope
+reductions when originally built, now confirmed by measurement, rather
+than assumption, to actually matter. Not started; this section reports
+the measurement this session was asked for, not a fix for what it found.
+
+### Custom incremental micro-FST: closing the gap, for real this time
+
+Both diagnosed causes fixed, each verified with the same isolated probe
+and `perf stat` discipline used to find them -- not assumed fixed because
+the change looked right.
+
+**Fix 1: `AutomatonBlock::merge_into`/`remove` rewritten, no `HashMap`.**
+`merge_into` is now a single sorted-merge walk of the block's existing
+content against `incoming`, mirroring `Block::merge_into`'s algorithm
+exactly -- read the old term at each rank, compare against the next
+incoming term, decide old/new/matched, push into a freshly built `ids`
+array, track `unchanged_prefix` the same way `Block::MergeOutcome` does.
+No `HashMap<String, _>`, no per-entry `String` allocation. `remove` needs
+no walk at all: removing one entry from a sorted sequence only shifts
+everything after it, so `self.ids.remove(old_rank)` is exactly correct,
+and `unchanged_prefix` is just `old_rank` -- the original implementation's
+full HashMap-rebuild-on-removal was solving a problem that didn't exist.
+`AutomatonDictionary::assign_ranks` gained the matching `skip` parameter
+(mirroring `Dictionary`'s own), and turned out to need no decode at all
+once written that way: it only ever consumed `(local_rank, id)` pairs, and
+`AutomatonBlock::id_at` gives those directly, so `resync_after_mutation`'s
+separate `decode_into` pass was removed entirely, not just skipped.
+
+Measured on the isolated block-level probe (`perf_probe_merge_into_
+single_term_automaton_vs_block`, no dictionary layer at all): **46x
+slower than `Block::merge_into` -> ~3.3x slower**. Real progress, but the
+probe's own before/after numbers made clear something structural was
+still unaccounted for -- worth checking rather than declaring done at a
+plausible-looking partial win.
+
+**Fix 2: `Automaton::stream`, an incremental walk, replacing repeated
+`term_at_into` calls.** The remaining ~3.3x traced to an architecture
+mismatch, not a leftover inefficiency in the new merge walk: it read old
+content via `term_at_into(rank, ..)` once per rank, and `term_at_into`
+always restarts from the automaton's `root` -- paying the full path
+length on *every* call, no matter how much of it was just walked for the
+previous rank. `Block::merge_into`/`decode_into` use `fst::Map::stream()`,
+which is a genuinely incremental walk: consecutive keys sharing a prefix
+reuse that traversal, paying only for the divergence. This is a different
+axis from the earlier, already-measured `term_at_into`-vs-`Block::
+term_at_into` point-lookup comparison (`perf_probe_decode_cost_automaton`,
+where `Automaton` already won) -- that probe compared two *non-incremental*
+APIs against each other; `Block::merge_into`'s real code path was never a
+fair comparison for `term_at_into` to be measured against in the first
+place.
+
+`Automaton::stream` (`micro_fst.rs`) is the equivalent incremental walk:
+a preorder DFS over the trie with an explicit stack (one frame per state
+on the current root-to-frontier path, each tracking its next child index
+via a new direct-loop `Transitions::at`, not `Transitions::iter`'s
+combinator chain -- consistent with this module's own earlier finding
+that the combinator chain, not the scan itself, was the real cost).
+`AutomatonBlock::merge_into` and `decode_into` were both switched to it.
+Tested directly (`micro_fst::tests::stream_matches_term_at_into_for_every_
+rank`, `stream_backtracks_correctly_across_shared_and_diverging_prefixes`),
+not just relied on indirectly through the existing block-level tests,
+which also all still pass unchanged (the streaming rewrite is a pure
+internal implementation change; no public contract moved).
+
+Measured on the same isolated block-level probe: **~3.3x slower ->
+`AutomatonBlock` `47.4us/op` vs `Block` `14.4us/op`**, i.e. still nominally
+behind at this micro-benchmark's specific (small, unboundedly-growing)
+block-size regime, but the real test is the end-to-end numbers below,
+which is where this was always meant to be judged.
+
+**End-to-end re-measurement** (`examples/perf_dictionary_automaton_vs_fst.rs`,
+same methodology as the original "measured end to end" section: 20,000
+namespace-clustered term groups, `Dictionary`'s default block bounds,
+`perf stat` cross-checking wall clock):
+
+| mode | before fix | after fix | `perf stat` confirmation |
+|---|---|---|---|
+| `sequential_insert` | 0.47x (slower) | **2.9x faster** | 1.87x fewer cycles, 2x fewer instructions, 5.1x fewer cache-references |
+| `remove` | 0.31x (slower) | **2.15x faster** | 2.07x fewer cycles, 2.2x fewer instructions, 5x fewer cache-references |
+| `get_id` | 1.30x faster | 1.39x faster | unchanged (this path was never touched) |
+| `get_term` | 1.99x faster | 2.01x faster | unchanged (this path was never touched) |
+| `bulk_insert` | 0.51x (slower) | 0.51x (slower), unchanged | not addressed -- see below |
+
+`sequential_insert` and `remove` both flipped from confirmed losses to
+confirmed wins, at roughly 2-3x, and by a wide enough hardware-counter
+margin (cache-references down 5x on both) that this isn't a borderline
+call. `get_id`/`get_term` were untouched by this fix (their code paths
+never went through `merge_into`/`remove`/`assign_ranks`) and remain
+exactly the wins they were.
+
+**`bulk_insert` is deliberately not addressed here.** It was already
+diagnosed as a different problem in the original measurement section:
+`Automaton::build_sorted`'s from-scratch construction speed against
+`fst`'s `MapBuilder`, not a wrapping-overhead question at all -- nothing
+this fix touched (`merge_into`, `remove`, `assign_ranks`, `stream`) sits
+anywhere on `build_sorted`'s path. Confirmed unchanged by `perf stat`
+(128.8M vs 220.7M cycles for 20,000 fresh terms, same ~1.7x gap as
+before). A real, separate, still-open item.
+
+**Net effect**: four of five measured operations are now confirmed wins
+for `AutomatonDictionary` over `Dictionary` -- reads by ~1.4-2x, and now
+mutations too, by ~2-3x. Only fresh bulk construction remains a loss.
+This changes the promotion calculus from the previous section's "not a
+strict win, don't promote" to "a strict win for every workload except
+cold/bulk construction" -- still not a blanket recommendation to promote
+to default (bulk construction matters for any workload that loads a
+large corpus from scratch, and `AutomatonDictionary` still lacks
+`insert_prepared`/`get_term_into`/`get_terms_into`/`RebuildStats`/
+`size_bytes`), but a materially different, more favorable position than
+before this fix, and a fix driven end to end by measurement at every
+step: probe, diagnose, fix, re-probe, re-measure end to end, rather than
+assuming a plausible-looking change worked.
+
+### Custom incremental micro-FST: closing the bulk-construction gap
+
+`bulk_insert` (`AutomatonBlock::build` -> `Automaton::build_sorted`, the
+fresh-construction path `AutomatonDictionary::bootstrap` uses on an empty
+dictionary) was the one operation the previous two fixes didn't touch --
+neither `merge_into`/`remove`'s rewrite nor `Automaton::stream` sits
+anywhere on `build_sorted`'s path. A first premise check mattered here:
+the earlier "16-26x faster batch insert" number was about
+`Automaton::insert_sorted` (a batch inserted into an *existing*
+automaton) against N sequential `Automaton::insert` calls -- an entirely
+different operation from `build_sorted` (fresh construction from
+nothing), never previously measured against `fst`'s `MapBuilder` at all.
+Checked by reading both `build_sorted` and `insert_sorted`'s code before
+assuming one could substitute for the other: `insert_sorted` does
+strictly *more* per-term work than `build_sorted` (a walk attempting to
+match existing transitions, generation bookkeeping) with nothing to gain
+from an empty starting automaton, so there was no shortcut there --
+`build_sorted` needed its own, real profiling.
+
+**Profiled with `perf record`** (a `profiling` Cargo profile already
+existed with `debug = true, strip = false`, so this needed no new
+tooling), not reasoned about from reading the code alone. Three real
+findings, fixed one at a time, each re-measured before moving to the
+next:
+
+1. **`link_new` (used by every state `build_sorted`/`insert_sorted`
+   create) unconditionally called `Transitions::insert_transition`** --
+   the general, any-position rebuild-from-a-sorted-`Vec` path, needed by
+   `Automaton::insert` (a single, order-independent incremental insert,
+   which can genuinely diverge anywhere among a state's existing
+   transitions) but *not* by `build_sorted`, whose own doc comment
+   already noted "sorted input never branches backwards at a given
+   node." Added `link_new_appending`, calling `Transitions::append_in_order`
+   directly (no allocation, no rebuild) -- applied only to `build_sorted`'s
+   call site, confirmed safe by the empty-start invariant (nothing exists
+   yet to diverge before). *Not* applied to `insert_sorted`'s own
+   extension loop: that one mutates a possibly non-empty existing
+   automaton, where a new branch can genuinely need to land *between* two
+   already-existing siblings (e.g. existing "cx"/"cz", inserting "cy") --
+   a case `append_in_order` would silently place in the wrong position,
+   and the existing test suite didn't happen to cover it. Checked by
+   reasoning, not risked: left on the safe general path.
+2. **`Signature::of`/`register: HashMap<Signature, StateId>` were the
+   next-largest cost** -- `perf record` showed `SipHash` hashing
+   (`std`'s default, deliberately slow for adversarial-input resistance)
+   plus the `Vec` equality comparison it triggers as the two biggest
+   remaining line items. `register` is a purely internal map over this
+   module's own derived keys, never attacker-influenced, so DoS
+   resistance buys nothing here -- switched to `FxHasher` (`micro_fst.rs`),
+   the same simple multiply-rotate-xor hash `rustc`'s own compiler
+   internals use for exactly this kind of hot internal map, via
+   `HashMap<_, _, BuildHasherDefault<FxHasher>>` (a `type Register`
+   alias, no new dependency).
+3. **`Signature::of` and `finalize_outputs_and_count` were both still
+   using `Transitions::iter()`'s combinator chain** (`Chain`, `FlatMap`,
+   `Map`) to collect into a fresh `Vec` once per confirmed state -- the
+   exact pattern this module's own earlier decode-speed investigation
+   already found costly (see `Transitions::iter`'s doc comment), just not
+   yet applied to these two call sites. Rewritten as direct loops over
+   the already-added `Transitions::at`; `finalize_outputs_and_count` also
+   lost its separate `targets: Vec<StateId>` entirely (folded into the
+   same loop that builds `outputs`, since nothing else used `targets`).
+
+Ratio on the isolated `bulk_insert` end-to-end measurement, `perf
+stat`-confirmed at each step (instructions used as the primary metric for
+the final numbers -- cycles proved noisier run to run on this machine,
+consistent with this project's own earlier measurement-hygiene notes):
+
+| stage | automaton cycles (approx) | ratio vs `fst` |
+|---|---|---|
+| before any bulk-insert fix | 220.7M | 1.71x slower |
+| + `link_new_appending` | 172.4M | 1.37x slower |
+| + `FxHasher` | 150.4M | 1.20x slower |
+| + direct-loop `Signature`/`finalize_outputs_and_count` | ~154.8M (avg of 3 runs; cycles noisy) | ~1.13x slower (~1.10x by instructions, the more stable metric) |
+
+**Not fully closed.** What's left, per a final `perf record` pass: the
+single largest remaining cost is `BatchOrder::prepare`'s input sort
+(`sort_unstable_by` on the incoming terms) -- confirmed via a `--call-graph
+dwarf` trace, not assumed from the flat profile, which would have
+wrongly blamed it on `Signature` comparison. This sort is identical code
+shared by `Dictionary::insert_batch` and `AutomatonDictionary::insert_batch`
+alike, so it isn't a gap between the two implementations at all -- both
+sides pay it. The genuinely `Automaton`-specific remainder (register
+lookups, `confirm_path`, state allocation) is now small enough that
+closing it further would mean either an unsafe zero-allocation register
+lookup (the `Signature` `Vec` still costs one real allocation per
+confirmed state on a register miss; avoiding that on stable Rust without
+a `hashbrown`-style `raw_entry`/`Equivalent` API isn't clean, and wasn't
+attempted) or accepting the remaining ~1.1x as close enough. Left as-is
+here, reported rather than pushed further, per this session's own
+"measure, don't over-fit a diminishing-returns tail" instinct.
+
+**Net effect across all five measured operations, now**: `bulk_insert`
+~1.1x slower (down from ~1.95x when first measured, effectively closed);
+`sequential_insert` **2.33x faster** (up from 2.9x measured right after
+the `merge_into` fix -- further improved by this session's own shared
+infrastructure, `confirm_path`/`Signature::of`/`FxHasher`, that
+`insert_sorted` and `remove` also go through); `remove` **3.15x faster**
+(up from 2.15x, same reason); `get_id` 1.33x faster; `get_term` 2.06x
+faster -- all `perf stat`-confirmed. Four wins and one near-parity, from
+a starting point of three outright losses out of five.
+
+### Custom incremental micro-FST: an extensive analysis of what's left in `build_sorted`
+
+A deeper follow-up investigation, specifically into *construction*
+(`Automaton::build_sorted` / `Block::build`) rather than any mutation
+path, using `perf record`/`perf stat` more rigorously than the previous
+sections -- and finding that the previous section's own `bulk_insert`
+numbers (1.1x slower) were themselves measuring something subtly wrong,
+which this analysis had to correct before it could trust anything else.
+
+**New isolated benchmark infrastructure**, because neither existing tool
+was clean enough for this question: `examples/perf_micro_fst_build.rs`
+(a standalone binary, `automaton`/`block` x `build`/`setup` modes, the
+`setup` mode existing purely so `perf stat` can subtract term-generation/
+sorting/chunking cost from the whole-process counters) plus
+`src/lib.rs`'s `#[doc(hidden)] pub mod __internal_bench`, exposing thin
+wrappers around the otherwise-`pub(crate)` `Automaton::build_sorted` and
+`Block::build` so an external example binary can reach them. Chunked to
+256-term pieces (`Dictionary`'s own `block_max`) to match
+`AutomatonDictionary::bootstrap`'s real call shape.
+
+**Finding 0, and the one that mattered most: the earlier `bulk_insert`
+measurement's "1.1x slower" was contaminated by a shared cost, badly
+enough to reverse the sign.** Isolated wall-clock on `build_sorted`
+alone (no `BatchOrder::prepare` sort, no dictionary wrapping) first
+*appeared* to show `Automaton::build_sorted` faster than `Block::build`
+-- then a repeat run showed the opposite. Five-repetition `perf stat`
+settled it with tight error bars (instructions: automaton 332.9M ±0.24%,
+`Block` 314.8M ±0.89%; cycles noisier, ±3.7-4.4%, as this project's own
+measurement-hygiene notes already warned): `Automaton::build_sorted`
+alone is genuinely slower, ~1.06-1.16x depending on metric -- a real gap,
+but far smaller than `bulk_insert`'s reported 1.1x once the shared sort
+is correctly excluded on *both* sides. The lesson generalizes: even a
+"whole-process, no dictionary layer" benchmark isn't automatically clean
+if it does its own setup work inside the same process `perf` samples --
+this crate's own `setup`/no-`setup` subtraction discipline needed
+applying one level deeper than it previously had been.
+
+**Finding 1: `perf record`'s flat profile was *also* lying, for the same
+reason, and `--delay` fixed it properly.** A first `perf record` on the
+isolated probe still showed `__memcmp_avx2_movbe` as the single largest
+cost (~20-25%) -- but a `--call-graph fp` caller trace (`--call-graph
+dwarf` couldn't unwind through glibc's assembly at all, no CFI there)
+traced it entirely to the probe's *own* setup-phase `Vec<String>` sort,
+not to construction. Confirmed by re-recording with `perf record -D
+<ms>` (a startup delay long enough to skip past setup's own measured
+duration entirely, timed from `setup` mode's own wall-clock): with setup
+genuinely excluded from the recording window, `__memcmp_avx2_movbe`
+disappears from `Automaton::build_sorted`'s top-20 entirely. Every
+earlier profile in this whole multi-session effort that showed prominent
+`memcmp` during a "bulk"/"build" operation was measuring the *input sort*,
+not string comparison inside construction itself -- worth flagging as a
+standing methodological trap for any future profiling of a batch/bulk
+path in this crate.
+
+**Finding 2: with the confound removed, the true `build_sorted` profile**
+(construction only, `perf record -D`-isolated, self time):
+
+| cost | automaton | note |
+|---|---|---|
+| `HashMap::get::<Signature>` (register lookup) | 14.52% | `FxHasher`-backed now (see the prior section) |
+| `release` | 9.42% | refcount decrement / cascading free |
+| `build_sorted` itself | 8.95% | main loop, `common_prefix_len`, path bookkeeping |
+| `confirm_path` | 7.95% | per-term confirmation driver |
+| `alloc_state` | 6.16% | state slab allocation/reuse |
+| glibc allocator family (`_int_malloc`, `_int_free_*`, `cfree`, `unlink_chunk`, `malloc`, `realloc`, `_int_realloc`) | **~27.2% combined** | no single symbol dominates, but the *category* does |
+| `finalize_outputs_and_count` | 3.30% | already rewritten to a direct loop (prior section) |
+| `redirect` | 2.29% | repoint a transition to its canonical target |
+
+And `Block::build`'s, same methodology, for a like-for-like comparison:
+
+| cost | block | note |
+|---|---|---|
+| `UnfinishedNodes::find_common_prefix_and_set_output` | 14.04% | `fst`'s own construction-loop equivalent |
+| `Builder::insert` | 10.38% | `fst`'s own per-term driver |
+| glibc allocator family | **~22.5% combined** | comparable magnitude to automaton's -- not automaton-specific |
+| `__memcmp_avx2_movbe` | 4.69% | genuinely inside `fst` here (registry/node equality), unlike the earlier false positive |
+| `Registry::new` / `Registry::entry` | 4.13% / 3.66% | `fst`'s own register-deduplication -- the same algorithmic role as `Signature`/`register` |
+
+**The two implementations' cost profiles are structurally similar**: both
+spend a comparable share on allocator overhead (~22-27%, not something
+distinguishing the two) and a comparable share on their own
+register/dedup mechanism (`HashMap::get::<Signature>` at 14.52% vs.
+`find_common_prefix_and_set_output` + `Registry::*` together at roughly
+the same order). There is no longer one dominant, obviously-fixable
+outlier on the automaton side -- this is now a "many small constant
+factors" gap, not a "one big lever" gap.
+
+**Finding 3, from `perf stat`'s deeper counters (`stalled-cycles-frontend`,
+`L1-dcache-load-misses/loads`, delta-corrected via the `setup`/`build`
+subtraction): the remaining ~1.30x cycle gap is frontend-stall-dominated,
+not data-cache-bound.** Automaton pays ~2.85x more frontend stall
+cycles than `Block::build` (6.99M vs. 2.45M) despite *better* L1 data
+cache behavior: a 0.22% load-miss rate vs. `Block`'s 2.58% (automaton
+does more total loads -- 63.8M vs. 52.8M -- but they hit cache far more
+reliably). Ruled out as the sole explanation, not confirmed: a
+same-crate-inlining-fragmentation hypothesis (`codegen-units=1`, no LTO,
+tested via a `CARGO_PROFILE_RELEASE_*` env override, never touching the
+committed `Cargo.toml`) changed *nothing* for either side (automaton
+52.3M -> 52.85M cycles delta, `Block` 40.3M -> 39.7M -- both within
+noise), meaning `alloc_state`/`release`/`redirect`/etc. are already
+inlined adequately at the crate's current default `codegen-units=16`.
+The frontend-stall cause itself is **not yet identified** -- reported as
+an open question, not a solved one.
+
+**Finding 4, a genuine surprise, reported as found rather than
+cherry-picked: enabling LTO helps `Block::build` more than
+`Automaton::build_sorted`, widening the relative gap.** Same env-override
+experiment with `lto = "thin"` added: automaton's construction delta
+dropped from 52.3M to 44.5M cycles (-15%), but `Block::build`'s dropped
+from 40.3M to 29.5M (-27%) -- both genuinely faster in absolute terms,
+but the *ratio* moved from 1.30x to 1.51x, the wrong direction for this
+specific comparison. The likely explanation: `Block::build` calls into
+the external `fst` crate on every operation, and without LTO none of
+that ever got inlined across the crate boundary at all -- enabling it for
+the first time unlocks a lot of previously-inaccessible headroom there.
+`Automaton::build_sorted` is already same-crate, so it was never subject
+to that specific limitation, and gained comparatively less. This is a
+real, useful finding for the *project* (LTO looks like a genuine win
+worth adopting for both implementations, and for `Dictionary` generally,
+since it depends on `fst` too) but not a finding that closes automaton's
+gap against `fst` specifically -- reported honestly rather than framed as
+progress on the thing that was asked about.
+
+**Not yet attempted, and the clearest remaining concrete lead**:
+`Signature::of`'s `transitions: Vec<(u8, u32, StateId)>` and
+`finalize_outputs_and_count`'s local `outputs: Vec<u32>` are each a
+fresh heap allocation on *every confirmed state* -- exactly the ~27%
+allocator-overhead category Finding 2 surfaced, and exactly the kind of
+small, low-branching-factor-bounded (`CHUNK_CAP = 4`) data this crate's
+own `Transitions` unrolled-list design already demonstrates the value of
+avoiding heap allocation for. A `SmallVec<[T; 4]>`-style inline buffer
+for both (a new small dependency, or a hand-rolled equivalent mirroring
+`TransitionChunk`) is the most promising untried lever surfaced by this
+analysis, but this session stopped at analysis for this specific item,
+not implementation -- `Block::build` pays a comparable allocator tax
+(~22.5%) via its own `Registry`, so this would need measuring against
+`Block` again afterward to confirm it actually narrows the gap rather
+than just making both sides faster in lockstep, the same trap Finding 4
+already demonstrated is real.
+
+### Custom incremental micro-FST: implementing the levers
+
+Both levers the previous section surfaced were actually built and
+measured -- one a confirmed negative result, reverted; one a confirmed
+win, kept. Reported in that order because that's the order they were
+tried, and the negative result is exactly as informative as a positive
+one would have been.
+
+**Lever 1: `SmallVec`-style inline buffers for `Signature::transitions`
+and `finalize_outputs_and_count`'s `outputs` -- tried, measured slower,
+reverted.** Built a hand-rolled `SmallVec<T, N>` (inline `[Option<T>; N]`
++ `Vec` overflow, no new dependency, matching `TransitionChunk`'s own
+established shape), with a manual `PartialEq`/`Hash` giving exactly
+`Vec<T>`'s own structural semantics (representation-independent: an
+inline-only value and an overflowed value with the same logical content
+compare equal and hash identically -- required, since `Signature` is a
+`HashMap` key and two equal keys must always compare equal). Two direct
+unit tests (`small_vec_push_get_len_across_the_inline_overflow_boundary`,
+`small_vec_equality_and_hash_are_representation_independent`) confirmed
+it correct before it went anywhere near `Signature`.
+
+Wired in, then measured on the same isolated `perf_micro_fst_build`
+`setup`/`build` delta this analysis already established as clean:
+**instructions went *up*, not down** -- 146.9M -> 156.9M at `N=4`
+(+6.8%), reproducible with `±0.00%` variance across repeated runs (not
+noise). Tried `N=2` (156.7M, no real improvement) and `N=1` (160.9M,
+*worse* -- a smaller inline capacity pushes more states into the
+`overflow` `Vec` anyway, so it pays the abstraction's overhead *and*
+still allocates often). No value of `N` tried came close to the plain
+`Vec` baseline.
+
+Why, reasoned through after the fact rather than before: `SmallVec` is a
+bigger value to move around than a bare `Vec` (`[Option<(u8,u32,StateId)>;
+N]` plus a `Vec` field, vs. a `Vec`'s three words), and every register
+lookup constructs a `Signature`, compares it, and either drops it or
+moves it into the map -- more bytes shuffled per lookup, and a
+conditional branch (inline vs. overflow) on every element access via
+`get`, where the old code's derived `Vec` comparison very likely compiled
+to a tight, branchless loop (or even a real `memcmp`, for POD-ish `T`).
+glibc's small-object allocator fast path, it turns out, was already
+cheap enough that avoiding it wasn't worth what the avoidance itself
+cost. Fully reverted (`Signature.transitions`/`finalize_outputs_and_count`'s
+`outputs` are back to plain `Vec`, `set_outputs` back to `&[u32]`,
+`SmallVec` and its tests deleted, not just unused) -- the code comments
+at both sites now record this as a measured decision, not silence where
+a reader might reasonably wonder why the "obvious" optimization from the
+prior section never happened.
+
+**Lever 2: thin LTO -- tried, measured faster, kept.** Added
+`[profile.release] lto = "thin"` to `Cargo.toml`. Confirms the prior
+section's Finding 4 was worth acting on. `codegen-units = 1` alone was
+re-confirmed not worth adding on its own (no measured benefit, real
+build-time cost) and left out.
+*Correction, caught while measuring the next lever below*: this section
+originally claimed the resulting isolated construction numbers "matched
+the earlier experiment's numbers exactly" -- that was never actually
+re-checked at the time, only asserted by analogy (the dictionary-level
+`bulk_insert` numbers *were* checked and held up). They don't match:
+`lto = "thin"` alone measures closer to `Block::build`'s *original*
+no-LTO construction cost than to the earlier `codegen-units=1 +
+lto=thin` combined experiment's ~27%-faster number -- `codegen-units=1`
+apparently interacts with thin LTO's ability to inline across the `fst`
+crate boundary (simplifying what ThinLTO has to merge) in a way it
+doesn't deliver alone, an effect the original "codegen-units=1 changes
+nothing" experiment (tested *without* LTO) didn't surface. Worth
+revisiting -- `codegen-units=1` alone was correctly found not worth it,
+but `codegen-units=1` *combined with* LTO was never isolated as its own
+data point, and the combined-experiment's stronger number may well be
+recoverable by adding it now. Not done in this pass; flagged, not fixed,
+consistent with this whole investigation's own discipline about not
+letting an unverified claim stand once noticed.
+
+Checked at the full `AutomatonDictionary`-vs-`Dictionary` level too, not
+just the isolated construction benchmark, since Finding 4 specifically
+warned that a lever measured on one slice can shift a different slice's
+ratio: `bulk_insert` (still automaton's one loss) moved from ~1.20x to
+~1.16x slower -- unlike the isolated `build_sorted`-only benchmark, where
+the same change widened the gap to 1.51x, the *dictionary-level* number
+(diluted by `BatchOrder::prepare`'s shared sort and bootstrap overhead,
+which LTO also speeds up on both sides) didn't get worse. `sequential_insert`
+(2.32x fewer cycles), `get_id`, `get_term`, and `remove` (3.35x faster by
+wall clock) all held steady or improved slightly. No regression found
+anywhere `perf stat` was pointed at it. Safe for any future consumer of
+this crate as a library dependency too: `[profile.*]` sections are only
+read from the workspace root, never from a dependency's own
+`Cargo.toml`, so this only affects builds where `s-dict` itself is what's
+being built.
+
+**Where this leaves the "implement the levers" instruction**: one lever
+built, measured, and correctly discarded; one lever built, measured, and
+kept. Net effect on the actual numbers that matter (the full
+`AutomatonDictionary`-vs-`Dictionary` comparison) is a small further
+improvement on top of the "closing the bulk-construction gap"
+section's own results, not a dramatic one -- the extensive analysis
+already found this specific investigation was past its biggest wins and
+into "many small constant factors," and implementing what it found
+confirmed that diagnosis rather than overturning it.
+
+### Custom incremental micro-FST: a reused scratch buffer, not a `SmallVec`
+
+A follow-up question after the `SmallVec` revert, prompted directly by
+the user: instead of an inline-capacity type, what about a plain,
+*reused* scratch buffer -- clear and refill the same `Vec` across calls
+instead of allocating fresh each time? A materially different idea from
+`SmallVec`, worth trying on its own merits rather than treated as
+already answered by the previous negative result: `SmallVec` failed
+because *its own abstraction* (a bigger struct to move, a branch on
+every access) cost more than the allocation it avoided; a scratch buffer
+adds no new abstraction at all -- still a plain `Vec`, just handed back
+instead of dropped.
+
+**Two different `Vec`s, two different situations**, worth being precise
+about since only one of them is simple:
+
+- `finalize_outputs_and_count`'s local `outputs: Vec<u32>` never
+  escapes the function (read once by `set_outputs`, then unused) -- a
+  trivial case: thread a `&mut Vec<u32>` in, `.clear()` it, reuse it.
+  No complications.
+- `Signature`'s `transitions: Vec<(u8, u32, StateId)>` is different: it
+  becomes a `HashMap` key. On a register *hit* (the common case for a
+  corpus with real structural sharing -- minimization's whole point),
+  the `Signature` is dropped right after the lookup, and that allocation
+  was pure waste all along. On a *miss*, the `Vec` has to be moved into
+  the map and live there permanently -- nothing to reuse. The fix:
+  `signature_of_into(state, scratch)` takes the buffer via `mem::take`
+  (not a fresh allocation) to build the candidate `Signature`; the
+  caller (`confirm_path`, and `release`, which has its own separate
+  `Signature::of` call this investigation hadn't previously accounted
+  for -- see below) gives the buffer back (`*scratch = sig.transitions`)
+  on a hit, and simply lets a fresh one grow on the next miss. No
+  `Borrow`/`raw_entry` trickery needed (the approach this project
+  considered and set aside earlier as too fragile for stable Rust
+  without `hashbrown`) -- ownership only ever moves one way, into the
+  map, and never needs to be borrowed back out.
+
+**Threading the buffers through turned out to touch more call sites
+than expected.** `confirm_path` was the obvious one, but `release`
+(freeing a superseded state's slot, purging its stale register entry)
+has its *own* `Signature`-building call, reachable from `redirect`,
+which is itself called from `confirm_path` *and* from `insert`'s and
+`insert_sorted`'s own copy-on-write clone loops. Getting real reuse
+meant threading `outputs_scratch: &mut Vec<u32>` /
+`signature_scratch: &mut Vec<(u8, u32, StateId)>` from each top-level
+entry point (`build_sorted`, `insert`, `insert_sorted`, `remove`, each
+declaring its own pair once) down through `confirm_path`, `redirect`,
+and `release`'s own recursive cascade -- six call sites, three function
+signatures. `redirect` and `confirm_path` both crossed clippy's
+`too_many_arguments` threshold (8 params) as a result; `#[allow]`ed with
+a comment rather than force a context-struct refactor into an unrelated
+change. All 84 tests pass, including the minimality regression test and
+the 4-way fuzz differential -- the give-back logic (particularly
+`release`'s, where `sig` is *never* moved into the map, since both
+`HashMap::get` and `HashMap::remove` take the key by reference, so the
+buffer can be reclaimed unconditionally, not just on the "not found"
+branch) needed to be exactly right, and this is the check that it was.
+
+**Measured on the same isolated `perf_micro_fst_build` benchmark,
+instructions as the primary metric** -- cycles turned out unusually
+noisy in this round specifically (single-run deltas swinging between
+1.18x and 1.32x across repeated measurements of the *same* binary, both
+sides moving together, clearly machine noise rather than a real change;
+instructions stayed exactly reproducible, `±0.00%`, across every run):
+automaton's isolated construction delta went from 146.9M instructions
+(the "implementing the levers" section's post-LTO, pre-scratch-buffer
+baseline) to **116.8M** -- and `Block::build`'s own delta, unchanged
+code, measured at 118.6M in the same runs. **Automaton's construction
+now uses very slightly *fewer* instructions than `Block::build`** (ratio
+~0.985x), a reversal from every previous measurement in this whole
+investigation, where automaton's construction cost was always the
+slower side by some margin (1.06x-1.95x, depending on what else was
+fixed at the time).
+
+At the full `AutomatonDictionary`-vs-`Dictionary` `bulk_insert` level
+(which also carries `BatchOrder::prepare`'s shared sort and dictionary
+bootstrap overhead, diluting a pure-construction win somewhat, the same
+effect noted for LTO above): instructions ratio improved from ~1.20x to
+**1.041x** (automaton 288.98M vs. `fst` 277.47M for 80,000 terms) --
+automaton's one remaining loss among the five measured dictionary
+operations is now nearly closed, not just improved. `cycles` at this
+level (automaton 134.26M vs. `fst` 124.06M, ratio 1.08x) agrees on
+direction and magnitude, for once landing close to the instructions
+ratio rather than diverging from it the way the pure-isolated-construction
+benchmark's cycles did. All 84 tests still pass, clippy clean.
+
+This is the strongest single result in the whole "optimizing
+`build_sorted`" line of investigation, and it came from correctly
+separating two questions the `SmallVec` attempt had conflated: *avoiding
+an allocation* (worth doing, confirmed here) is not the same lever as
+*avoiding it via an inline-capacity abstraction* (not worth it, per the
+prior section) -- the same allocation, avoided a structurally simpler
+way, paid off where the fancier version didn't.
