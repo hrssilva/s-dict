@@ -95,6 +95,17 @@ impl Default for TransitionChunk {
 /// sorted by byte (`insert_transition` maintains this even though
 /// incremental `insert` can add a transition out of order; see its doc
 /// comment) -- `iter`/`get`/`set_target_for_byte` all rely on that.
+///
+/// A "single `Vec<TransitionChunk>`, no inline/overflow split" version
+/// was tried here and reverted -- measured no real memory win (leaf
+/// states got cheaper, but every 1+-transition state now needed a real
+/// heap allocation for what used to be free, and those dominate) plus a
+/// real speed loss (1.5-1.9x slower on `remove`/`get_id`/`get_term`/
+/// `bulk_insert`). See DESIGN.md's memory-scaling investigation and the
+/// design discussion that followed it -- a byte-packed, pooled-block
+/// representation (not just "move the same fixed-size chunk to the
+/// heap") is the direction that discussion is actually pursuing now;
+/// this struct stays as shipped until/unless that's built and measured.
 #[derive(Debug, Default, Clone)]
 struct Transitions {
     inline: TransitionChunk,
@@ -215,46 +226,6 @@ impl Transitions {
                     chunk.outputs[i],
                     chunk.targets[i].expect("populated slots always hold a target"),
                 ));
-            }
-        }
-        best.expect("value must be reachable via some transition at this state")
-    }
-
-    /// `last_output_at_most`, also returning the winning transition's
-    /// flat index (as `Transitions::at`/`StreamFrame::next_child`
-    /// address it) -- needed only by `Automaton::seek_stream`, to build a
-    /// `StreamFrame` resumable by `TermsStream::next` from a rank other
-    /// than 0. Not used by `term_at_into`'s own hot path (which has no
-    /// need for the index), so kept separate rather than changing
-    /// `last_output_at_most`'s signature for every caller.
-    fn last_output_at_most_with_index(&self, value: u32) -> (usize, u8, u32, StateId) {
-        let mut best: Option<(usize, u8, u32, StateId)> = None;
-        let mut idx = 0usize;
-        for i in 0..self.inline.len as usize {
-            if self.inline.outputs[i] > value {
-                return best.expect("value must be reachable via some transition at this state");
-            }
-            best = Some((
-                idx,
-                self.inline.bytes[i],
-                self.inline.outputs[i],
-                self.inline.targets[i].expect("populated slots always hold a target"),
-            ));
-            idx += 1;
-        }
-        for chunk in &self.overflow {
-            for i in 0..chunk.len as usize {
-                if chunk.outputs[i] > value {
-                    return best
-                        .expect("value must be reachable via some transition at this state");
-                }
-                best = Some((
-                    idx,
-                    chunk.bytes[i],
-                    chunk.outputs[i],
-                    chunk.targets[i].expect("populated slots always hold a target"),
-                ));
-                idx += 1;
             }
         }
         best.expect("value must be reachable via some transition at this state")
@@ -1040,6 +1011,92 @@ impl Automaton {
         }
     }
 
+    /// Decodes a *batch* of `(output position, rank)` pairs -- sorted by
+    /// rank ascending, not required to be deduplicated -- into
+    /// `out[position]`, via one recursive descent instead of one
+    /// `term_at_into` call per rank.
+    ///
+    /// This is the direct multi-key generalization of `term_at_into`'s
+    /// own descent, not a heuristic layered on top of it: at each state,
+    /// the remaining sorted targets are partitioned against that state's
+    /// own transitions using the exact per-transition cumulative
+    /// `output` values `last_output_at_most`/`term_at_into` already read
+    /// -- no separate bookkeeping, no distance/gap comparison, no tuned
+    /// constant. A state is visited only if at least one target's value
+    /// falls in its range; a state with none does not get touched at
+    /// all, at any cost. Two targets that happen to be structurally
+    /// close (share a long common prefix in the automaton, which for
+    /// sorted input usually but not always means "close in rank") pay
+    /// for that shared path exactly once, discovered by the recursion
+    /// itself as it walks both down the same branch -- not decided in
+    /// advance by looking at how far apart their ranks are. Two targets
+    /// that diverge immediately cost nothing extra for the parts of the
+    /// tree neither of them touches.
+    pub(crate) fn decode_ranks_into(&self, targets: &[(usize, u32)], out: &mut [Option<String>]) {
+        let mut buf = Vec::new();
+        self.decode_batch(self.root, targets, 0, &mut buf, out);
+    }
+
+    /// `targets` stays one contiguous slice of the *original* input for
+    /// the whole recursion -- never copied or shifted -- with
+    /// `value_offset` (the sum of every transition `output` consumed by
+    /// an ancestor call) carried alongside instead, so a target's value
+    /// *at this state* is always `stored_value - value_offset`. That
+    /// keeps every recursive step to slice operations (`partition_point`,
+    /// `split_at`) over the one backing array, no per-call allocation.
+    fn decode_batch(
+        &self,
+        state_id: StateId,
+        targets: &[(usize, u32)],
+        value_offset: u32,
+        buf: &mut Vec<u8>,
+        out: &mut [Option<String>],
+    ) {
+        if targets.is_empty() {
+            return;
+        }
+        let state = &self.states[state_id.slot() as usize];
+        let mut remaining = targets;
+        if state.is_final {
+            // Every leading target still at value_offset (i.e. local
+            // value 0) is this state's own term -- sorted ascending, so
+            // these are always a prefix of `remaining`.
+            let split = remaining.partition_point(|&(_, v)| v == value_offset);
+            if split > 0 {
+                let term =
+                    std::str::from_utf8(buf).expect("keys were inserted as valid UTF-8 str bytes");
+                for &(pos, _) in &remaining[..split] {
+                    out[pos] = Some(term.to_string());
+                }
+                remaining = &remaining[split..];
+            }
+        }
+        let mut idx = 0usize;
+        while !remaining.is_empty() {
+            let (byte, my_out, my_target) = state
+                .transitions
+                .at(idx)
+                .expect("value must be reachable via some transition at this state");
+            // Everything before the *next* transition's own output
+            // belongs to this one -- `u32::MAX` if there is no next
+            // transition, since the last one covers the rest by the
+            // same invariant `last_output_at_most` relies on.
+            let boundary = state
+                .transitions
+                .at(idx + 1)
+                .map_or(u32::MAX, |(_, next_out, _)| value_offset + next_out);
+            let split = remaining.partition_point(|&(_, v)| v < boundary);
+            let (mine, rest) = remaining.split_at(split);
+            if !mine.is_empty() {
+                buf.push(byte);
+                self.decode_batch(my_target, mine, value_offset + my_out, buf, out);
+                buf.pop();
+            }
+            remaining = rest;
+            idx += 1;
+        }
+    }
+
     /// A streaming walk of every term in sorted (rank) order -- the
     /// incremental counterpart to `term_at_into`, and the reason it
     /// exists: repeated `term_at_into(rank, ..)` calls always restart
@@ -1063,57 +1120,6 @@ impl Automaton {
                 next_child: 0,
                 yielded_final: false,
             }],
-        }
-    }
-
-    /// Like `term_at_into` (a direct root-to-leaf descent to `rank`), but
-    /// returns a positioned `TermsStream` instead of just the decoded
-    /// bytes: `result.current()` is `rank`'s own term (same bytes
-    /// `term_at_into` would have written), and calling `.next()` on the
-    /// returned stream yields `rank + 1`, `rank + 2`, ... via ordinary
-    /// incremental advancement -- reusing whatever prefix `rank`'s
-    /// descent already established, the same shared-prefix win `stream()`
-    /// gives two *consecutive* `next()` calls, but starting from an
-    /// arbitrary rank instead of being stuck starting from 0.
-    ///
-    /// Exists to test a specific hypothesis about scattered bulk decode:
-    /// `term_at_into` called once per id in a requested set always pays
-    /// the full descent cost per call, even when consecutive requested
-    /// ranks are close together and share most of their path -- this
-    /// pays that full cost once, for the first id in a run, and lets
-    /// `next()` pick up the shared-prefix reuse for the rest. Whether
-    /// that actually wins in practice (traversal-reuse savings vs. the
-    /// extra bookkeeping to build a resumable stack instead of a flat
-    /// buffer) is exactly what needs measuring, not assumed -- see
-    /// `s-bench`'s `dict_bench` for the real-data comparison.
-    pub(crate) fn seek_stream(&self, rank: u32) -> TermsStream<'_> {
-        let mut value = rank;
-        let mut state = self.root;
-        let mut buf = Vec::new();
-        let mut stack = Vec::new();
-        loop {
-            let s = &self.states[state.slot() as usize];
-            if value == 0 && s.is_final {
-                stack.push(StreamFrame {
-                    state,
-                    next_child: 0,
-                    yielded_final: true,
-                });
-                return TermsStream {
-                    automaton: self,
-                    buf,
-                    stack,
-                };
-            }
-            let (idx, b, out, target) = s.transitions.last_output_at_most_with_index(value);
-            stack.push(StreamFrame {
-                state,
-                next_child: idx as u32 + 1,
-                yielded_final: true,
-            });
-            value -= out;
-            buf.push(b);
-            state = target;
         }
     }
 
@@ -1186,6 +1192,277 @@ impl Automaton {
         }
         total
     }
+
+    /// A pure measurement, not a real encoding: what would this
+    /// automaton's *reachable* structure cost if every state were a
+    /// byte-packed, variable-length record instead of a fixed-size
+    /// `State`/`TransitionChunk`? Builds no new storage, changes no
+    /// addressing, touches no mutation code -- the cheap way to check
+    /// the byte-packing hypothesis (DESIGN.md's memory-scaling
+    /// investigation, and the design discussion that followed it) before
+    /// committing to rewriting `confirm_path`/`redirect`/`release`/
+    /// `clone_state`/`alloc_state` around a real version of this layout.
+    ///
+    /// Per-state record: 1 byte (a count/flag byte -- `is_final` in the
+    /// top bit, transition count in the rest, safe up to 127
+    /// transitions, comfortably above this corpus's branching factor),
+    /// then per transition: 1 byte (the edge byte) + a LEB128 varint for
+    /// the output (bounded by block size, so almost always 1 byte at
+    /// this corpus's default `block_max`) + a fixed `TARGET_ADDR_BYTES`
+    /// address. The address width is assumed fixed here for simplicity
+    /// -- a real implementation might vary-width it too (smaller within
+    /// one block), which would make this a pessimistic estimate, not an
+    /// optimistic one.
+    pub(crate) fn estimate_packed_bytes(&self) -> usize {
+        const TARGET_ADDR_BYTES: usize = 4;
+        fn leb128_len(mut value: u32) -> usize {
+            let mut len = 1;
+            while value >= 0x80 {
+                value >>= 7;
+                len += 1;
+            }
+            len
+        }
+
+        let mut seen = std::collections::HashSet::new();
+        let mut stack = vec![self.root];
+        let mut total = 0usize;
+        while let Some(id) = stack.pop() {
+            if seen.insert(id) {
+                let state = &self.states[id.slot() as usize];
+                total += 1; // flag/count byte
+                let mut i = 0usize;
+                while let Some((_, output, target)) = state.transitions.at(i) {
+                    total += 1; // edge byte
+                    total += leb128_len(output);
+                    total += TARGET_ADDR_BYTES;
+                    stack.push(target);
+                    i += 1;
+                }
+            }
+        }
+        total
+    }
+}
+
+/// A read-only, byte-packed compilation of an [`Automaton`] -- built
+/// once from an existing (mutable) automaton via [`PackedAutomaton::compile`],
+/// never itself mutated. Prototype for the design discussion following
+/// DESIGN.md's memory-scaling investigation: validates decode speed for
+/// a cache-friendly, variable-length-record layout before committing to
+/// rewriting insertion/removal around a mutable version of it (the
+/// "unrolled blocks" piece of that discussion -- not attempted here).
+/// Supports only `rank`/`term_at_into`: no insert, no remove, no
+/// register, no refcounting -- those all assume `states: Vec<State>`
+/// random access by `StateId`, which this representation deliberately
+/// doesn't have.
+///
+/// Layout: states are written in postorder (every child before its
+/// parent) into one flat `bytes: Vec<u8>` -- guarantees a child's
+/// address is already known when its parent's record is written, and
+/// naturally deduplicates a multiply-referenced state to one record,
+/// one address, written once (the same dedup `Automaton`'s own register
+/// already achieved; this just preserves it through compilation instead
+/// of re-deriving it). Each state's record is `[flag_count: u8]` (top
+/// bit `is_final`, low 7 bits transition count -- safe up to 127,
+/// comfortably above this corpus's branching factor) followed by, per
+/// transition in byte-sorted order, `[byte: u8][output: LEB128
+/// varint][target: u32 LE, an absolute byte offset into `bytes`]`. No
+/// padding, no fixed slot count -- a leaf costs exactly 1 byte. This is
+/// deliberately the same layout `Automaton::estimate_packed_bytes`
+/// assumed, so `compile(..).size_bytes()` is that estimate's real-world
+/// check, not just a repeat of it.
+///
+/// `#[allow(dead_code)]` throughout: reachable only from this module's
+/// own tests and `perf_probe_*` benchmarks right now, deliberately, not
+/// wired into `AutomatonBlock`/`AutomatonDictionary` -- this is a
+/// decode-speed prototype, not a production path, until/unless the
+/// design discussion it's validating decides to build the mutable
+/// version around it.
+#[allow(dead_code)]
+pub(crate) struct PackedAutomaton {
+    bytes: Vec<u8>,
+    root: u32,
+}
+
+#[allow(dead_code)]
+impl PackedAutomaton {
+    /// Compiles `automaton`'s current (reachable) content into a packed
+    /// buffer. A postorder walk with memoization (`written`, mapping an
+    /// old `StateId` to its address in `bytes`) -- recursive, not the
+    /// iterative stack-based approach `size_bytes`/`reachable_state_count`
+    /// use; safe here because recursion depth is bounded by term length,
+    /// not term count, but a production version handling arbitrarily
+    /// long terms would want the iterative form those use instead.
+    pub(crate) fn compile(automaton: &Automaton) -> PackedAutomaton {
+        let mut bytes = Vec::new();
+        let mut written: HashMap<StateId, u32> = HashMap::new();
+        let root = Self::write_state(automaton, automaton.root, &mut bytes, &mut written);
+        PackedAutomaton { bytes, root }
+    }
+
+    fn write_state(
+        automaton: &Automaton,
+        id: StateId,
+        bytes: &mut Vec<u8>,
+        written: &mut HashMap<StateId, u32>,
+    ) -> u32 {
+        if let Some(&addr) = written.get(&id) {
+            return addr;
+        }
+        let state = &automaton.states[id.slot() as usize];
+        // Children written first (postorder), so their addresses are
+        // known by the time this state's own record is written.
+        let mut transitions: Vec<(u8, u32, u32)> = Vec::new();
+        let mut i = 0usize;
+        while let Some((b, out, target)) = state.transitions.at(i) {
+            let child_addr = Self::write_state(automaton, target, bytes, written);
+            transitions.push((b, out, child_addr));
+            i += 1;
+        }
+        debug_assert!(
+            transitions.len() <= 0x7F,
+            "branching factor exceeds this prototype's 7-bit transition-count field"
+        );
+        let addr = bytes.len() as u32;
+        let flag_count = (u8::from(state.is_final) << 7) | (transitions.len() as u8);
+        bytes.push(flag_count);
+        for (b, out, target) in transitions {
+            bytes.push(b);
+            write_leb128(bytes, out);
+            bytes.extend_from_slice(&target.to_le_bytes());
+        }
+        written.insert(id, addr);
+        addr
+    }
+
+    /// Total size of the compiled buffer -- directly comparable to
+    /// `Automaton::estimate_packed_bytes`'s prediction for the same
+    /// automaton (see the struct doc comment).
+    pub(crate) fn size_bytes(&self) -> usize {
+        self.bytes.len()
+    }
+
+    /// Mirrors `Automaton::rank`'s contract exactly.
+    pub(crate) fn rank(&self, term: &str) -> Option<u32> {
+        let mut pos = self.root;
+        let mut value = 0u32;
+        for &b in term.as_bytes() {
+            let (output, target) = self.get(pos, b)?;
+            value += output;
+            pos = target;
+        }
+        self.is_final(pos).then_some(value)
+    }
+
+    /// Mirrors `Automaton::term_at_into`'s contract exactly.
+    pub(crate) fn term_at_into(&self, rank: u32, buf: &mut Vec<u8>) {
+        buf.clear();
+        let mut value = rank;
+        let mut pos = self.root;
+        loop {
+            if value == 0 && self.is_final(pos) {
+                return;
+            }
+            let (b, out, target) = self.last_output_at_most(pos, value);
+            value -= out;
+            buf.push(b);
+            pos = target;
+        }
+    }
+
+    fn is_final(&self, pos: u32) -> bool {
+        self.bytes[pos as usize] & 0x80 != 0
+    }
+
+    fn transition_count(&self, pos: u32) -> usize {
+        (self.bytes[pos as usize] & 0x7F) as usize
+    }
+
+    /// Sequentially scans this state's transitions for `byte`, parsing
+    /// each record in turn -- unlike the fixed-array scheme this
+    /// replaces, a variable-length record can't jump straight to slot
+    /// `i`, so this is O(branching factor) *parse work*, not just an
+    /// O(branching factor) *scan* over already-typed fields. Whether
+    /// that parse cost is offset by better cache locality is exactly
+    /// what this prototype exists to measure, not assume.
+    fn get(&self, pos: u32, byte: u8) -> Option<(u32, u32)> {
+        let count = self.transition_count(pos);
+        let mut cursor = pos as usize + 1;
+        for _ in 0..count {
+            let b = self.bytes[cursor];
+            cursor += 1;
+            let (output, len) = read_leb128(&self.bytes[cursor..]);
+            cursor += len;
+            let target = u32::from_le_bytes(
+                self.bytes[cursor..cursor + 4]
+                    .try_into()
+                    .expect("4 bytes were written for every target address"),
+            );
+            cursor += 4;
+            if b == byte {
+                return Some((output, target));
+            }
+        }
+        None
+    }
+
+    /// The last transition (in byte order) whose output is `<= value` --
+    /// `Transitions::last_output_at_most`'s contract, over parsed
+    /// records instead of a typed array.
+    fn last_output_at_most(&self, pos: u32, value: u32) -> (u8, u32, u32) {
+        let count = self.transition_count(pos);
+        let mut cursor = pos as usize + 1;
+        let mut best: Option<(u8, u32, u32)> = None;
+        for _ in 0..count {
+            let b = self.bytes[cursor];
+            cursor += 1;
+            let (output, len) = read_leb128(&self.bytes[cursor..]);
+            cursor += len;
+            let target = u32::from_le_bytes(
+                self.bytes[cursor..cursor + 4]
+                    .try_into()
+                    .expect("4 bytes were written for every target address"),
+            );
+            cursor += 4;
+            if output > value {
+                return best.expect("value must be reachable via some transition at this state");
+            }
+            best = Some((b, output, target));
+        }
+        best.expect("value must be reachable via some transition at this state")
+    }
+}
+
+#[allow(dead_code)]
+fn write_leb128(bytes: &mut Vec<u8>, mut value: u32) {
+    loop {
+        let byte = (value & 0x7F) as u8;
+        value >>= 7;
+        if value == 0 {
+            bytes.push(byte);
+            break;
+        }
+        bytes.push(byte | 0x80);
+    }
+}
+
+/// Returns `(value, bytes_consumed)`.
+#[allow(dead_code)]
+fn read_leb128(bytes: &[u8]) -> (u32, usize) {
+    let mut value = 0u32;
+    let mut shift = 0;
+    let mut len = 0;
+    loop {
+        let byte = bytes[len];
+        value |= u32::from(byte & 0x7F) << shift;
+        len += 1;
+        if byte & 0x80 == 0 {
+            break;
+        }
+        shift += 7;
+    }
+    (value, len)
 }
 
 struct StreamFrame {
@@ -1220,16 +1497,6 @@ pub(crate) struct TermsStream<'a> {
 }
 
 impl<'a> TermsStream<'a> {
-    /// The term this stream is currently positioned at -- for a stream
-    /// from `Automaton::seek_stream(rank)`, that's `rank`'s own term
-    /// (identical bytes to what `term_at_into(rank, ..)` would have
-    /// written), before any `next()` call has advanced past it. Not
-    /// meaningful on a fresh `stream()` (nothing decoded yet; call
-    /// `next()` first).
-    pub(crate) fn current(&self) -> &[u8] {
-        &self.buf
-    }
-
     /// Advances to the next term in sorted order, or `None` once
     /// exhausted. A preorder DFS over the trie using `stack` in place of
     /// recursion: visit a state's own value (if final) before its
@@ -1638,6 +1905,33 @@ mod tests {
     use crate::block::Block;
     use crate::entries_arena::{EntriesArena, merge_into};
     use std::time::Instant;
+
+    /// Diagnostic for the memory-scaling investigation (DESIGN.md): what
+    /// is the fixed per-state cost this representation pays regardless
+    /// of actual branching factor, and how does it compare to a rough
+    /// estimate of what `fst`'s byte-packed encoding needs per state.
+    /// `#[ignore]`d: prints sizes, not a pass/fail assertion.
+    #[test]
+    #[ignore]
+    fn print_struct_sizes() {
+        eprintln!(
+            "size_of::<StateId>()         = {}",
+            std::mem::size_of::<StateId>()
+        );
+        eprintln!(
+            "size_of::<TransitionChunk>() = {}",
+            std::mem::size_of::<TransitionChunk>()
+        );
+        eprintln!(
+            "size_of::<Transitions>()     = {}",
+            std::mem::size_of::<Transitions>()
+        );
+        eprintln!(
+            "size_of::<State>()           = {}",
+            std::mem::size_of::<State>()
+        );
+        eprintln!("CHUNK_CAP                    = {CHUNK_CAP}");
+    }
 
     /// Targeted repro for a specific suspicion, not yet confirmed: does
     /// `confirm_path`, when a batch's running `path` includes a state
@@ -2131,6 +2425,90 @@ mod tests {
         assert_eq!(automaton.rank("not-present-at-all"), None);
     }
 
+    /// `PackedAutomaton::rank`/`term_at_into` must agree with
+    /// `Automaton`'s own, for every term, across a namespace-clustered
+    /// corpus (the same one the equivalent `Automaton`-vs-`Block` test
+    /// above uses) -- the direct correctness check for the whole
+    /// postorder-compile-then-parse scheme before trusting any decode
+    /// speed measured against it.
+    #[test]
+    fn packed_automaton_matches_automaton_rank_and_unrank() {
+        let terms: Vec<String> = (0..2000)
+            .flat_map(|i| {
+                [
+                    format!("http://dbpedia.org/resource/Entity_{i}"),
+                    format!("http://xmlns.com/foaf/0.1/property{i}"),
+                    format!("urn:isbn:{i:013}"),
+                    format!("_:b{i:x}"),
+                ]
+            })
+            .collect();
+        let (automaton, _block, terms) = build_both(terms);
+        let packed = PackedAutomaton::compile(&automaton);
+
+        for (expected_rank, term) in terms.iter().enumerate() {
+            let a_rank = automaton.rank(term);
+            let p_rank = packed.rank(term);
+            assert_eq!(
+                p_rank,
+                Some(expected_rank as u32),
+                "packed rank mismatch for {term:?}"
+            );
+            assert_eq!(
+                a_rank, p_rank,
+                "automaton and packed disagree on rank for {term:?}"
+            );
+
+            let mut a_buf = Vec::new();
+            automaton.term_at_into(expected_rank as u32, &mut a_buf);
+            let mut p_buf = Vec::new();
+            packed.term_at_into(expected_rank as u32, &mut p_buf);
+            assert_eq!(
+                a_buf, p_buf,
+                "automaton and packed disagree on term_at_into({expected_rank})"
+            );
+            assert_eq!(std::str::from_utf8(&p_buf).unwrap(), term.as_str());
+        }
+
+        assert_eq!(packed.rank("not-present-at-all"), None);
+        assert_eq!(packed.rank(""), None);
+    }
+
+    /// A small, hand-traceable case specifically exercising states with
+    /// more than one transition and a state that's both final and has
+    /// children (`"car"`, a prefix of `"cars"`) -- the shapes most
+    /// likely to expose a postorder-ordering or flag-byte bug that a
+    /// purely-leaf-heavy corpus might not.
+    #[test]
+    fn packed_automaton_matches_automaton_on_branching_and_prefix_terms() {
+        let terms = ["car", "cars", "cat"];
+        let automaton = Automaton::build_sorted(terms.iter().copied());
+        let packed = PackedAutomaton::compile(&automaton);
+
+        for (rank, term) in terms.iter().enumerate() {
+            assert_eq!(packed.rank(term), Some(rank as u32));
+            let mut buf = Vec::new();
+            packed.term_at_into(rank as u32, &mut buf);
+            assert_eq!(std::str::from_utf8(&buf).unwrap(), *term);
+        }
+        assert_eq!(packed.rank("ca"), None);
+        assert_eq!(packed.rank("carsx"), None);
+    }
+
+    /// `PackedAutomaton::compile(..).size_bytes()` should be the *exact*
+    /// real-world value `Automaton::estimate_packed_bytes` predicted --
+    /// both are built from the same documented layout, so this is a
+    /// direct check that the earlier estimate wasn't just plausible
+    /// arithmetic, but actually matched what compiling for real
+    /// produces.
+    #[test]
+    fn packed_automaton_size_matches_the_earlier_estimate() {
+        let terms = namespace_clustered_terms(300);
+        let automaton = Automaton::build_sorted(terms.iter().map(String::as_str));
+        let packed = PackedAutomaton::compile(&automaton);
+        assert_eq!(packed.size_bytes(), automaton.estimate_packed_bytes());
+    }
+
     /// `Automaton::stream` (the incremental walk `AutomatonBlock::
     /// decode_into`/`merge_into` now use, in place of one `term_at_into`
     /// call per rank -- see their own module's doc comment for why) must
@@ -2169,15 +2547,15 @@ mod tests {
         assert_eq!(stream.next(), None, "stream must end exactly at len()");
     }
 
-    /// `seek_stream(rank)`'s own term must match `term_at_into(rank, ..)`
-    /// exactly, and every subsequent `next()` call must match
-    /// `term_at_into(rank + 1, ..)`, `term_at_into(rank + 2, ..)`, ...,
-    /// for *every* starting rank, not just rank 0 (`stream()`'s only
-    /// starting point) -- the direct correctness check for the resumable
-    /// stack `seek_stream` hand-builds instead of walking there via
-    /// `next()`.
+    /// `decode_ranks_into` given *every* rank in one batch, sorted
+    /// ascending by rank as required (its own precondition) but with
+    /// output *positions* deliberately decorrelated from rank order --
+    /// must match `term_at_into` called individually for each one. Since
+    /// this queries the whole automaton, it exercises every state's own
+    /// partition-by-transition logic at least once, not just a few
+    /// hand-picked paths.
     #[test]
-    fn seek_stream_matches_term_at_into_from_every_starting_rank() {
+    fn decode_ranks_into_matches_term_at_into_for_every_rank_at_once() {
         let terms: Vec<String> = (0..500)
             .flat_map(|i| {
                 [
@@ -2189,35 +2567,70 @@ mod tests {
             })
             .collect();
         let (automaton, _block, terms) = build_both(terms);
+        let n = terms.len();
+
+        // Ranks stay ascending (the actual precondition); only the output
+        // position each one writes to is decorrelated from rank order.
+        let targets: Vec<(usize, u32)> = (0..n as u32).map(|r| (n - 1 - r as usize, r)).collect();
+        let mut out = vec![None; n];
+        automaton.decode_ranks_into(&targets, &mut out);
+
+        let mut buf = Vec::new();
+        for (rank, expected) in terms.iter().enumerate() {
+            automaton.term_at_into(rank as u32, &mut buf);
+            assert_eq!(
+                out[n - 1 - rank].as_deref(),
+                Some(expected.as_str()),
+                "mismatch at rank {rank}"
+            );
+            assert_eq!(std::str::from_utf8(&buf).unwrap(), expected.as_str());
+        }
+    }
+
+    /// Several separate clusters of consecutive ranks, with large,
+    /// deliberately un-requested gaps between them within the same
+    /// automaton -- the exact shape that broke an earlier seek-then-crawl
+    /// design (crawling through every unrequested rank in the gap). This
+    /// checks only correctness; `dict_bench` covers the cost side.
+    #[test]
+    fn decode_ranks_into_handles_widely_separated_clusters_within_one_automaton() {
+        let terms: Vec<String> = (0..2000)
+            .map(|i| format!("http://example.org/entity-{i:05}"))
+            .collect();
+        let (automaton, _block, terms) = build_both(terms);
         let n = terms.len() as u32;
 
-        for start in 0..n {
-            let mut seeked = automaton.seek_stream(start);
-            let mut expected_buf = Vec::new();
-            automaton.term_at_into(start, &mut expected_buf);
-            assert_eq!(
-                seeked.current(),
-                expected_buf.as_slice(),
-                "seek_stream({start}).current() disagrees with term_at_into({start}, ..)"
-            );
-
-            for rank in (start + 1)..n {
-                let next = seeked
-                    .next()
-                    .unwrap_or_else(|| panic!("seek_stream({start}) ended early at rank {rank}"));
-                automaton.term_at_into(rank, &mut expected_buf);
-                assert_eq!(
-                    next,
-                    expected_buf.as_slice(),
-                    "seek_stream({start})'s next() disagrees with term_at_into({rank}, ..) after {} steps",
-                    rank - start
-                );
+        let mut targets: Vec<(usize, u32)> = Vec::new();
+        let mut pos = 0usize;
+        let mut rank = 3u32;
+        while rank < n {
+            for r in rank..(rank + 5).min(n) {
+                targets.push((pos, r));
+                pos += 1;
             }
+            rank += 331; // a large, deliberately awkward gap
+        }
+        // A duplicated rank, to check that's handled too -- inserted (not
+        // appended) so `targets` stays sorted ascending by rank, its
+        // actual precondition.
+        let dup = targets[2];
+        targets.push((pos, dup.1));
+        pos += 1;
+        targets.sort_unstable_by_key(|&(_, r)| r);
+
+        let mut out = vec![None; pos];
+        automaton.decode_ranks_into(&targets, &mut out);
+
+        let mut buf = Vec::new();
+        for &(out_pos, rank) in &targets {
+            automaton.term_at_into(rank, &mut buf);
+            let expected = std::str::from_utf8(&buf).unwrap();
             assert_eq!(
-                seeked.next(),
-                None,
-                "seek_stream({start}) must end exactly at len()"
+                out[out_pos].as_deref(),
+                Some(expected),
+                "mismatch for rank {rank} at output position {out_pos}"
             );
+            assert_eq!(terms[rank as usize], expected);
         }
     }
 
@@ -2636,6 +3049,169 @@ mod tests {
             terms.len(),
             rank_elapsed / total_ops,
             unrank_elapsed / total_ops,
+        );
+    }
+
+    /// See `perf_probe_decode_cost_automaton`'s doc comment -- same
+    /// terms, `PackedAutomaton` in place of `Automaton`, isolated the
+    /// same way for the same `perf stat` attribution reason. The
+    /// `compile` call itself is deliberately outside the timed region:
+    /// this probe is about decode speed specifically, not compilation
+    /// cost (a separate, one-time-per-block question `estimate_packed_bytes`
+    /// / `compile(..).size_bytes()` already cover on the size side, and
+    /// which this session hasn't measured the *time* cost of yet).
+    #[test]
+    #[ignore = "manual perf probe, not part of the regular suite"]
+    fn perf_probe_decode_cost_packed_automaton() {
+        let terms = decode_probe_terms();
+        let automaton = Automaton::build_sorted(terms.iter().map(String::as_str));
+        let packed = PackedAutomaton::compile(&automaton);
+
+        let start = Instant::now();
+        for _ in 0..DECODE_PROBE_REPEATS {
+            for t in &terms {
+                std::hint::black_box(packed.rank(t));
+            }
+        }
+        let rank_elapsed = start.elapsed();
+
+        let mut buf = Vec::new();
+        let start = Instant::now();
+        for _ in 0..DECODE_PROBE_REPEATS {
+            for rank in 0..terms.len() {
+                packed.term_at_into(rank as u32, &mut buf);
+                std::hint::black_box(&buf);
+            }
+        }
+        let unrank_elapsed = start.elapsed();
+
+        let total_ops = (DECODE_PROBE_REPEATS * terms.len()) as u32;
+        eprintln!(
+            "PackedAutomaton decode, {} terms x {DECODE_PROBE_REPEATS} repeats ({total_ops} ops each):\n\
+             rank:         {rank_elapsed:?} ({:?}/op)\n\
+             term_at_into: {unrank_elapsed:?} ({:?}/op)\n\
+             size_bytes:   {}",
+            terms.len(),
+            rank_elapsed / total_ops,
+            unrank_elapsed / total_ops,
+            packed.size_bytes(),
+        );
+    }
+
+    /// A cheap, deterministic 64-bit mix (splitmix64) -- see
+    /// `examples/perf_scale_memory.rs`'s identical helper for the full
+    /// rationale. Duplicated here rather than shared: that file is a
+    /// separate binary crate, this is a `#[cfg(test)]` module in the
+    /// library, and this one function isn't worth a shared dependency
+    /// between them.
+    fn splitmix64(mut x: u64) -> u64 {
+        x = x.wrapping_add(0x9E3779B97F4A7C15);
+        let mut z = x;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D049BB133111EB);
+        z ^ (z >> 31)
+    }
+
+    /// Low cross-term redundancy by design (see `examples/
+    /// perf_scale_memory.rs`'s `hashlike_terms_range` for the full
+    /// rationale) -- this is the regime `estimate_packed_bytes`/
+    /// `PackedAutomaton::compile` found the largest *size* win in
+    /// (DESIGN.md's memory-scaling investigation: ~88% smaller), and so
+    /// the regime most likely to also show a real *decode-speed*
+    /// difference from cache locality: the unpacked automaton's states
+    /// here are scattered across roughly 10x more heap bytes per term
+    /// than the packed encoding needs, unlike the highly-shared
+    /// namespace-clustered corpus `decode_probe_terms` uses, where both
+    /// representations are already small enough to mostly fit in cache
+    /// regardless.
+    fn hashlike_decode_probe_terms(n: u32) -> Vec<String> {
+        let mut terms: Vec<String> = (0..n)
+            .map(|i| format!("urn:uuid:{:016x}", splitmix64(i as u64)))
+            .collect();
+        terms.sort_unstable();
+        terms.dedup();
+        terms
+    }
+
+    /// See `perf_probe_decode_cost_automaton`'s doc comment for the
+    /// isolation methodology -- same shape, `hashlike_decode_probe_terms`
+    /// in place of `decode_probe_terms`, specifically to test the
+    /// cache-locality hypothesis at the scale/redundancy regime most
+    /// likely to show it (see `hashlike_decode_probe_terms`'s own doc
+    /// comment).
+    #[test]
+    #[ignore = "manual perf probe, not part of the regular suite"]
+    fn perf_probe_decode_cost_automaton_hashlike() {
+        let terms = hashlike_decode_probe_terms(20_000);
+        let automaton = Automaton::build_sorted(terms.iter().map(String::as_str));
+
+        let start = Instant::now();
+        for _ in 0..DECODE_PROBE_REPEATS {
+            for t in &terms {
+                std::hint::black_box(automaton.rank(t));
+            }
+        }
+        let rank_elapsed = start.elapsed();
+
+        let mut buf = Vec::new();
+        let start = Instant::now();
+        for _ in 0..DECODE_PROBE_REPEATS {
+            for rank in 0..terms.len() {
+                automaton.term_at_into(rank as u32, &mut buf);
+                std::hint::black_box(&buf);
+            }
+        }
+        let unrank_elapsed = start.elapsed();
+
+        let total_ops = (DECODE_PROBE_REPEATS * terms.len()) as u32;
+        eprintln!(
+            "Automaton decode (hashlike), {} terms x {DECODE_PROBE_REPEATS} repeats ({total_ops} ops each):\n\
+             rank:         {rank_elapsed:?} ({:?}/op)\n\
+             term_at_into: {unrank_elapsed:?} ({:?}/op)\n\
+             size_bytes:   {}",
+            terms.len(),
+            rank_elapsed / total_ops,
+            unrank_elapsed / total_ops,
+            automaton.size_bytes(),
+        );
+    }
+
+    /// See `perf_probe_decode_cost_automaton_hashlike`'s doc comment.
+    #[test]
+    #[ignore = "manual perf probe, not part of the regular suite"]
+    fn perf_probe_decode_cost_packed_automaton_hashlike() {
+        let terms = hashlike_decode_probe_terms(20_000);
+        let automaton = Automaton::build_sorted(terms.iter().map(String::as_str));
+        let packed = PackedAutomaton::compile(&automaton);
+
+        let start = Instant::now();
+        for _ in 0..DECODE_PROBE_REPEATS {
+            for t in &terms {
+                std::hint::black_box(packed.rank(t));
+            }
+        }
+        let rank_elapsed = start.elapsed();
+
+        let mut buf = Vec::new();
+        let start = Instant::now();
+        for _ in 0..DECODE_PROBE_REPEATS {
+            for rank in 0..terms.len() {
+                packed.term_at_into(rank as u32, &mut buf);
+                std::hint::black_box(&buf);
+            }
+        }
+        let unrank_elapsed = start.elapsed();
+
+        let total_ops = (DECODE_PROBE_REPEATS * terms.len()) as u32;
+        eprintln!(
+            "PackedAutomaton decode (hashlike), {} terms x {DECODE_PROBE_REPEATS} repeats ({total_ops} ops each):\n\
+             rank:         {rank_elapsed:?} ({:?}/op)\n\
+             term_at_into: {unrank_elapsed:?} ({:?}/op)\n\
+             size_bytes:   {}",
+            terms.len(),
+            rank_elapsed / total_ops,
+            unrank_elapsed / total_ops,
+            packed.size_bytes(),
         );
     }
 

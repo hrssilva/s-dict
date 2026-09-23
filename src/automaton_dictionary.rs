@@ -35,7 +35,7 @@
 use std::num::NonZeroU32;
 
 use crate::automaton_block::AutomatonBlock;
-use crate::batch::BatchOrder;
+use crate::batch::{BatchOrder, PreparedBatch};
 use crate::entries_arena::EntriesArena;
 use crate::{TermDictionary, TermId};
 
@@ -144,6 +144,28 @@ impl AutomatonDictionary {
             .iter()
             .filter_map(|b| b.as_ref())
             .map(|b| b.payload_bytes() + b.len() * std::mem::size_of::<TermId>())
+            .sum();
+        let directory_bytes: usize = self
+            .directory
+            .iter()
+            .map(|(key, _)| key.len() + std::mem::size_of::<AutomatonBlockId>())
+            .sum();
+        let id_to_block_bytes =
+            self.id_to_block.len() * std::mem::size_of::<Option<(AutomatonBlockId, u16)>>();
+        blocks_bytes + directory_bytes + id_to_block_bytes
+    }
+
+    /// `size_bytes`, but with each block's own payload replaced by
+    /// `AutomatonBlock::estimate_packed_bytes` -- a measurement only
+    /// (see its own doc comment), not a real, addressable encoding.
+    /// Directory/reverse-mapping overhead is unaffected by that
+    /// hypothetical, so it's counted identically to `size_bytes`.
+    pub fn estimate_packed_bytes(&self) -> usize {
+        let blocks_bytes: usize = self
+            .blocks
+            .iter()
+            .filter_map(|b| b.as_ref())
+            .map(|b| b.estimate_packed_bytes() + b.len() * std::mem::size_of::<TermId>())
             .sum();
         let directory_bytes: usize = self
             .directory
@@ -267,6 +289,17 @@ impl AutomatonDictionary {
             self.block(block_id)
                 .decode_sorted_ranks_into(&positions, out);
         }
+    }
+
+    /// `Dictionary::insert_prepared`'s exact contract: insert a worker-
+    /// prepared batch without sorting or deduplicating it again. Already
+    /// has everywhere this needs -- `insert_batch` above already builds
+    /// its own `BatchOrder` and calls the same `insert_ordered` this
+    /// does, so accepting an already-`prepare`d one from the caller,
+    /// instead of building one from raw `&[&str]`, is the only new part.
+    pub fn insert_prepared(&mut self, prepared: PreparedBatch<'_>) -> Vec<TermId> {
+        let batch = prepared.batch;
+        self.insert_ordered(&batch.order, |u| batch.term(batch.order.first(u)))
     }
 
     fn block(&self, id: AutomatonBlockId) -> &AutomatonBlock {

@@ -2635,3 +2635,133 @@ already appears to have internalized the same discipline. Its own
 `s-bench`/`dict_bench`-based comparison (referenced in its doc comments,
 external to this repo) is outside what this session can measure or
 weigh in on.
+
+### Custom incremental micro-FST: the memory-scaling problem at real corpus scale
+
+An external benchmark (`s-bench`/`dict_bench`, outside this repo, using
+real RDF data rather than this project's own synthetic generators) found
+something this session's own measurements never surfaced: at 524,299
+distinct terms, `AutomatonDictionary` retains 164.89 MiB (~330 bytes/term)
+against `Dictionary`'s 15.94 MiB (~32 bytes/term, matching a compact FST's
+expected footprint); at 4,579,699 terms, `Dictionary` stays flat (~32.7
+bytes/term) but `AutomatonDictionary` grows to ~848 bytes/term -- a 2.6x
+*increase* in per-term cost as the corpus grew 10x, not the flat or
+sublinear scaling either implementation's design intends. Extrapolated to
+the full ~33M-term corpus this benchmark's source data represents, the
+automaton side would plausibly need tens of GB against `fst`'s ~1-1.3GB,
+a real OOM risk on the 14GB machine this was tested on -- not attempted,
+correctly, rather than risk it.
+
+**First question: is this slot-reclamation garbage (the known,
+already-addressed gap from earlier in this file), or the true minimal
+structure itself?** The benchmark's own numbers already answered this --
+growth showed up even in `size_bytes()` (both `Dictionary`'s and
+`AutomatonDictionary`'s versions walk only *reachable* state, explicitly
+excluding `register`/`refcounts`/`free_slots`/generation bookkeeping on
+the automaton side, exactly the register-cleanup discipline this file's
+"reference-counted slot reclamation" section already built and verified).
+So this isn't stale garbage -- the true minimal automaton itself is
+larger per term at scale than it should be.
+
+**Reproduced in-repo, and the reproduction is itself the key finding.**
+New `examples/perf_scale_memory.rs`, `AutomatonDictionary`/`Dictionary`'s
+own `size_bytes()`, checkpointed across an increasing insert via
+`insert_batch` (a realistic bulk-load shape). This project's own
+namespace-clustered synthetic generator (highly repetitive: every term
+shares one of four long, fixed namespace prefixes, differing only in a
+short numeric suffix) reproduced *none* of this: 22.2 -> 26.3 bytes/term
+across 52K -> 524K terms, `Dictionary`-relative ratio essentially flat at
+~1.2x, the growth curve visibly *flattening*, not accelerating. That
+result, by itself, located the cause: it isn't scale, it's **redundancy**.
+A second generator (`hashlike`: a short shared prefix, `urn:uuid:`,
+followed by 16 hex digits derived from `splitmix64(index)` -- no
+cross-term structure beyond the last character or two, approximating
+hash-based identifiers/blank node labels/UUIDs real RDF data has plenty
+of) told the real story: at the *same* term count (100K), `Dictionary`
+stayed at ~30.6 bytes/term (nearly identical to the clustered case --
+`fst`'s byte-packed encoding is close to redundancy-invariant), while
+`AutomatonDictionary` used **767-811 bytes/term -- ~25x worse than
+`fst`**, against only ~1.2x worse for highly-redundant content. Real KG
+corpora have a long-tail, Zipfian mix of highly-repetitive vocabulary
+terms and low-redundancy identifiers/literals; as more data loads, the
+weighted-average redundancy per block plausibly drops, which is
+consistent with -- not just superficially similar to -- the external
+benchmark's observed growth curve, even though this repo's own
+`insert_batch` order/content differs from the real corpus load order.
+
+**Root cause, confirmed by direct measurement, not inference from the
+ratio alone**: `std::mem::size_of::<State>() == 72` bytes (verified via a
+new diagnostic test, `micro_fst::tests::print_struct_sizes`) -- and
+every one of those 72 bytes is paid **per state, regardless of actual
+branching factor**, because `Transitions` holds one `TransitionChunk`
+*by value*, inline, with `CHUNK_CAP = 4` fixed-size slots
+(`bytes: [u8;4]`, `outputs: [u32;4]`, `targets: [Option<StateId>;4]`),
+even for the extremely common case (the corpus's own low-branching-factor
+premise this whole design leans on) of a state with exactly one
+transition. For the `hashlike` case, 767-811 bytes/term / 72 bytes/state
+implies roughly 10-11 essentially-unshareable states per term -- matching
+a 16-hex-digit suffix where only the last character or two has enough
+collision probability (1-in-16, 1-in-256) to ever get merged by
+minimization, and every other position is, correctly, its own unique
+state. `fst`'s underlying representation is a variable-length, byte-packed
+encoding (a `Node`'s size scales with its actual transition count and
+output magnitude, not a fixed Rust struct) -- it has no equivalent fixed
+floor, which is exactly why it stays flat under low redundancy while this
+representation doesn't.
+
+**Tuning `CHUNK_CAP` down: tried, a real but incomplete and costly
+mitigation, not shipped.** If most states only use 1 of 4 slots under low
+redundancy, shrinking the inline capacity should shrink the fixed
+per-state cost proportionally. Tested by direct measurement (temporarily
+editing the constant, full test suite re-run clean at every value, wall
+clock and `size_bytes()` both re-measured, then reverted -- the same
+"try it, measure it" discipline as every other lever in this file, not
+assumed from the size-formula alone):
+
+| `CHUNK_CAP` | `size_of::<State>()` | hashlike bytes/term | clustered bytes/term | `remove` | `get_id` | `get_term` | `bulk_insert` |
+|---|---|---|---|---|---|---|---|
+| 4 (shipped) | 72 | 767-811 | 22.2-26.3 | 6.25us/op | 227ns/op | 251ns/op | 359ns/op |
+| 2 | ~28 (not printed; derived) | 603-623 (**worse than CHUNK_CAP=1**) | 20.5-23.2 | 10.45us/op (1.67x slower) | 362ns/op (1.59x slower) | 371ns/op (1.48x slower) | 585ns/op (1.63x slower) |
+| 1 | 48 | **524-554** (-32%) | **19.8-22.9** (-13%) | 10.66us/op (**1.70x slower**) | 351ns/op (**1.55x slower**) | 391ns/op (**1.56x slower**) | 672ns/op (**1.87x slower**) |
+
+All values held up under the crate's full test suite (92+5+5 tests,
+including the 4-way fuzz differential and the minimality regression
+test) at every `CHUNK_CAP` tried -- correctness was never in question,
+only the memory/speed tradeoff. Two things stand out:
+
+1. **`CHUNK_CAP=2` is strictly worse than `CHUNK_CAP=1`** on memory
+   (603-623 vs. 524-554 bytes/term for `hashlike`) while offering no
+   real speed advantage over `CHUNK_CAP=1` either -- not a clean
+   monotonic tradeoff curve. Overflow is chunked in `CHUNK_CAP`-sized
+   pieces too (`overflow: Vec<TransitionChunk>`), so a state needing
+   just one more transition than its inline capacity still allocates a
+   whole extra `CHUNK_CAP`-sized chunk -- at `CHUNK_CAP=2`, a
+   3-transition state (common near a block's root, where namespace
+   diversity peaks) wastes half of that overflow chunk; at
+   `CHUNK_CAP=1`, every state past 1 transition already expected to pay
+   for an overflow allocation, so there's no equivalent waste to avoid.
+2. **Even the best case (`CHUNK_CAP=1`) doesn't close the gap.** 524-554
+   bytes/term is still ~17x worse than `fst`'s ~30 for the same
+   low-redundancy content, for a 1.5-1.9x slowdown on every read/write
+   operation measured. This is a mitigation, not a fix -- reverted, not
+   shipped, since a 32% memory reduction that costs the exact
+   performance advantage this whole custom-automaton effort was built to
+   deliver isn't a net win on the numbers alone, and this session isn't
+   the place to unilaterally decide that tradeoff for the project.
+
+**Conclusion, stated plainly**: this is a genuine, now-diagnosed
+architectural limitation, not a bug with a clean fix. A fixed-size Rust
+struct per automaton state is fundamentally less memory-efficient than a
+variable-length byte-packed encoding for low-redundancy content, and no
+`CHUNK_CAP` value closes that gap without giving back most of the speed
+advantage that's this whole implementation's reason to exist. Closing it
+for real would need a structurally different state representation (a
+genuinely variable-length/byte-packed encoding, or a different strategy
+specifically for low-branching leaf runs) -- a bigger redesign than a
+tuning knob, and a decision about whether `AutomatonDictionary` is
+viable at all for corpora with a meaningful share of low-redundancy
+content (which most real RDF data has) that's worth making deliberately,
+not as a side effect of chasing one more lever. `examples/
+perf_scale_memory.rs` and `micro_fst::tests::print_struct_sizes` are
+kept, not reverted -- they're the reusable tools for whatever that
+decision needs next, not single-use diagnostics.

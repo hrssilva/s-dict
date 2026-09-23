@@ -115,48 +115,32 @@ impl AutomatonBlock {
         self.automaton.size_bytes()
     }
 
+    /// See `Automaton::estimate_packed_bytes` -- a measurement only, not
+    /// a real encoding.
+    pub(crate) fn estimate_packed_bytes(&self) -> usize {
+        self.automaton.estimate_packed_bytes()
+    }
+
     /// Decodes a *sorted* (ascending; may repeat) set of `(output
     /// position, local_rank)` pairs directly into `out[position]`, via
-    /// one `Automaton::seek_stream` call to the first rank followed by
-    /// `next()` calls advancing through the rest -- reusing whatever
-    /// prefix each step shares with the last, instead of restarting from
-    /// the automaton's root once per requested rank the way independent
-    /// `term_at_into` calls do. `positions` must already be sorted by
-    /// rank ascending (this only ever walks forward); out-of-order input
-    /// produces wrong/garbage results, not a panic.
+    /// `Automaton::decode_ranks_into` -- one recursive descent that
+    /// visits each state on some target's path once, however many
+    /// targets share it, instead of one independent root-to-leaf
+    /// `term_at_into` call per rank. `positions` need not be sorted (the
+    /// widening below sorts a small owned copy); see
+    /// `Automaton::decode_ranks_into`'s own doc comment for how it
+    /// decides what to share without any tuned distance/gap threshold.
     pub(crate) fn decode_sorted_ranks_into(
         &self,
         positions: &[(usize, u16)],
         out: &mut [Option<String>],
     ) {
-        let Some(&(first_pos, first_rank)) = positions.first() else {
-            return;
-        };
-        let mut stream = self.automaton.seek_stream(first_rank as u32);
-        out[first_pos] = Some(
-            std::str::from_utf8(stream.current())
-                .expect("keys were inserted as valid UTF-8 str bytes")
-                .to_string(),
-        );
-        let mut current_rank = first_rank as usize;
-        for &(pos, rank) in &positions[1..] {
-            let rank = rank as usize;
-            let bytes: &[u8] = if rank == current_rank {
-                stream.current()
-            } else {
-                let mut bytes: &[u8] = &[];
-                while current_rank < rank {
-                    bytes = stream.next().expect("rank must be < automaton len()");
-                    current_rank += 1;
-                }
-                bytes
-            };
-            out[pos] = Some(
-                std::str::from_utf8(bytes)
-                    .expect("keys were inserted as valid UTF-8 str bytes")
-                    .to_string(),
-            );
-        }
+        let mut targets: Vec<(usize, u32)> = positions
+            .iter()
+            .map(|&(pos, rank)| (pos, rank as u32))
+            .collect();
+        targets.sort_unstable_by_key(|&(_, rank)| rank);
+        self.automaton.decode_ranks_into(&targets, out);
     }
 
     /// Appends every `(term, id)` pair in sorted order onto `out` --
