@@ -220,6 +220,46 @@ impl Transitions {
         best.expect("value must be reachable via some transition at this state")
     }
 
+    /// `last_output_at_most`, also returning the winning transition's
+    /// flat index (as `Transitions::at`/`StreamFrame::next_child`
+    /// address it) -- needed only by `Automaton::seek_stream`, to build a
+    /// `StreamFrame` resumable by `TermsStream::next` from a rank other
+    /// than 0. Not used by `term_at_into`'s own hot path (which has no
+    /// need for the index), so kept separate rather than changing
+    /// `last_output_at_most`'s signature for every caller.
+    fn last_output_at_most_with_index(&self, value: u32) -> (usize, u8, u32, StateId) {
+        let mut best: Option<(usize, u8, u32, StateId)> = None;
+        let mut idx = 0usize;
+        for i in 0..self.inline.len as usize {
+            if self.inline.outputs[i] > value {
+                return best.expect("value must be reachable via some transition at this state");
+            }
+            best = Some((
+                idx,
+                self.inline.bytes[i],
+                self.inline.outputs[i],
+                self.inline.targets[i].expect("populated slots always hold a target"),
+            ));
+            idx += 1;
+        }
+        for chunk in &self.overflow {
+            for i in 0..chunk.len as usize {
+                if chunk.outputs[i] > value {
+                    return best
+                        .expect("value must be reachable via some transition at this state");
+                }
+                best = Some((
+                    idx,
+                    chunk.bytes[i],
+                    chunk.outputs[i],
+                    chunk.targets[i].expect("populated slots always hold a target"),
+                ));
+                idx += 1;
+            }
+        }
+        best.expect("value must be reachable via some transition at this state")
+    }
+
     /// Inserts a new transition for `byte` (which must not already
     /// exist), keeping transitions sorted by byte. `build_sorted` always
     /// happens to append at the end (sorted input never branches
@@ -1026,6 +1066,57 @@ impl Automaton {
         }
     }
 
+    /// Like `term_at_into` (a direct root-to-leaf descent to `rank`), but
+    /// returns a positioned `TermsStream` instead of just the decoded
+    /// bytes: `result.current()` is `rank`'s own term (same bytes
+    /// `term_at_into` would have written), and calling `.next()` on the
+    /// returned stream yields `rank + 1`, `rank + 2`, ... via ordinary
+    /// incremental advancement -- reusing whatever prefix `rank`'s
+    /// descent already established, the same shared-prefix win `stream()`
+    /// gives two *consecutive* `next()` calls, but starting from an
+    /// arbitrary rank instead of being stuck starting from 0.
+    ///
+    /// Exists to test a specific hypothesis about scattered bulk decode:
+    /// `term_at_into` called once per id in a requested set always pays
+    /// the full descent cost per call, even when consecutive requested
+    /// ranks are close together and share most of their path -- this
+    /// pays that full cost once, for the first id in a run, and lets
+    /// `next()` pick up the shared-prefix reuse for the rest. Whether
+    /// that actually wins in practice (traversal-reuse savings vs. the
+    /// extra bookkeeping to build a resumable stack instead of a flat
+    /// buffer) is exactly what needs measuring, not assumed -- see
+    /// `s-bench`'s `dict_bench` for the real-data comparison.
+    pub(crate) fn seek_stream(&self, rank: u32) -> TermsStream<'_> {
+        let mut value = rank;
+        let mut state = self.root;
+        let mut buf = Vec::new();
+        let mut stack = Vec::new();
+        loop {
+            let s = &self.states[state.slot() as usize];
+            if value == 0 && s.is_final {
+                stack.push(StreamFrame {
+                    state,
+                    next_child: 0,
+                    yielded_final: true,
+                });
+                return TermsStream {
+                    automaton: self,
+                    buf,
+                    stack,
+                };
+            }
+            let (idx, b, out, target) = s.transitions.last_output_at_most_with_index(value);
+            stack.push(StreamFrame {
+                state,
+                next_child: idx as u32 + 1,
+                yielded_final: true,
+            });
+            value -= out;
+            buf.push(b);
+            state = target;
+        }
+    }
+
     /// The total number of terms this automaton accepts.
     pub(crate) fn len(&self) -> usize {
         self.states[self.root.slot() as usize].count as usize
@@ -1057,6 +1148,43 @@ impl Automaton {
             }
         }
         seen.len()
+    }
+
+    /// Logical byte size of the *reachable* portion of this automaton's
+    /// state graph -- the true minimal automaton, not the slab (which can
+    /// hold register-deduplication garbage from bulk construction or
+    /// incremental mutation; see the struct doc comment and
+    /// `reachable_state_count`, whose walk this mirrors). The
+    /// `Block::payload_bytes` analog: sums each reachable state's fixed
+    /// cost (`State`, which holds its inline transition chunk by value,
+    /// no allocation) plus any `overflow` chunks' heap bytes.
+    ///
+    /// Excludes `register`/`refcounts`/`free_slots`/`generations` --
+    /// incremental-mutation bookkeeping this implementation carries that
+    /// has no `Block`/`fst::Map` equivalent at all (an FST is rebuilt
+    /// from scratch on every mutation, so it never needs any of this).
+    /// So this is the fair, apples-to-apples number against
+    /// `Block::payload_bytes` (both report "the compiled index
+    /// structure's own size"), not this automaton's complete memory
+    /// footprint under sustained mutation -- a caller wanting that should
+    /// treat this as a lower bound. Does not account for allocator slack
+    /// (`Vec` spare capacity) or heap allocation headers, the same
+    /// simplification `Block::payload_bytes` makes.
+    pub(crate) fn size_bytes(&self) -> usize {
+        let mut seen = std::collections::HashSet::new();
+        let mut stack = vec![self.root];
+        let mut total = 0usize;
+        while let Some(id) = stack.pop() {
+            if seen.insert(id) {
+                let state = &self.states[id.slot() as usize];
+                total += std::mem::size_of::<State>();
+                total += state.transitions.overflow.len() * std::mem::size_of::<TransitionChunk>();
+                for (_, _, target) in state.transitions.iter() {
+                    stack.push(target);
+                }
+            }
+        }
+        total
     }
 }
 
@@ -1092,6 +1220,16 @@ pub(crate) struct TermsStream<'a> {
 }
 
 impl<'a> TermsStream<'a> {
+    /// The term this stream is currently positioned at -- for a stream
+    /// from `Automaton::seek_stream(rank)`, that's `rank`'s own term
+    /// (identical bytes to what `term_at_into(rank, ..)` would have
+    /// written), before any `next()` call has advanced past it. Not
+    /// meaningful on a fresh `stream()` (nothing decoded yet; call
+    /// `next()` first).
+    pub(crate) fn current(&self) -> &[u8] {
+        &self.buf
+    }
+
     /// Advances to the next term in sorted order, or `None` once
     /// exhausted. A preorder DFS over the trie using `stack` in place of
     /// recursion: visit a state's own value (if final) before its
@@ -1195,7 +1333,18 @@ fn clone_state(
     original: StateId,
 ) -> StateId {
     let content = states[original.slot() as usize].clone();
-    let inherited_targets: Vec<StateId> = content.transitions.iter().map(|(_, _, t)| t).collect();
+    // A direct loop over `Transitions::at`, not `iter().map(..).collect()`
+    // -- this call site was missed when `Signature::of`/
+    // `finalize_outputs_and_count` got the same fix (see `Transitions::
+    // iter`'s doc comment for why the combinator chain, not the scan
+    // itself, is the cost); a fresh `perf record` of `sequential_insert`
+    // found it as a top-6 cost (DESIGN.md's allocation-pattern audit).
+    let mut inherited_targets: Vec<StateId> = Vec::new();
+    let mut i = 0usize;
+    while let Some((_, _, target)) = content.transitions.at(i) {
+        inherited_targets.push(target);
+        i += 1;
+    }
     let cloned = alloc_state(
         states,
         refcounts,
@@ -1254,9 +1403,18 @@ fn release(
         // reference -- so the buffer can always be reclaimed, not just
         // conditionally.
         *signature_scratch = sig.transitions;
-        let children: Vec<StateId> = states[slot].transitions.iter().map(|(_, _, t)| t).collect();
         free_slots.push(slot as u32);
-        for child in children {
+        // No `children: Vec<StateId>` collected first -- `states` is
+        // only ever borrowed immutably through this whole call tree
+        // (`release` never mutates state content, only `refcounts`/
+        // `free_slots`/`register`), so `states[slot]`'s transitions
+        // can't change out from under this loop; iterating them directly
+        // while also passing `states` into the recursive call is just
+        // two simultaneous immutable borrows, always allowed. The old
+        // `Vec` was collecting into an intermediate that served no
+        // purpose here (DESIGN.md's allocation-pattern audit).
+        let mut i = 0usize;
+        while let Some((_, _, child)) = states[slot].transitions.at(i) {
             release(
                 states,
                 refcounts,
@@ -1265,6 +1423,7 @@ fn release(
                 child,
                 signature_scratch,
             );
+            i += 1;
         }
     }
 }
@@ -2008,6 +2167,58 @@ mod tests {
             );
         }
         assert_eq!(stream.next(), None, "stream must end exactly at len()");
+    }
+
+    /// `seek_stream(rank)`'s own term must match `term_at_into(rank, ..)`
+    /// exactly, and every subsequent `next()` call must match
+    /// `term_at_into(rank + 1, ..)`, `term_at_into(rank + 2, ..)`, ...,
+    /// for *every* starting rank, not just rank 0 (`stream()`'s only
+    /// starting point) -- the direct correctness check for the resumable
+    /// stack `seek_stream` hand-builds instead of walking there via
+    /// `next()`.
+    #[test]
+    fn seek_stream_matches_term_at_into_from_every_starting_rank() {
+        let terms: Vec<String> = (0..500)
+            .flat_map(|i| {
+                [
+                    format!("http://dbpedia.org/resource/Entity_{i}"),
+                    format!("http://xmlns.com/foaf/0.1/property{i}"),
+                    format!("urn:isbn:{i:013}"),
+                    format!("_:b{i:x}"),
+                ]
+            })
+            .collect();
+        let (automaton, _block, terms) = build_both(terms);
+        let n = terms.len() as u32;
+
+        for start in 0..n {
+            let mut seeked = automaton.seek_stream(start);
+            let mut expected_buf = Vec::new();
+            automaton.term_at_into(start, &mut expected_buf);
+            assert_eq!(
+                seeked.current(),
+                expected_buf.as_slice(),
+                "seek_stream({start}).current() disagrees with term_at_into({start}, ..)"
+            );
+
+            for rank in (start + 1)..n {
+                let next = seeked
+                    .next()
+                    .unwrap_or_else(|| panic!("seek_stream({start}) ended early at rank {rank}"));
+                automaton.term_at_into(rank, &mut expected_buf);
+                assert_eq!(
+                    next,
+                    expected_buf.as_slice(),
+                    "seek_stream({start})'s next() disagrees with term_at_into({rank}, ..) after {} steps",
+                    rank - start
+                );
+            }
+            assert_eq!(
+                seeked.next(),
+                None,
+                "seek_stream({start}) must end exactly at len()"
+            );
+        }
     }
 
     /// A shared prefix followed by divergent branches (the shape

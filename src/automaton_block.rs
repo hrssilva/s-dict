@@ -109,6 +109,56 @@ impl AutomatonBlock {
         String::from_utf8(buf).expect("keys were inserted as valid UTF-8 str bytes")
     }
 
+    /// `Block::payload_bytes`'s analog -- see `Automaton::size_bytes`'s
+    /// own doc comment for exactly what's included/excluded.
+    pub(crate) fn payload_bytes(&self) -> usize {
+        self.automaton.size_bytes()
+    }
+
+    /// Decodes a *sorted* (ascending; may repeat) set of `(output
+    /// position, local_rank)` pairs directly into `out[position]`, via
+    /// one `Automaton::seek_stream` call to the first rank followed by
+    /// `next()` calls advancing through the rest -- reusing whatever
+    /// prefix each step shares with the last, instead of restarting from
+    /// the automaton's root once per requested rank the way independent
+    /// `term_at_into` calls do. `positions` must already be sorted by
+    /// rank ascending (this only ever walks forward); out-of-order input
+    /// produces wrong/garbage results, not a panic.
+    pub(crate) fn decode_sorted_ranks_into(
+        &self,
+        positions: &[(usize, u16)],
+        out: &mut [Option<String>],
+    ) {
+        let Some(&(first_pos, first_rank)) = positions.first() else {
+            return;
+        };
+        let mut stream = self.automaton.seek_stream(first_rank as u32);
+        out[first_pos] = Some(
+            std::str::from_utf8(stream.current())
+                .expect("keys were inserted as valid UTF-8 str bytes")
+                .to_string(),
+        );
+        let mut current_rank = first_rank as usize;
+        for &(pos, rank) in &positions[1..] {
+            let rank = rank as usize;
+            let bytes: &[u8] = if rank == current_rank {
+                stream.current()
+            } else {
+                let mut bytes: &[u8] = &[];
+                while current_rank < rank {
+                    bytes = stream.next().expect("rank must be < automaton len()");
+                    current_rank += 1;
+                }
+                bytes
+            };
+            out[pos] = Some(
+                std::str::from_utf8(bytes)
+                    .expect("keys were inserted as valid UTF-8 str bytes")
+                    .to_string(),
+            );
+        }
+    }
+
     /// Appends every `(term, id)` pair in sorted order onto `out` --
     /// `Block::decode_into`'s contract, via `Automaton::stream` (a single
     /// incremental walk, sharing common-prefix traversal cost between
@@ -198,7 +248,18 @@ impl AutomatonBlock {
             // that's worth its own cost on every mutation.
             self.automaton.insert_sorted(incoming.iter().copied());
             self.ids = new_ids;
-            self.min_key = self.term_at(0).into_boxed_str();
+            // `unchanged_prefix > 0` means rank 0 -- exactly what
+            // `min_key` caches -- is among the leading entries the merge
+            // walk found unmoved, so `min_key` is still correct as-is.
+            // Recomputing it unconditionally here (found via a fresh
+            // `perf record` of `sequential_insert`, DESIGN.md's
+            // allocation-pattern audit) paid for a full root-restart
+            // `term_at_into` walk plus a fresh `String` allocation on
+            // *every* mutation, the overwhelming majority of which don't
+            // touch the block's minimum term at all.
+            if unchanged_prefix == 0 {
+                self.min_key = self.term_at(0).into_boxed_str();
+            }
         }
 
         AutomatonMergeOutcome {
@@ -222,11 +283,15 @@ impl AutomatonBlock {
         debug_assert!(removed);
 
         self.ids.remove(old_rank);
-        self.min_key = if self.ids.is_empty() {
-            Box::default()
-        } else {
-            self.term_at(0).into_boxed_str()
-        };
+        // Only rank 0's own removal can change `min_key` -- removing
+        // anything else leaves the old rank-0 entry exactly where it
+        // was (same reasoning as `merge_into`'s own `unchanged_prefix`
+        // check just above).
+        if self.ids.is_empty() {
+            self.min_key = Box::default();
+        } else if old_rank == 0 {
+            self.min_key = self.term_at(0).into_boxed_str();
+        }
 
         Some((removed_id, old_rank))
     }

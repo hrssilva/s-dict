@@ -133,6 +133,142 @@ impl AutomatonDictionary {
         self.directory.len()
     }
 
+    /// `Dictionary::size_bytes`'s exact accounting (blocks' payload + ids
+    /// array, the router, the reverse directory), `AutomatonBlockId` in
+    /// place of `BlockId` -- see `AutomatonBlock::payload_bytes`/
+    /// `Automaton::size_bytes` for what a block's own payload does and
+    /// doesn't include.
+    pub fn size_bytes(&self) -> usize {
+        let blocks_bytes: usize = self
+            .blocks
+            .iter()
+            .filter_map(|b| b.as_ref())
+            .map(|b| b.payload_bytes() + b.len() * std::mem::size_of::<TermId>())
+            .sum();
+        let directory_bytes: usize = self
+            .directory
+            .iter()
+            .map(|(key, _)| key.len() + std::mem::size_of::<AutomatonBlockId>())
+            .sum();
+        let id_to_block_bytes =
+            self.id_to_block.len() * std::mem::size_of::<Option<(AutomatonBlockId, u16)>>();
+        blocks_bytes + directory_bytes + id_to_block_bytes
+    }
+
+    /// `Dictionary::get_term_into`'s exact contract: decodes into a
+    /// caller-reused buffer instead of allocating a fresh `String` every
+    /// call. `buf` is cleared first; returns `false` (leaving `buf`
+    /// empty) if `id` isn't present.
+    pub fn get_term_into(&self, id: TermId, buf: &mut Vec<u8>) -> bool {
+        buf.clear();
+        let Some((block_id, local_rank)) = self.id_to_block.get(id.0 as usize).and_then(|e| *e)
+        else {
+            return false;
+        };
+        self.block(block_id).term_at_into(local_rank as usize, buf);
+        true
+    }
+
+    /// `Dictionary::get_terms_into`'s exact contract: decodes many ids in
+    /// one call, grouped by block and decoded once per affected block
+    /// (via `AutomatonBlock::decode_into`'s `Automaton::stream`-based
+    /// walk) instead of one independent root-to-leaf automaton walk per
+    /// id. `ids` need not be sorted or deduplicated; `out` is cleared
+    /// first and filled in the same order as `ids`, `None` marking an id
+    /// not present.
+    pub fn get_terms_into(&self, ids: &[TermId], out: &mut Vec<Option<String>>) {
+        out.clear();
+        out.resize(ids.len(), None);
+
+        let mut by_block: std::collections::HashMap<AutomatonBlockId, Vec<(usize, u16)>> =
+            std::collections::HashMap::new();
+        for (pos, &id) in ids.iter().enumerate() {
+            if let Some((block_id, local_rank)) =
+                self.id_to_block.get(id.0 as usize).copied().flatten()
+            {
+                by_block
+                    .entry(block_id)
+                    .or_default()
+                    .push((pos, local_rank));
+            }
+        }
+
+        let mut arena = EntriesArena::new();
+        for (block_id, positions) in by_block {
+            arena.clear();
+            self.block(block_id).decode_into(&mut arena);
+            for (pos, local_rank) in positions {
+                out[pos] = Some(arena.term_at(local_rank as usize).to_string());
+            }
+        }
+    }
+
+    /// `Dictionary::get_terms_scattered_into`'s exact contract and
+    /// rationale: for a query that only touches a small fraction of each
+    /// affected block, decode just the requested ranks directly via
+    /// `AutomatonBlock::term_at_into` (an `O(term length)` walk from the
+    /// automaton's root per call, independent of block size -- the same
+    /// primitive `get_term_into` uses) instead of streaming each touched
+    /// block's entire content. No block-grouping pass needed: `id_to_block`
+    /// already gives `(block_id, local_rank)` in O(1) per id.
+    pub fn get_terms_scattered_into(&self, ids: &[TermId], out: &mut Vec<Option<String>>) {
+        out.clear();
+        out.resize(ids.len(), None);
+        let mut buf = Vec::new();
+        for (pos, &id) in ids.iter().enumerate() {
+            let Some((block_id, local_rank)) =
+                self.id_to_block.get(id.0 as usize).copied().flatten()
+            else {
+                continue;
+            };
+            self.block(block_id)
+                .term_at_into(local_rank as usize, &mut buf);
+            out[pos] = Some(
+                std::str::from_utf8(&buf)
+                    .expect("keys were inserted as valid UTF-8 str bytes")
+                    .to_string(),
+            );
+        }
+    }
+
+    /// A third bulk-decode strategy, testing a specific hypothesis:
+    /// unlike `get_terms_scattered_into` (independent `term_at_into` per
+    /// id, always restarting from the automaton's root) or
+    /// `get_terms_into` (streams a touched block's *entire* content),
+    /// this groups ids by block, sorts each block's requested ranks
+    /// ascending, then decodes them via one `AutomatonBlock::
+    /// decode_sorted_ranks_into` call per block -- seeking to the first
+    /// requested rank once, then advancing forward through the rest via
+    /// `Automaton::seek_stream`'s resumable stack, reusing whatever
+    /// prefix consecutive/nearby *requested* ranks share instead of
+    /// paying a full root descent for each and without decoding entries
+    /// nobody asked for. Whether this actually wins over the other two
+    /// in practice depends on how much prefix sharing real requested
+    /// ranks have -- see `s-bench`'s `dict_bench` for the measurement.
+    pub fn get_terms_seeked_into(&self, ids: &[TermId], out: &mut Vec<Option<String>>) {
+        out.clear();
+        out.resize(ids.len(), None);
+
+        let mut by_block: std::collections::HashMap<AutomatonBlockId, Vec<(usize, u16)>> =
+            std::collections::HashMap::new();
+        for (pos, &id) in ids.iter().enumerate() {
+            if let Some((block_id, local_rank)) =
+                self.id_to_block.get(id.0 as usize).copied().flatten()
+            {
+                by_block
+                    .entry(block_id)
+                    .or_default()
+                    .push((pos, local_rank));
+            }
+        }
+
+        for (block_id, mut positions) in by_block {
+            positions.sort_unstable_by_key(|&(_, rank)| rank);
+            self.block(block_id)
+                .decode_sorted_ranks_into(&positions, out);
+        }
+    }
+
     fn block(&self, id: AutomatonBlockId) -> &AutomatonBlock {
         self.blocks[id.slot() as usize]
             .as_ref()
@@ -191,6 +327,28 @@ impl AutomatonDictionary {
         for local_rank in skip..len {
             let id = self.block(block_id).id_at(local_rank);
             self.set_id_to_block(id, block_id, local_rank);
+        }
+    }
+
+    /// Re-reads `block_id`'s (possibly unchanged) `min_key` into the
+    /// directory, but only when `unchanged_prefix == 0` -- that's
+    /// exactly the condition under which rank 0 (what `min_key` caches)
+    /// could have moved (see `AutomatonBlock::merge_into`/`remove`'s own
+    /// doc comments for the same check on the block's own `min_key`
+    /// field). `unchanged_prefix > 0` means the directory's copy is
+    /// already correct, and `Box<str>::from(&str)` is a real allocation
+    /// and copy every time -- found doing this unconditionally on every
+    /// mutation via a fresh `perf record` of `sequential_insert`
+    /// (DESIGN.md's allocation-pattern audit), the same over-eager
+    /// recomputation `AutomatonBlock` itself had.
+    fn refresh_directory_key(
+        &mut self,
+        dir_idx: usize,
+        block_id: AutomatonBlockId,
+        unchanged_prefix: usize,
+    ) {
+        if unchanged_prefix == 0 {
+            self.directory[dir_idx].0 = self.block(block_id).min_key().into();
         }
     }
 
@@ -389,7 +547,7 @@ impl AutomatonDictionary {
 
             if outcome.added > 0 {
                 self.len += outcome.added;
-                self.directory[dir_idx].0 = self.block(block_id).min_key().into();
+                self.refresh_directory_key(dir_idx, block_id, outcome.unchanged_prefix);
                 self.assign_ranks(block_id, outcome.unchanged_prefix);
                 if self.block(block_id).len() > self.block_max {
                     self.split_while_oversized(dir_idx);
@@ -437,7 +595,7 @@ impl TermDictionary for AutomatonDictionary {
         let outcome = block_ref.merge_into(std::iter::once(term), || id, |_| {});
 
         self.len += 1;
-        self.directory[dir_idx].0 = self.block(block_id).min_key().into();
+        self.refresh_directory_key(dir_idx, block_id, outcome.unchanged_prefix);
         self.assign_ranks(block_id, outcome.unchanged_prefix);
 
         if self.block(block_id).len() > self.block_max {
@@ -466,7 +624,7 @@ impl TermDictionary for AutomatonDictionary {
         if remaining == 0 {
             self.remove_empty_block(dir_idx);
         } else {
-            self.directory[dir_idx].0 = self.block(block_id).min_key().into();
+            self.refresh_directory_key(dir_idx, block_id, unchanged_prefix);
             self.assign_ranks(block_id, unchanged_prefix);
             if remaining < self.block_min {
                 self.merge_with_neighbor(dir_idx);
@@ -477,5 +635,176 @@ impl TermDictionary for AutomatonDictionary {
 
     fn len(&self) -> usize {
         self.len
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn get_term_into_matches_get_term() {
+        let mut dict = AutomatonDictionary::with_block_bounds(2, 8);
+        let id = dict.insert("http://example.org/a");
+        let mut buf = Vec::new();
+        assert!(dict.get_term_into(id, &mut buf));
+        assert_eq!(std::str::from_utf8(&buf).unwrap(), "http://example.org/a");
+
+        let missing = TermId(9999);
+        buf.clear();
+        assert!(!dict.get_term_into(missing, &mut buf));
+        assert!(buf.is_empty());
+    }
+
+    #[test]
+    fn get_term_into_matches_get_term_across_many_terms_and_splits() {
+        let mut dict = AutomatonDictionary::with_block_bounds(4, 16);
+        let terms: Vec<String> = (0..500)
+            .map(|i| format!("http://example.org/entity-{i:04}"))
+            .collect();
+        let ids: Vec<TermId> = terms.iter().map(|t| dict.insert(t)).collect();
+        let mut buf = Vec::new();
+        for (term, id) in terms.iter().zip(&ids) {
+            assert!(dict.get_term_into(*id, &mut buf));
+            assert_eq!(std::str::from_utf8(&buf).unwrap(), term);
+            assert_eq!(dict.get_term(*id).as_deref(), Some(term.as_str()));
+        }
+    }
+
+    #[test]
+    fn get_terms_into_matches_individual_lookups_across_blocks() {
+        let mut dict = AutomatonDictionary::with_block_bounds(2, 8);
+        let terms: Vec<String> = (0..100).map(|i| format!("term-{i:04}")).collect();
+        let ids: Vec<TermId> = terms.iter().map(|t| dict.insert(t)).collect();
+        assert!(dict.block_count() > 1, "should span multiple blocks");
+
+        let mut query: Vec<TermId> = vec![ids[50], ids[3], ids[99], ids[50], ids[0]];
+        query.push(TermId(999_999)); // absent
+
+        let mut out = Vec::new();
+        dict.get_terms_into(&query, &mut out);
+        assert_eq!(out.len(), query.len());
+        for (i, &id) in query.iter().enumerate() {
+            assert_eq!(out[i], dict.get_term(id), "mismatch at query position {i}");
+        }
+    }
+
+    #[test]
+    fn get_terms_into_empty_input() {
+        let dict = AutomatonDictionary::with_block_bounds(2, 8);
+        let mut out = vec![Some("stale".to_string())];
+        dict.get_terms_into(&[], &mut out);
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn get_terms_scattered_into_matches_get_terms_into_and_get_term() {
+        let mut dict = AutomatonDictionary::with_block_bounds(2, 8);
+        let terms: Vec<String> = (0..100).map(|i| format!("term-{i:04}")).collect();
+        let ids: Vec<TermId> = terms.iter().map(|t| dict.insert(t)).collect();
+        assert!(dict.block_count() > 1, "should span multiple blocks");
+
+        let mut query: Vec<TermId> = vec![ids[50], ids[3], ids[99], ids[50], ids[0]];
+        query.push(TermId(999_999)); // absent
+
+        let mut dense = Vec::new();
+        dict.get_terms_into(&query, &mut dense);
+        let mut scattered = Vec::new();
+        dict.get_terms_scattered_into(&query, &mut scattered);
+        assert_eq!(scattered, dense);
+        for (i, &id) in query.iter().enumerate() {
+            assert_eq!(
+                scattered[i],
+                dict.get_term(id),
+                "mismatch at query position {i}"
+            );
+        }
+    }
+
+    #[test]
+    fn get_terms_scattered_into_empty_input() {
+        let dict = AutomatonDictionary::with_block_bounds(2, 8);
+        let mut out = vec![Some("stale".to_string())];
+        dict.get_terms_scattered_into(&[], &mut out);
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn get_terms_seeked_into_matches_individual_lookups_across_blocks() {
+        let mut dict = AutomatonDictionary::with_block_bounds(2, 8);
+        let terms: Vec<String> = (0..100).map(|i| format!("term-{i:04}")).collect();
+        let ids: Vec<TermId> = terms.iter().map(|t| dict.insert(t)).collect();
+        assert!(dict.block_count() > 1, "should span multiple blocks");
+
+        // Duplicates (including a run of 3 identical ids), out-of-rank-order
+        // within a block, and an absent id mixed in.
+        let mut query: Vec<TermId> = vec![
+            ids[50], ids[3], ids[99], ids[50], ids[0], ids[50], ids[4], ids[3],
+        ];
+        query.push(TermId(999_999)); // absent
+
+        let mut out = Vec::new();
+        dict.get_terms_seeked_into(&query, &mut out);
+        assert_eq!(out.len(), query.len());
+        for (i, &id) in query.iter().enumerate() {
+            assert_eq!(out[i], dict.get_term(id), "mismatch at query position {i}");
+        }
+    }
+
+    #[test]
+    fn get_terms_seeked_into_matches_consecutive_ranks_within_one_block() {
+        let mut dict = AutomatonDictionary::with_block_bounds(16, 64);
+        let terms: Vec<String> = (0..1000)
+            .flat_map(|i| {
+                [
+                    format!("http://example.org/entity-{i:05}"),
+                    format!("http://xmlns.com/foaf/0.1/property{i}"),
+                ]
+            })
+            .collect();
+        let mut sorted_terms = terms.clone();
+        sorted_terms.sort_unstable();
+        let ids: Vec<TermId> = terms.iter().map(|t| dict.insert(t)).collect();
+
+        // A genuinely consecutive-rank cluster: every id landing in the
+        // same block as `ids[0]` and its lexical neighbors.
+        let mut query: Vec<TermId> = ids.iter().take(20).copied().collect();
+        query.reverse(); // out of rank order on purpose
+
+        let mut out = Vec::new();
+        dict.get_terms_seeked_into(&query, &mut out);
+        for (i, &id) in query.iter().enumerate() {
+            assert_eq!(out[i], dict.get_term(id), "mismatch at query position {i}");
+        }
+    }
+
+    #[test]
+    fn get_terms_seeked_into_empty_input() {
+        let dict = AutomatonDictionary::with_block_bounds(2, 8);
+        let mut out = vec![Some("stale".to_string())];
+        dict.get_terms_seeked_into(&[], &mut out);
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn size_bytes_grows_with_content_and_shrinks_on_remove() {
+        let mut dict = AutomatonDictionary::with_block_bounds(4, 16);
+        let empty = dict.size_bytes();
+        let terms: Vec<String> = (0..200)
+            .map(|i| format!("http://example.org/entity-{i:04}"))
+            .collect();
+        for t in &terms {
+            dict.insert(t);
+        }
+        let full = dict.size_bytes();
+        assert!(full > empty, "size_bytes should grow as terms are inserted");
+        for t in &terms {
+            dict.remove(t);
+        }
+        let drained = dict.size_bytes();
+        assert!(
+            drained < full,
+            "size_bytes should shrink as terms are removed"
+        );
     }
 }

@@ -2538,3 +2538,100 @@ an allocation* (worth doing, confirmed here) is not the same lever as
 *avoiding it via an inline-capacity abstraction* (not worth it, per the
 prior section) -- the same allocation, avoided a structurally simpler
 way, paid off where the fancier version didn't.
+
+### Custom incremental micro-FST: a fresh allocation-pattern audit
+
+Requested explicitly: re-examine both algorithm and memory, `perf` as a
+guide, hunting for two specific shapes -- (1) `A` copied to an
+unnecessary intermediate `B`, tested, then moved to `C` (`B` never
+needed to exist), and (2) a chain `T1(A) -> B1 -> T2(B1) -> B2 -> ... ->
+C` that could be one composed transform straight from `A` to `C`. Found
+via fresh `perf record` profiles of `sequential_insert` and `remove`
+(both properly isolated from setup via `perf record -D`, this
+investigation's own established discipline), not by re-reading code
+first and guessing what to profile.
+
+**Finding 1: `clone_state`'s `inherited_targets` -- the exact
+combinator-chain anti-pattern already fixed at three other call sites
+(`Signature::of`, `finalize_outputs_and_count`), missed at this one.**
+`content.transitions.iter().map(|(_, _, t)| t).collect()` showed up as
+a top-6 cost in `sequential_insert`'s flat profile (`Vec<StateId> as
+SpecFromIterNested<..., clone_state::{closure#0}>::from_iter`, ~4.9%).
+Same fix as before: a direct loop over `Transitions::at`. This one still
+needs an owned `Vec` (the source `content` is moved into `alloc_state`
+right after, so the targets must be captured first) -- not
+type (1) or (2) above, just the same iterator-overhead lesson landing a
+fourth time.
+
+**Finding 2: `release`'s `children: Vec<StateId>` -- genuinely
+type (1), an unnecessary `B`.** `states[slot].transitions.iter().map(..
+).collect()` built an owned `Vec` of child ids purely so the subsequent
+loop could call `release` on each one. But `release` only ever borrows
+`states` *immutably* through its entire (recursive) call tree -- it
+never mutates state content, only `refcounts`/`free_slots`/`register` --
+so `states[slot]`'s transitions can't change out from under a direct
+loop, and indexing `states[slot].transitions.at(i)` while also passing
+`states` into the recursive call is just two simultaneous immutable
+borrows, always legal. Rewritten to iterate directly with no
+intermediate `Vec` at all: `A` (the live transitions) feeds `C` (the
+recursive `release` calls) with no `B` in between.
+
+**Finding 3, the largest single win of this audit: `min_key`/directory-key
+recomputed on every mutation, needed on only a small fraction of them.**
+`AutomatonBlock::merge_into` set `self.min_key = self.term_at(0)...`
+unconditionally whenever anything was added -- a full root-restart
+`term_at_into` walk (not the shared-prefix `stream()` path) plus a fresh
+`String` allocation, on *every single insert*, even though `min_key`
+only actually changes when rank 0 itself moved. The merge walk already
+computes exactly that signal (`unchanged_prefix > 0` means rank 0 is
+among the leading entries proven unmoved) and was discarding it right
+after computing it. Same pattern, same fix, in three more places:
+`AutomatonBlock::remove` (recomputed unless `old_rank == 0`) and all
+three `AutomatonDictionary` call sites that copy a block's `min_key`
+into the directory (`insert`, `insert_ordered`, `remove` -- consolidated
+into one `refresh_directory_key` helper, since `Box<str>::from(&str)`
+is a real allocation-and-copy every time too, and all three were paying
+it unconditionally). Not exactly the "A/B/C" shape either -- more a
+redundant-recomputation cousin of it, discarding a signal the algorithm
+already had rather than threading data through an unnecessary buffer --
+but the same underlying discipline (don't do work whose result you
+already know) caught it.
+
+**Measured**, `perf stat`, both wall-clock and hardware counters (fresh
+5-rep runs, `perf_dictionary_automaton_vs_fst`):
+
+| operation | before this audit | after | `perf stat` confirmation |
+|---|---|---|---|
+| `remove` | 3.15-3.35x faster than `fst` | **6.36x faster** (wall clock); **4.24x fewer cycles, 4.74x fewer instructions, 6.21x fewer cache-references** | yes |
+| `sequential_insert` | 2.32-2.40x faster | **2.73x faster**, instructions down 15.1% from immediately before this audit | yes |
+| `bulk_insert` | ~1.04-1.16x slower | unaffected (this audit's fixes are all on the mutate-existing-block path, not fresh construction) -- still ~1.04x slower, near parity | consistent |
+
+`remove`'s jump is the standout: it exercises `release`'s cascading-free
+path (Finding 2) and recomputes a block's `min_key` on every removal
+(Finding 3) far more heavily than insert does, so both fixes compounded
+specifically there. A post-fix `perf record` of both `remove` and
+`sequential_insert` confirms the combinator-chain fingerprints are gone
+from the flat profile entirely -- what remains (register `HashMap`
+lookups, the merge walk itself, `confirm_path`/`alloc_state`/`clone_state`'s
+now-fixed core loop) is legitimate algorithm cost, not a pattern this
+audit's two shapes describe. All 99 tests pass (91 lib + 5 + 3 across
+`tests/`), including the 4-way fuzz differential -- which would have
+caught a wrong `min_key`/directory-key skip condition, since it checks
+routing correctness after every mutation, not just decode correctness.
+
+**Also found, not fixed here, explicitly out of scope**: this session's
+review surfaced a substantial amount of code added outside this
+conversation between turns -- `get_term_into`/`get_terms_into`/
+`get_terms_scattered_into`/`get_terms_seeked_into`/`size_bytes` on
+`AutomatonDictionary` (and matching `get_terms_scattered_into` additions
+to `Dictionary`/`FrontCodedDictionary`), plus `Automaton::seek_stream`/
+`size_bytes` and `AutomatonBlock::payload_bytes`/`decode_sorted_ranks_into`
+in support. Read in full and checked against this audit's two anti-pattern
+shapes specifically: no unnecessary intermediate buffer found in any of
+the three bulk-decode strategies (`get_terms_seeked_into`/
+`decode_sorted_ranks_into` in particular already writes straight from
+the stream into the caller's `out`, no arena in between) -- this code
+already appears to have internalized the same discipline. Its own
+`s-bench`/`dict_bench`-based comparison (referenced in its doc comments,
+external to this repo) is outside what this session can measure or
+weigh in on.

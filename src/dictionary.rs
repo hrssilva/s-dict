@@ -315,6 +315,44 @@ impl Dictionary {
         }
     }
 
+    /// Like `get_terms_into`, but for a *scattered* query: one that only
+    /// touches a small fraction of each affected block's own content (an
+    /// arbitrary join result's term ids, say, rather than "dump this
+    /// whole dictionary"). `get_terms_into` above decodes each touched
+    /// block's *entire* content via one streaming pass -- worth it when
+    /// most of a block's own entries are requested (the stream reuses
+    /// shared-prefix traversal state between consecutive keys), a waste
+    /// when only a few are (every entry nobody asked for still gets
+    /// decoded). This instead calls `Block::term_at_into` directly per
+    /// id -- already an O(term length) unranking walk from the FST root,
+    /// independent of block size or how far the requested rank is from
+    /// 0 (the same primitive `get_term_into` itself uses) -- so it never
+    /// pays for content that wasn't asked for. No block-grouping pass
+    /// needed at all: `id_to_block` already gives `(block_id,
+    /// local_rank)` in O(1) per id, and there's nothing to amortize
+    /// across ids that don't share consecutive rank order. `ids` need
+    /// not be sorted or deduplicated; `out` is cleared first and filled
+    /// in the same order as `ids`, `None` marking an id not present.
+    pub fn get_terms_scattered_into(&self, ids: &[TermId], out: &mut Vec<Option<String>>) {
+        out.clear();
+        out.resize(ids.len(), None);
+        let mut buf = Vec::new();
+        for (pos, &id) in ids.iter().enumerate() {
+            let Some((block_id, local_rank)) =
+                self.id_to_block.get(id.0 as usize).copied().flatten()
+            else {
+                continue;
+            };
+            self.block(block_id)
+                .term_at_into(local_rank as usize, &mut buf);
+            out[pos] = Some(
+                std::str::from_utf8(&buf)
+                    .expect("keys were inserted as valid UTF-8 str bytes")
+                    .to_string(),
+            );
+        }
+    }
+
     fn block(&self, id: BlockId) -> &Block {
         self.blocks[id.slot() as usize]
             .as_ref()
@@ -835,6 +873,38 @@ mod tests {
         let dict = Dictionary::with_block_bounds(2, 8);
         let mut out = vec![Some("stale".to_string())];
         dict.get_terms_into(&[], &mut out);
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn get_terms_scattered_into_matches_get_terms_into_and_get_term() {
+        let mut dict = Dictionary::with_block_bounds(2, 8);
+        let terms: Vec<String> = (0..100).map(|i| format!("term-{i:04}")).collect();
+        let ids: Vec<TermId> = terms.iter().map(|t| dict.insert(t)).collect();
+        assert!(dict.block_count() > 1, "should span multiple blocks");
+
+        let mut query: Vec<TermId> = vec![ids[50], ids[3], ids[99], ids[50], ids[0]];
+        query.push(TermId(999_999)); // absent
+
+        let mut dense = Vec::new();
+        dict.get_terms_into(&query, &mut dense);
+        let mut scattered = Vec::new();
+        dict.get_terms_scattered_into(&query, &mut scattered);
+        assert_eq!(scattered, dense);
+        for (i, &id) in query.iter().enumerate() {
+            assert_eq!(
+                scattered[i],
+                dict.get_term(id),
+                "mismatch at query position {i}"
+            );
+        }
+    }
+
+    #[test]
+    fn get_terms_scattered_into_empty_input() {
+        let dict = Dictionary::with_block_bounds(2, 8);
+        let mut out = vec![Some("stale".to_string())];
+        dict.get_terms_scattered_into(&[], &mut out);
         assert!(out.is_empty());
     }
 
