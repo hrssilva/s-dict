@@ -1371,10 +1371,12 @@ impl PackedAutomaton {
         }
     }
 
+    #[inline]
     fn is_final(&self, pos: u32) -> bool {
         self.bytes[pos as usize] & 0x80 != 0
     }
 
+    #[inline]
     fn transition_count(&self, pos: u32) -> usize {
         (self.bytes[pos as usize] & 0x7F) as usize
     }
@@ -1386,6 +1388,17 @@ impl PackedAutomaton {
     /// O(branching factor) *scan* over already-typed fields. Whether
     /// that parse cost is offset by better cache locality is exactly
     /// what this prototype exists to measure, not assume.
+    ///
+    /// `#[inline]`: a `perf record` profile of the hashlike decode probe
+    /// found this got inlined into `rank` by default, while
+    /// `last_output_at_most` (same shape, called from `term_at_into`)
+    /// didn't -- the resulting real function-call-per-visited-state cost
+    /// was a plausible, testable explanation for `term_at_into` showing
+    /// no speedup while `rank` showed ~1.5-1.65x, an asymmetry that
+    /// looked structural at first but wasn't. Hinting both explicitly
+    /// removes the asymmetry as a variable rather than leaving it to
+    /// whatever LLVM's default heuristic happens to decide.
+    #[inline]
     fn get(&self, pos: u32, byte: u8) -> Option<(u32, u32)> {
         let count = self.transition_count(pos);
         let mut cursor = pos as usize + 1;
@@ -1409,7 +1422,12 @@ impl PackedAutomaton {
 
     /// The last transition (in byte order) whose output is `<= value` --
     /// `Transitions::last_output_at_most`'s contract, over parsed
-    /// records instead of a typed array.
+    /// records instead of a typed array. `#[inline(always)]`: plain
+    /// `#[inline]` (a hint, not a command) measurably wasn't enough --
+    /// a `perf record` profile still showed this as its own symbol
+    /// afterward, unlike `get`, which LLVM folded into `rank` either
+    /// way. See `get`'s doc comment for the fuller story.
+    #[inline(always)]
     fn last_output_at_most(&self, pos: u32, value: u32) -> (u8, u32, u32) {
         let count = self.transition_count(pos);
         let mut cursor = pos as usize + 1;

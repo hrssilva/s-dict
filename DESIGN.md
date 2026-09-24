@@ -2765,3 +2765,95 @@ not as a side effect of chasing one more lever. `examples/
 perf_scale_memory.rs` and `micro_fst::tests::print_struct_sizes` are
 kept, not reverted -- they're the reusable tools for whatever that
 decision needs next, not single-use diagnostics.
+
+### Custom incremental micro-FST: a byte-packed representation, prompted by `s-graph`
+
+A design discussion, not a profiling session: the user pointed at
+`../s-graph/examples/common/radixtree_dfs_interleaved_varskip_unrolled.rs`,
+which stores a whole radix trie as one flat, byte-packed stream (no
+per-node struct, no per-node allocation), split into independently
+allocated fixed-capacity blocks specifically so single-record insertion
+costs O(block capacity), not O(structure size). The one adaptation this
+crate's problem needs that theirs doesn't: their structure is a plain
+tree (one parent per node, so DFS-preorder addressing works); this
+crate's automaton is a DAG (register-based minimization means one state
+can have several parents), so a state needs an address independent of
+any single path to it -- not a blocker, since `StateId` was already an
+opaque handle, not a physical position, before any of this.
+
+**Cheap validation first, per an explicit staging decision** (asked via
+`AskUserQuestion`, "prototype size savings first" over "build the full
+thing" or "flat Vec, add blocks only if needed"): `Automaton::
+estimate_packed_bytes`, a pure measurement -- walks the *existing*
+reachable structure and computes what a byte-packed, variable-length
+record per state (`[flag_count: u8][per-transition: byte + LEB128
+output + 4-byte address]`) would cost, without touching any storage,
+addressing, or mutation code at all. Result, far bigger than anything
+the `CHUNK_CAP`/`SmallVec` tuning found:
+
+| scenario | current `size_bytes()` | packed estimate | reduction | vs. `fst` |
+|---|---|---|---|---|
+| hashlike (low redundancy) | 767-811 bytes/term | ~91-95 bytes/term | ~88% | 25x worse -> ~3x worse |
+| clustered (high redundancy) | 26.1-26.3 bytes/term | ~14.5 bytes/term | ~45% | 1.2x worse -> automaton *wins* (~14.5 vs. `fst`'s ~30) |
+
+**Read-only decode prototype, built to test the other half of the
+tradeoff** (the estimate says nothing about speed): `PackedAutomaton`
+(`micro_fst.rs`) -- `compile(&Automaton)` writes the same layout the
+estimate assumed via a postorder walk (every child written before its
+parent, so a parent's transitions can reference already-known
+addresses; naturally preserves the source automaton's own
+deduplication, since a state visited via a second parent just returns
+its already-recorded address), then serves `rank`/`term_at_into` by
+parsing records instead of indexing typed arrays. No insert, no remove,
+no register, no refcounting -- deliberately out of scope; that's the
+"unrolled blocks" half of the `s-graph`-prompted idea, not attempted
+here.
+
+Correctness before speed, as always: three new tests
+(`packed_automaton_matches_automaton_rank_and_unrank`, 8,000
+namespace-clustered terms; `..._on_branching_and_prefix_terms`, a
+hand-traceable case with multi-child and final-with-children states;
+`..._size_matches_the_earlier_estimate`, confirming `compile(..).
+size_bytes()` exactly equals what `estimate_packed_bytes` predicted for
+the same automaton) all pass before any timing was trusted.
+
+**Decode speed: a real, `perf stat`-confirmed win, but it took finding
+and fixing a specific problem to get there, not just building the
+prototype and measuring once.** First pass, wall-clock: `rank` ~1.5-1.65x
+faster on a 20,000-term hashlike corpus, but `term_at_into` showed *no*
+improvement at all -- an asymmetry between two operations that walk the
+exact same states, which shouldn't happen if the representation itself
+were the only variable. A `perf record` profile explained it: `get`
+(called from `rank`) had been inlined by LLVM by default; the
+structurally near-identical `last_output_at_most` (called from
+`term_at_into`) hadn't, paying a real function-call per visited state
+that `rank`'s path didn't. Plain `#[inline]` (a hint) didn't change
+LLVM's decision -- confirmed by re-profiling, not assumed fixed;
+`#[inline(always)]` did, confirmed the same way. After that fix, both
+operations show a real win, `perf stat`-confirmed on both the hashlike
+and clustered corpora:
+
+| metric | hashlike | clustered |
+|---|---|---|
+| cycles | 1.17x fewer | 1.17x fewer |
+| instructions | 1.81x *more* | 1.81x *more* |
+| cache-references | 1.97x fewer | 1.95x fewer |
+| cache-misses | 1.44x fewer | 1.42x fewer |
+
+More instructions (the parsing overhead a variable-length record pays
+that direct array indexing doesn't) but far fewer cache references and
+misses, netting out to fewer total cycles either way -- IPC roughly
+doubles (1.4 -> 3.0 on the hashlike corpus), exactly the "more work per
+cycle because the data actually fits near the CPU" signature this whole
+line of investigation was betting on. This is the first time in this
+entire memory-scaling investigation that a change has won on *both*
+axes at once, rather than trading one for the other.
+
+**What this does and doesn't establish.** Confirmed: the byte-packed
+layout is both smaller and faster to *decode* than the current
+`State`/`TransitionChunk` representation, for both tested redundancy
+regimes. Not yet touched at all: whether it can be made *mutable*
+(insert/remove) without giving back this win -- the entire reason
+`s-graph`'s own design needs unrolled blocks in the first place, and the
+next real step if this is worth pursuing further, not a small addition
+to this prototype.
