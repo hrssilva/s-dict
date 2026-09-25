@@ -121,6 +121,12 @@ impl AutomatonBlock {
         self.automaton.estimate_packed_bytes()
     }
 
+    /// See `Automaton::reachable_state_count` -- a measurement only, for
+    /// the states-per-term investigation (DESIGN.md).
+    pub(crate) fn reachable_state_count(&self) -> usize {
+        self.automaton.reachable_state_count()
+    }
+
     /// Decodes a *sorted* (ascending; may repeat) set of `(output
     /// position, local_rank)` pairs directly into `out[position]`, via
     /// `Automaton::decode_ranks_into` -- one recursive descent that

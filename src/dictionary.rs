@@ -176,6 +176,19 @@ impl Dictionary {
         blocks_bytes + directory_bytes + id_to_block_bytes
     }
 
+    /// Total reachable node count across every block's `fst` automaton --
+    /// `AutomatonDictionary`/`PackedAutomatonDictionary`'s own
+    /// `reachable_state_count` sums, mirrored here via `Block::
+    /// reachable_state_count`. A pure measurement (see that method's own
+    /// doc comment for why it exists).
+    pub fn reachable_state_count(&self) -> usize {
+        self.blocks
+            .iter()
+            .filter_map(|b| b.as_ref())
+            .map(Block::reachable_state_count)
+            .sum()
+    }
+
     /// Insert a worker-prepared batch without sorting or deduplicating it again.
     /// Returns IDs in original input order, including duplicate occurrences.
     /// Preparation owns only one caller-bounded batch; no global term copy or

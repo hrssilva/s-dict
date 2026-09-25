@@ -177,6 +177,17 @@ impl AutomatonDictionary {
         blocks_bytes + directory_bytes + id_to_block_bytes
     }
 
+    /// Total reachable state count across every block's `Automaton` --
+    /// `Dictionary::reachable_state_count`'s counterpart, for the
+    /// states-per-term investigation (DESIGN.md).
+    pub fn reachable_state_count(&self) -> usize {
+        self.blocks
+            .iter()
+            .filter_map(|b| b.as_ref())
+            .map(AutomatonBlock::reachable_state_count)
+            .sum()
+    }
+
     /// `Dictionary::get_term_into`'s exact contract: decodes into a
     /// caller-reused buffer instead of allocating a fresh `String` every
     /// call. `buf` is cleared first; returns `false` (leaving `buf`

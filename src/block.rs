@@ -277,6 +277,32 @@ impl Block {
     pub(crate) fn payload_bytes(&self) -> usize {
         self.fst.as_fst().as_bytes().len()
     }
+
+    /// The number of *reachable* nodes in this block's underlying `fst`
+    /// automaton -- `Automaton::reachable_state_count`'s counterpart,
+    /// walking `fst::raw::Fst`'s own node graph (`Node::transitions`) via
+    /// `fst::raw::CompiledAddr` instead of a `StateId` slab. A pure
+    /// measurement (like `AutomatonDictionary::estimate_packed_bytes`):
+    /// isolates whether `fst`'s own minimization achieves a *different
+    /// state count per term* than `Automaton`'s does for the same
+    /// content, as opposed to just a smaller per-state byte cost --
+    /// see DESIGN.md's investigation into why both `Automaton` and
+    /// `PackedAutomaton` show super-linear bytes/term growth on real RDF
+    /// data while `Dictionary` (this type) stays flat.
+    pub(crate) fn reachable_state_count(&self) -> usize {
+        let raw_fst = self.fst.as_fst();
+        let mut seen = std::collections::HashSet::new();
+        let mut stack = vec![raw_fst.root().addr()];
+        while let Some(addr) = stack.pop() {
+            if seen.insert(addr) {
+                let node = raw_fst.node(addr);
+                for i in 0..node.len() {
+                    stack.push(node.transition(i).addr);
+                }
+            }
+        }
+        seen.len()
+    }
 }
 
 #[cfg(test)]

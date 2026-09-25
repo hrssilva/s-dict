@@ -2857,3 +2857,976 @@ regimes. Not yet touched at all: whether it can be made *mutable*
 `s-graph`'s own design needs unrolled blocks in the first place, and the
 next real step if this is worth pursuing further, not a small addition
 to this prototype.
+
+## the mutable unrolled-block version: a real insert, and a real problem it exposed
+
+Extended `PackedAutomaton` in place (same type, not a new one) into the
+mutable structure the decode-only prototype above deliberately deferred:
+`blocks: Vec<Vec<u8>>` (fixed `BLOCK_CAPACITY = 4096` per block,
+`s-graph`'s own default) addressed by a single virtual `u32`
+(`block_idx * BLOCK_CAPACITY + offset`), a persistent `register:
+HashMap<PackedSignature, u32>` mirroring the slab design's own register
+but keyed by packed addresses instead of `StateId`, and `insert(&mut
+self, term: &str)` mirroring `Automaton::insert`'s own algorithm exactly
+(walk existing transitions as far as they match, "open" every matched
+state into an editable `StagingFrame` by parsing its existing record,
+extend with fresh empty frames for the unmatched suffix, confirm
+bottom-up -- recomputing each frame's outputs via the same
+prefix-sum-of-sibling-subtree-counts technique, deduping through the
+register, and splicing the resolved `(byte, output, pos)` into the
+parent frame).
+
+One real simplification fell out of the DAG-vs-tree difference between
+this and `s-graph`'s own structure, reasoned through before writing any
+code: `s-graph`'s addressing is DFS-preorder position *in a tree*, which
+is exactly why it needs shift-or-split-on-insert complexity (a node's
+position can change as siblings are added). This crate's states are
+addressed by explicit stored pointers (already true of `StateId` in the
+slab design) and confirmation is always bottom-up -- a child's address
+is permanent before its parent's record ever references it -- so a
+confirmed record's address here never needs to move. That removed the
+need for any shifting, splitting-to-make-room, or
+reference-counting/redirect machinery at all: a superseded record is
+just abandoned, unreachable bytes.
+
+The record format needed one real addition the read-only version didn't:
+an explicit `subtree_count` (LEB128 varint, right after the flag/count
+byte) on every record, because `insert`'s output recomputation needs
+each child's subtree size and there's no cheap way to recover that from
+the read-only layout without re-walking whole subtrees.
+
+**Correctness, confirmed before anything else.** Four new differential
+tests: `packed_automaton_insert_matches_automaton_incremental_insert`
+(interleaved, non-sorted insertion order -- `insert` has no
+sorted-input assumption, unlike `Automaton::build_sorted`),
+`..._insert_is_idempotent`, and
+`..._insert_reaches_same_minimality_as_fresh_build` (this project's
+existing minimality-regression pattern, applied here: after a
+deterministically-reordered incremental build of 600 terms, the
+*reachable* record count -- not `size_bytes()`, see below -- must equal
+a fresh `Automaton::build_sorted` over the same final set; it does).
+Building this surfaced and fixed an unrelated latent bug in an
+*existing* test, not in `Automaton` itself:
+`packed_automaton_size_matches_the_earlier_estimate` was feeding
+`Automaton::build_sorted` unsorted, undeduplicated input, violating its
+documented precondition. That produced a genuinely corrupted automaton
+(reproduced directly: the root state held 900 transition entries for
+only 3 distinct bytes -- 300 duplicate `'h'`/`'u'`/`'_'` entries each,
+one extra per unsorted "run"), invisible before because the only
+assertion was self-consistency between `compile` and `estimate`
+(equally inflated on both sides) and because the *old* format's
+`debug_assert!` on transition count compiles away entirely under
+`cargo test --release`, this project's standard test invocation. Fixed
+by sorting+deduplicating first, matching every other call site's
+existing (correct) convention.
+
+**Insert speed: real, `perf stat`-confirmed, and a genuine tradeoff, not
+a second free win.** Same harness as `perf_probe_insert_cost_automaton`
+(160-term baseline, matching `block_max`'s midpoint; 20,000 single-term
+inserts against a freshly-cloned baseline each time, isolated from
+`Block`'s and `Automaton`'s own probes so `perf stat` attributes cleanly
+to one operation):
+
+| implementation | time/op | cycles | instructions | cache-refs | cache-misses |
+|---|---|---|---|---|---|
+| `Block` (decode+merge+rebuild via `fst`) | 54.7us | 2,625M | 8,120M | 68.7M | 279K |
+| `Automaton::insert` (mutable slab) | 8.83us | 508M | 1,441M | 7.80M | 60.3K |
+| `PackedAutomaton::insert` (mutable unrolled blocks) | 14.3us | 788M | 2,493M | 2.63M | 69.9K |
+
+`PackedAutomaton::insert` is ~3.3x faster than a full `fst` rebuild (the
+thing blocks exist to avoid paying on every mutation) but ~1.55x
+*slower* than the plain slab `Automaton::insert` it's meant to replace --
+parsing each matched state's record back into a `StagingFrame` and
+re-serializing a brand-new record for every state on the path (vs. the
+slab's direct in-place pointer/field mutation) costs real cycles that
+the decode path's win doesn't offset here. Fewer cache-references than
+the slab version (2.63M vs 7.80M -- the packed layout's locality
+advantage shows up on the write path too) but more cycles and
+instructions overall: parsing/serialization cost dominates over cache
+effects for this operation, the reverse of what decode showed.
+
+**Memory under sustained inserts: measured, not assumed, and a real
+regression -- the significant negative finding of this whole
+extension.** The design reasoning above (see `PackedAutomaton`'s own
+struct doc comment, corrected after this measurement) assumed
+unreclaimed dead records were a small cost, bounded by how much churn
+one `AutomatonBlock` sees between its own periodic full rebuilds
+(`split`/`merge_with_neighbor`). That assumption was never measured
+before being written down, and it's wrong: because inserting *any* term
+changes every ancestor's `subtree_count` on the root-to-leaf path, the
+register can essentially never reuse an old copy of any state on that
+path -- every single insert writes a brand-new record for every state
+from the new leaf up to and including the root. `measure_packed_
+automaton_dead_bytes_under_sustained_inserts` (800-term namespace-
+clustered baseline, insert-only churn, comparing `size_bytes()` against
+a *fresh* `Automaton::build_sorted` over the same live set's
+`estimate_packed_bytes()` at each checkpoint):
+
+| inserts | live terms | size_bytes | fresh estimate | ratio |
+|---|---|---|---|---|
+| 0 | 800 | 1,338 | 1,338 | 1.00x |
+| 144 | 944 | 48,841 | 1,814 | 26.9x |
+| 192 | 992 | 67,006 | 1,835 | 36.5x |
+| 200 | 1,000 | 70,142 | 1,883 | 37.3x |
+| 2,000 | 2,800 | 690,235 | 2,105 | 327.9x |
+
+192 inserts is comfortably *inside* one block's normal churn between
+splits at this project's default `block_max` (256) -- not an extreme,
+long-run stress case. The bloat is already 20-37x by then, and it keeps
+climbing roughly linearly with insert count, not leveling off: this
+representation, exactly as built, would make an `AutomatonBlock` using
+it dramatically *larger* under real insert traffic than either the
+current `fst`-backed `Block` or the existing mutable-slab `Automaton`
+(which reclaims old slots via refcounting/`free_slots`, keeping its
+slab-vs-reachable gap bounded -- see the sustained-churn measurement
+earlier in this document). Confirmed as a real property of this
+specific design (bottom-up confirmation touching the whole path, no
+reclamation at all), not a bug in the implementation.
+
+**Decode, re-measured -- the earlier "unambiguous win" claim above
+didn't survive making the structure mutable, and shouldn't have been
+assumed to without checking.** The mutable record format adds one field
+the read-only prototype didn't have (`subtree_count`, a LEB128 varint
+right after the flag/count byte, needed by `insert`'s output
+recomputation) -- parsed on *every* state visited by `rank`/
+`term_at_into` too, even though decode never uses it. Re-running the
+same `perf_probe_decode_cost_packed_automaton(_hashlike)` probes against
+this mutable version, `perf stat`-confirmed and reproduced twice:
+
+| metric | hashlike | clustered |
+|---|---|---|
+| cycles | 1.40-1.46x *more* | 1.42x *more* |
+| instructions | 2.67x more | 2.63x more |
+| cache-references | 1.73-1.75x fewer | 1.05x fewer |
+| cache-misses | roughly flat | roughly flat |
+
+A `perf record --call-graph fp` profile confirmed this isn't an
+inlining regression -- `header`/`read_leb128` are still fully inlined
+into `get`/`last_output_at_most`, same as before -- it's genuine added
+work: every state visit now pays for parsing a varint decode never
+needed, on top of the one it already paid per transition for that
+transition's own output. Cache-references are still lower than the
+plain slab `Automaton` (the layout's locality advantage is real and
+persists), but that's no longer enough to net out to fewer cycles the
+way it did for the read-only prototype -- decode is unambiguously worse
+now, not better, than both the read-only prototype *and* the plain slab
+`Automaton` it was meant to beat. Storing `subtree_count` out-of-line
+(e.g. only in a separate lookup structure `insert` consults, not inline
+in every record `rank`/`term_at_into` must skip past) would remove this
+specific cost, but that's a real redesign, not measured or attempted
+here -- reported as a further open question, not a fix already in hand.
+
+**Isolating the actual cause, instead of assuming it was `subtree_count`.**
+A discussion of the addressing scheme (positional/renumbered vs.
+permanent-pointer addressing, prompted by working through a hand-traced
+insert example) raised the right question: does this crate's design
+even need `s-graph`-style unrolled blocks at all? `s-graph` needs
+block-relative addressing because its structure is a plain tree, where
+a node's address *is* its DFS-preorder position, so a block boundary
+can force a shift-or-split. This crate's automaton is a DAG addressed
+by explicit, permanent `u32`s -- nothing here is ever positionally
+addressed, so nothing ever needs to shift, which means unrolled blocks
+were bought to solve a problem (bounded-cost single-record insertion
+without touching the rest of the buffer) this design already had for
+free by construction. What they cost instead was a second,
+bounds-checked pointer hop (`blocks[block_index]`, to find the byte
+array to then index into) in front of every single field read -- and a
+throwaway variant (identical record format, `Vec<u8>` instead of
+`Vec<Vec<u8>>`, deleted after use) isolated that this was the dominant
+cause of the decode regression above, not `subtree_count`: with
+`subtree_count` kept but blocking removed, the throwaway variant showed
+925M cycles on the hashlike decode probe (*fewer* than the plain slab
+`Automaton`'s ~984-996M) and 44.3M on clustered (~4% more than
+`Automaton`'s ~42.5M) -- a small remaining `subtree_count` tax, and the
+blocking tax gone.
+
+**Rebuilding `PackedAutomaton` on a flat `Vec<u8>`, and re-measuring for
+real (not the isolated throwaway).** `blocks: Vec<Vec<u8>>` was removed
+in favor of a plain `bytes: Vec<u8>` (ordinary amortized-growth `Vec`
+reallocation, no capacity cap, no `decompose`); every read/write path
+updated accordingly; `insert`'s algorithm itself unchanged. Full
+`perf stat`, `perf_probe_decode_cost_packed_automaton(_hashlike)` and
+`perf_probe_insert_cost_packed_automaton`, reproduced (3 repeated runs,
+hashlike decode: 1,214-1,222M cycles, tight agreement -- not noise):
+
+| metric | Automaton (slab) | blocked (prior round) | flat (this round) |
+|---|---|---|---|
+| decode cycles, hashlike | ~984-996M | ~1,410M (1.43x) | ~1,217M (1.22x) |
+| decode cycles, clustered | ~42.5M | ~60.3M (1.41x) | ~51.2M (1.20x) |
+| insert cycles, N=160 | 518M | 788M (1.52x) | 667M (1.29x) |
+
+Real, `perf stat`-confirmed improvement on *both* decode and insert
+(roughly 14-15% fewer cycles than the blocked version, on every
+metric) -- but **not** the near-parity-or-better result the isolated
+throwaway suggested. There's an unexplained gap between that
+microbenchmark (925M/44.3M) and this integrated result (~1,217M/51.2M)
+that a `perf record --call-graph fp` check didn't resolve: inlining is
+identical either way (`header`/`read_leb128` fully folded into
+`get`/`last_output_at_most`/`term_at_into`, no separate symbols in
+either version). The most likely remaining explanation is that thin-LTO
+codegen decisions for these hot functions are sensitive to how much
+other code shares the struct/call graph (the real `PackedAutomaton` has
+`insert`/`confirm_frame`/`append_record`/etc. in the same `impl` block
+and many more call sites than the throwaway's one isolated probe), but
+that's not confirmed -- reported as an open discrepancy, not papered
+over with the more flattering number.
+
+Insert-memory bloat is, as expected, **unaffected** by this change --
+still ~20-37x a fresh rebuild's size within 128-200 inserts
+(re-verified, identical numbers to the blocked version) -- because that
+cost comes entirely from every ancestor's `subtree_count` genuinely
+changing on every insert, which no addressing/container scheme removes.
+
+**Where this leaves the byte-packed idea, updated again.** Decode and
+insert speed: both real, `perf stat`-confirmed improvements from
+dropping unrolled blocks, but the mutable version still loses to the
+plain slab `Automaton` on both (~1.2-1.3x more cycles), not a win.
+Insert memory: still the significant, unaddressed open problem --
+unreclaimed dead records under sustained churn make this representation
+unsuitable for the write-heavy role `AutomatonBlock` would need it for.
+Closing that gap would need either (a) periodic in-block compaction (a
+`compile`-style rewrite of just the live reachable records, real added
+complexity, cost not measured here), or (b) genuine reclamation of
+variable-length dead records (the harder problem the original design
+deferred). Neither is implemented. A separate, not-yet-attempted size
+idea also came out of this discussion -- storing `subtree_count`
+out-of-line (a side table `insert` consults, decode never touches) to
+remove its small remaining tax, and/or a hybrid inline-vs-addressed
+transition encoding (inline a child's data directly when it provably
+has one parent, address it only when shared) to shrink the format
+itself -- both real candidates for a further round, neither built or
+measured yet. The read-only prototype's original result (byte-packing
+wins on decode) still stands on its own; the mutable version, even
+after this correction, has not recovered it. Not wired into
+`AutomatonBlock`/`AutomatonDictionary`, `#[allow(dead_code)]`
+throughout, same as before.
+
+## a methodology correction: `perf stat` was counting `compile()` as "decode"
+
+The previous section's flat-buffer numbers were themselves measured
+with a real, previously-unnoticed flaw, caught by asking a good
+question about *why* an earlier isolated throwaway benchmark had come
+in so much faster than the real, integrated `PackedAutomaton`. Every
+"decode" comparison against `PackedAutomaton` this whole investigation
+has used `perf stat -- <test binary> <probe>` -- but `perf stat` counts
+the *entire process*, not just the `Instant`-timed region a probe
+reports in its own wall-clock printout. Every decode probe calls
+`PackedAutomaton::compile(&automaton)` once, before the timed loop, on
+the reasoning that "it's outside the timed region, so it's not being
+measured" -- true for the wall-clock number printed to the console,
+false for the `perf stat` cycle count wrapping the whole run.
+`Automaton`'s own decode probes never pay an equivalent cost (there's
+no separate compile step -- `build_sorted` *is* the queryable
+structure), so this was a one-sided tax: every `PackedAutomaton`-vs-
+`Automaton` decode comparison in this document was actually measuring
+"compile + decode" against "decode alone."
+
+**Isolating it.** Three throwaway setup-only probes (deleted after
+use): "terms + `build_sorted`" alone (`Automaton`'s true setup, no
+compile), "+ real `compile`" (with the `register: HashMap<
+PackedSignature, u32>` bookkeeping `insert` needs), and "+ a no-register
+compile" (a version of `compile` that skips `PackedSignature`
+construction and the register lookup/insert entirely, just a plain
+postorder write memoized by original `StateId`) -- to separate `compile`'s
+own cost from decode's, and to check how much of `compile`'s cost is
+specifically the register:
+
+| probe (hashlike, 20,000 terms) | cycles |
+|---|---|
+| terms + `build_sorted` only | ~320-334M |
+| + real `compile` (with register) | ~652-729M |
+| + no-register compile | ~443M |
+
+So `compile`'s own cost is roughly 320-400M cycles for this corpus, and
+the register specifically accounts for roughly half of that (~440M
+without it vs ~650-730M with it -- a real, substantial, but *one-time,
+compile-time* cost, not a per-query decode cost; it amortizes across
+however many `rank`/`term_at_into` calls happen before the next
+rebuild, and is negligible next to `insert`'s own probe, whose baseline
+is 160 terms, not 20,000).
+
+**The corrected, decode-only picture**, subtracting the matching
+setup-only baseline from each full probe's `perf stat` number:
+
+| corpus | `Automaton` decode-only | `PackedAutomaton` (flat) decode-only | ratio |
+|---|---|---|---|
+| hashlike (20,000 terms, low redundancy) | ~668-675M cycles | ~602-640M cycles | packed ~1.05-1.12x *fewer* |
+| clustered (2,000 terms, high redundancy) | ~40.2M cycles | ~49.1M cycles | packed ~1.22x *more* |
+
+This changes the conclusion, and it's corpus-dependent, not uniform.
+On the low-redundancy corpus, where `compile`'s cost is large relative
+to the rest of the run (many states, little sharing), correcting for it
+flips the result: decode is at parity with, and plausibly a little
+faster than, the plain slab `Automaton` -- consistent with, not
+contradicting, the original read-only prototype's confirmed win. On the
+redundant corpus, `compile` is cheap to begin with (heavy sharing means
+few states to build), so this correction barely moves the number, and
+the ~1.2x decode regression there is real, not a measurement artifact.
+Every earlier "decode regression" figure in this document for the
+*blocked* version (now-deleted code, not re-measured under this
+corrected methodology) is understood to have the same one-sided bias
+and is likely somewhat overstated in magnitude, though not necessarily
+wrong in direction -- not re-verified, since that representation is
+already superseded and not worth resurrecting to re-check.
+
+**Why the isolated throwaway looked so much better in the previous
+section, concretely.** It used a `compile` with no register at all (no
+`PackedSignature`, no `HashMap` bookkeeping), so its one-time setup cost
+was cheaper by construction -- not because its *decode* logic was any
+different from the real, integrated version's (the two are structurally
+identical, and produce byte-identical output, confirmed via matching
+`size_bytes()`). The earlier writeup's "unexplained gap...
+possibly thin-LTO context sensitivity" guess was wrong; the real cause
+was measurement scope, not codegen.
+
+## wiring PackedAutomaton into a real dictionary -- and a surprising result
+
+Everything above measured `PackedAutomaton` in isolation: a bare
+automaton, built once via `compile` or mutated via a tight loop of
+`insert` calls on one never-splitting structure. That's not what
+`AutomatonBlock`/`AutomatonDictionary` actually do with it -- a real
+dictionary splits a block every time it crosses `block_max` (256 by
+default) and rebuilds both halves from scratch. The isolated
+sustained-insert measurement (`measure_packed_automaton_dead_bytes_
+under_sustained_inserts`, 20-37x bloat within 128-200 inserts) never
+let that happen -- it grew one block, unsplit, for up to 2,000 rounds,
+specifically to see what happens without the safety valve a real
+dictionary always has. Whether that safety valve is enough to keep the
+bloat in check in practice was an open question until measured, not
+something to assume either way.
+
+**Built:** `PackedAutomatonBlock`/`PackedAutomatonDictionary`
+(`packed_automaton_block.rs`/`packed_automaton_dictionary.rs`), mirroring
+`AutomatonBlock`/`AutomatonDictionary`'s exact macro structure (lexical
+blocks, sorted-array router, split/merge, `TermId` reverse mapping), a
+fourth `TermDictionary` implementation alongside `PlainDictionary`,
+`Dictionary`, `AutomatonDictionary` (`FrontCodedDictionary` is a fifth,
+unrelated one). Deliberately smaller in scope than `AutomatonDictionary`
+itself (which is already smaller in scope than `Dictionary` -- see its
+own module doc comment): no `PreparedBatch`, no bulk-decode variants
+beyond `get_term_into`. Two real, honest simplifications forced by what
+`PackedAutomaton` doesn't have yet: `decode_into`/`merge_into`'s
+existing-content walk uses `term_at_into` once per rank (root-restart
+every call) instead of an incremental `stream()` (which
+`AutomatonBlock` has via `Automaton::stream` and this doesn't), and
+`remove` -- since `PackedAutomaton` has no incremental removal at all
+-- rebuilds the whole block from scratch over its remaining terms, the
+same full-rebuild shape `Block`'s own fst-backed `remove` already has.
+Both are called out as open costs, not hidden.
+
+Correctness first, as always: added as a fifth dictionary to `tests/
+dictionary.rs`'s existing 400-step randomized insert/remove fuzz
+harness (alongside `Dictionary`, `FrontCodedDictionary`,
+`AutomatonDictionary`, `PlainDictionary` as oracle) across three
+seeds/block-size configurations, plus its own RDF round-trip test. All
+pass, including the `remove`-heavy fuzz runs that specifically exercise
+the full-rebuild path.
+
+**Memory, at real scale (`examples/perf_scale_memory.rs`, now with a
+`packed` kind alongside `automaton`/`fst`) -- the actual result this
+whole prototype was for.** 300,000 terms, both redundancy regimes,
+`bytes/term` at the final checkpoint:
+
+| corpus | `fst` (`Dictionary`) | `Automaton` (`AutomatonDictionary`) | `PackedAutomaton` (this) |
+|---|---|---|---|
+| clustered (high redundancy) | 12.91 | 26.03 | **14.79** |
+| hashlike (low redundancy) | 29.79 | 737.58 | **132.23** |
+
+This is the real, positive result the earlier isolated test's alarm
+didn't predict: under actual split/merge churn, `PackedAutomatonDictionary`
+beats the plain slab `AutomatonDictionary` by **1.76x** on the redundant
+corpus and **5.6x** on the low-redundancy one -- getting close to `fst`
+parity on clustered content, and cutting most (not all) of the gap to
+`fst` on hashlike content. This is exactly the corpus/scale shape of
+the *original* external benchmark that started this entire
+investigation (`AutomatonDictionary` growing to hundreds of bytes/term
+at real scale) -- and the byte-packed representation, wired in for
+real, substantially closes that gap. The isolated test wasn't wrong
+about what it measured (dead bytes do accumulate exactly as described,
+confirmed independently via direct byte inspection in conversation),
+but it measured a scenario -- unbounded single-block growth, no
+splitting ever -- a real dictionary never actually lets happen: a block
+crosses `block_max` and gets rebuilt from scratch well before insert
+churn compounds anywhere near that test's 128-2,000-round range.
+`PackedAutomaton`'s own `estimate`-vs-real gap (visible via
+`AutomatonDictionary`'s existing `packed_estimate` column, which this
+same run prints for the slab side) stays modest throughout -- confirming
+the dead-byte tax from churn-between-splits, while real, is nowhere
+near what the worst-case isolated test implied once bounded by actual
+split cadence.
+
+**Insert speed, at the dictionary level -- a real, newly-visible cost,
+separate from `PackedAutomaton::insert`'s own already-measured one.**
+Wall-clock for the full 300,000-term `insert_batch` run:
+
+| corpus | `Automaton` (`AutomatonDictionary`) | `PackedAutomaton` (this) |
+|---|---|---|
+| clustered | 0.39s | 4.86s (~12x slower) |
+| hashlike | 4.92s | 6.57s (~1.3x slower) |
+
+`PackedAutomaton::insert` itself was separately measured (this
+document, single-automaton probes) at only ~1.29x the slab's cost, not
+12x -- so this gap is coming from somewhere else, and the most likely
+place is the simplification named above: `PackedAutomatonBlock::
+merge_into` decodes a block's *entire existing content* via `term_at_into`
+once per rank (root-restart every call) before it can even determine
+which incoming terms are new, on every merge -- an O(block size *
+depth) cost `AutomatonBlock` avoids entirely via `Automaton::stream`'s
+incremental walk. That cost is *insensitive to content redundancy* (a
+structural walk, not helped by shared states the way `insert` itself
+is), which plausibly explains why the gap is so much larger for the
+highly redundant clustered corpus specifically: the slab's own insert
+gets *faster* from redundancy (more sharing, less real work), while
+`merge_into`'s decode-every-time cost doesn't get any such benefit.
+Not confirmed with a dedicated profile -- a real next step, not
+concluded here from the wall-clock shape alone.
+
+**Where this leaves the byte-packed idea, updated once more.** Memory:
+a genuine, substantial, real-scale win over the plain slab automaton in
+both regimes, closing most of the original external benchmark's gap to
+`fst` -- the strongest positive result this whole investigation has
+produced, and one the single-automaton, single-block measurements
+alone couldn't have shown (it depends on real split cadence). Insert
+speed at the dictionary level: a new, real cost, distinct from and
+larger than the already-measured `PackedAutomaton::insert` regression,
+traced (not yet confirmed) to the missing incremental block-decode
+walk. Decode: unaffected by any of this, still the corpus-dependent
+picture from the methodology-correction section above. Remove: full
+block rebuild, an accepted, honest limitation. Net: this is the first
+point in the whole investigation where the byte-packed representation
+looks like a real net positive on the axis (memory, at scale) the
+original problem was actually about -- with a now-quantified, not yet
+closed, follow-on cost (dictionary-level insert speed) as the next
+thing to fix if this is worth carrying further.
+
+## a traditional (direct) build algorithm for PackedAutomaton
+
+Every `PackedAutomaton` built so far -- in every measurement in this
+document -- went through `compile(&Automaton::build_sorted(..))`: build
+a full `Automaton` slab (every `State`, every `TransitionChunk`, the
+slab's own register), then walk it postorder into packed bytes, then
+throw the slab away. That's real, measured waste for a structure that's
+never queried in slab form at all -- worth fixing directly rather than
+accepting as the only way to get a `PackedAutomaton` from a term list.
+
+Added `PackedAutomaton::build_sorted`, the same sorted-input
+specialization of Daciuk/Mihov/Watson/Watson 2000 `Automaton::build_sorted`
+already implements (rightmost path as a stack of unconfirmed frames,
+confirm everything deeper than the common-prefix length with the
+previous word), but writing packed records directly -- no slab at all.
+It reuses `insert`'s own per-frame machinery unchanged (`StagingFrame`,
+`confirm_frame`, `write_confirmed_state`): sorted construction only
+changes how frames are opened and closed (append-only children, since a
+diverging byte at any depth is always greater than any sibling already
+there -- the same guarantee `Automaton::build_sorted`'s own
+`link_new_appending` relies on, vs. `insert`'s general
+`binary_search_by_key` splice), never how one frame gets confirmed once
+ready.
+
+**Correctness first.** Two new differential tests:
+`packed_automaton_build_sorted_matches_compile_from_automaton` (2,000
+clustered terms -- identical `size_bytes`, `reachable_state_count`, and
+every `rank`/`term_at_into` answer against the old
+compile-from-`Automaton` route) and
+`packed_automaton_build_sorted_matches_incremental_insert` (320 terms,
+`build_sorted` directly vs. one-at-a-time `insert` from empty -- same
+reachable structure either way). Both pass, plus the full existing
+suite (108 tests) unaffected.
+
+**Build speed, `perf stat`-confirmed, isolated per-variant (not summed
+across both in one probe):**
+
+| corpus | via `Automaton::build_sorted` + `compile` | `build_sorted` (direct) | speedup |
+|---|---|---|---|
+| clustered (2,000 terms) | 813.7µs / 3.40M cycles | 378.1µs / 3.03M cycles | 2.15x wall, 1.12x cycles |
+| hashlike (20,000 terms) | 257.8ms / 695.3M cycles | 144.4ms / 370.2M cycles | 1.79x wall, 1.88x cycles |
+
+A real, substantial build-speed win in both regimes, exactly where
+expected: skipping the intermediate slab construction entirely rather
+than paying for it and discarding it.
+
+**Wired in:** `PackedAutomatonBlock::build` (every block construction --
+bootstrap, split, merge, and now also `remove`'s full-rebuild path) uses
+`PackedAutomaton::build_sorted` directly instead of routing through
+`Automaton`. Re-running `examples/perf_scale_memory.rs` at the same
+300,000-term scale as the dictionary-level section above: memory is
+byte-identical (14.79/132.23 bytes/term, unchanged, as the differential
+tests already guaranteed), and hashlike `insert_batch` wall-clock
+dropped from 6.57s to 4.90s (~1.34x faster) -- `bootstrap` (the initial
+large batch, many `PackedAutomatonBlock::build` calls in a row) is a
+real fraction of hashlike's total cost. Clustered `insert_batch`
+wall-clock was essentially unchanged (4.86s vs. 4.85s), which is itself
+informative: it confirms the earlier hypothesis that the dictionary-level
+insert-speed gap is dominated by `merge_into`'s missing incremental
+decode walk, not by block construction cost -- speeding up `build`
+alone barely moves a number that construction was never the bottleneck
+for. That gap remains open, unaffected by this change, and is still the
+next thing to fix if dictionary-level insert speed matters for this
+representation's viability.
+
+## an incremental stream, to close the merge_into gap
+
+`PackedAutomatonBlock::decode_into`/`merge_into` were built, deliberately,
+using `term_at_into` once per rank (root-restart every call) because
+`PackedAutomaton` had no incremental walk -- `AutomatonBlock` has one via
+`Automaton::stream`. Added `PackedAutomaton::stream`/`PackedTermsStream`,
+the same technique, over the packed byte buffer: each `PackedStreamFrame`
+caches its own parse cursor (the byte offset of its next unvisited
+transition), advanced by one transition per `next()` call, so a state's
+transitions are each parsed exactly once total across a whole walk --
+`Transitions::at`'s O(1) re-derivation (fine for a small typed array)
+isn't available for a variable-length packed record, so the cursor cache
+is what makes this genuinely amortized rather than a naive port.
+
+**Correctness first**: two new differential tests
+(`packed_stream_matches_term_at_into_for_every_rank`,
+`packed_stream_backtracks_correctly_across_shared_and_diverging_prefixes`)
+pass, plus the full suite (110 tests) including the `remove`-heavy fuzz
+runs that exercise `decode_into`/`merge_into` continuously. Wired into
+`decode_into`, `merge_into`'s existing-content walk, and `remove`'s
+full-decode, replacing every `term_at_into`-per-rank loop in
+`packed_automaton_block.rs`.
+
+**Isolated at the block level** (same probe shape as `automaton_block.rs`'s
+own `perf_probe_merge_into_single_term_automaton_vs_block`, now with a
+`PackedAutomatonBlock` column): this alone *reversed* the block-level
+comparison -- `PackedAutomatonBlock::merge_into` went from something not
+directly measured before to 62.2-67.2µs/op, *faster* than
+`AutomatonBlock::merge_into`'s 84.0µs/op (both still slower than
+`Block`'s full fst rebuild at this specific, deliberately-unbounded,
+never-split growing-block shape -- see that probe's own comment on why
+it's not representative of a real, split-bounded workload).
+
+**But the dictionary-level gap barely moved at first** (4.85s -> 4.56s
+for the 300,000-term clustered `insert_batch` benchmark, far short of
+what the block-level reversal predicted) -- a real, measured result that
+didn't match the hypothesis, worth chasing rather than declaring victory
+on the block-level number alone. A `perf record` profile of the actual
+dictionary-scale run found why: **`hash_one::<&PackedSignature>` plus
+`SipHash`'s own `write`, combined, close to 40% of all cycles** --
+`PackedAutomaton`'s `register: HashMap<PackedSignature, u32>` was built
+with plain `HashMap::new()`, silently defaulting to std's `SipHash`.
+`Automaton`'s own slab register already solved exactly this problem,
+years earlier in this project's history (`FxHasher`, a fast
+non-cryptographic hash, documented at length in its own doc comment
+specifically because a `perf record` profile of `build_sorted` found the
+same cost dominant then) -- `PackedAutomaton`'s register was simply never
+switched to it. Fixed by reusing `FxHasher` directly (`type
+PackedRegister = HashMap<PackedSignature, u32,
+BuildHasherDefault<FxHasher>>`), the exact type alias pattern `Register`
+already established.
+
+That alone dropped clustered to ~3.15s and hashlike to ~3.82s (both
+`perf stat`-confirmed, not just wall-clock). Two more precedented,
+low-risk fixes followed from continuing to profile rather than stopping
+at the first win: `write_confirmed_state` built a fresh
+`PackedSignature { transitions: children.to_vec(), .. }` on *every*
+register lookup, the overwhelming majority of which are hits that
+immediately discard that allocation -- exactly the pattern `Signature`/
+`signature_of_into` already fixed for the slab register via a reused
+scratch buffer (`sig_scratch`, reclaimed out of a dropped signature on a
+hit instead of let it deallocate); and `compile`/`build_sorted` now
+reserve the register's capacity upfront (`automaton.len()`/`terms.len()`
+as a cheap-to-compute hint) instead of growing it one `insert` at a time.
+
+**A methodology mistake caught mid-investigation, worth recording
+plainly**: after applying the last two fixes, a re-profile of the
+dictionary-scale run still showed `reserve_rehash` essentially unchanged
+(~13% either way) -- initially read as "these two fixes didn't help."
+The actual cause: `perf record` was pointed at `target/profiling/examples/
+perf_scale_memory`, which had not been rebuilt since *before* the
+scratch-buffer/capacity fixes landed (confirmed via `md5sum` once asked
+directly whether the binary had actually been rebuilt) -- so that profile
+was silently re-measuring old code. Rebuilding and re-profiling is the
+only way any of these numbers are trustworthy; skipping that step
+produced a specific, wrong conclusion, not just a stale one, and would
+have gone unnoticed without the check.
+
+**Final, verified-fresh numbers** (`perf stat`, 300,000 terms, matching
+the earlier dictionary-level section's methodology exactly):
+
+| corpus | `Automaton` (`AutomatonDictionary`) | `PackedAutomaton` (this) | ratio |
+|---|---|---|---|
+| clustered | 1.455B cycles (0.39s) | 9.070B cycles (3.86s) | packed 6.2x *more* |
+| hashlike | 18.102B cycles (4.99s) | 12.563B cycles (4.64s) | packed 1.44x *fewer* |
+
+Hashlike now genuinely beats the plain slab automaton at the dictionary
+level -- a real, new result, not just parity. Clustered improved
+substantially from where this section started (the original wall-clock
+gap was ~12x; cycles now show ~6.2x) but the gap is **not closed**: a
+`perf record` profile after all four fixes still shows `confirm_frame`
+(~20%) and `reserve_rehash`/`cfree`/`malloc`/`HashMap::insert` (~12%,
+~10%, ~4%, ~6% respectively) as the dominant costs, meaning real
+allocation/rehashing churn remains, just reduced rather than eliminated.
+Why the capacity-hint reservation doesn't fully close it is itself not
+fully understood -- a direct check found a representative 256-term
+clustered block only needs ~91 reachable states (`reachable_state_count()
+/ len() ≈ 0.36`), so `terms.len()` as a capacity hint should
+over-provision, not under-provision, for a single `build_sorted` call;
+the remaining rehashing more likely comes from `merge_into`'s repeated
+per-term `insert()` calls into an *already-built* block, which never
+reserve anything themselves, but this hasn't been confirmed with a
+dedicated profile isolating build from insert at realistic block sizes,
+so it's reported as the leading hypothesis, not a settled conclusion.
+Further work here (pre-reserving before a run of `insert` calls in
+`merge_into`, or restructuring the register/signature scheme entirely)
+is real, open, and not attempted in this pass.
+
+## the real cause, found by asking two sharp questions instead of accepting the numbers
+
+Two things about the section above didn't add up on inspection: (1) if
+`FxHasher`, scratch-buffer reuse, and capacity reservation are all real
+fixes, why does `Automaton`'s own register -- built the same way, same
+hasher, comparable signature size -- not show the same `reserve_rehash`
+cost in its own profile? (2) it makes no sense for *more* register hits
+(clustered, heavily shared content) to make `PackedAutomaton` *worse*
+relative to `Automaton` -- a hit is the cheap case (see the confirm-step
+comparison two sections up: a hit just drops a temporary `Vec`, nothing
+written). Chasing both found the real cause, and it isn't in the register
+at all.
+
+**Automaton's own register, profiled the same way** (`perf record` on
+`automaton clustered` at the same 300,000-term scale): no `reserve_rehash`
+in the top costs. The profile instead shows `HashMap::get` (11.4%, the
+lookup itself), `insert_sorted` (8.3%), `release` (8.0%), `confirm_path`
+(8.0%), `Transitions::at`/`TermsStream::next` (the decode-walk side).
+Real hashing and lookup work, no resize churn -- a genuine difference
+from `PackedAutomaton`'s profile, not a measurement artifact repeated on
+both sides.
+
+**A real benchmark asymmetry, found and fixed**: `examples/
+perf_scale_memory.rs`'s `"automaton"` branch called `dict.
+estimate_packed_bytes()` -- a full O(reachable states) diagnostic walk
+across every block -- on *every checkpoint*, something the `"packed"`
+and `"fst"` branches never did. This call predates `PackedAutomatonDictionary`
+existing at all (it was a *hypothetical* size estimate, back when
+nothing could measure the real thing); now that a real packed dictionary
+exists to measure directly, the estimate is redundant, and it was
+quietly inflating `Automaton`'s measured time in every earlier comparison
+in this section. Removed. Re-measured: clustered barely changed (1.455B
+-> 1.381B cycles, clustered's automaton has few states, cheap to walk)
+but **hashlike dropped 27%** (18.102B -> 13.183B cycles -- hashlike's
+automaton has vastly more states, per its own much worse bytes/term, so
+walking all of them every checkpoint was real, substantial, uncounted
+work). The "hashlike now beats Automaton" result two sections up was
+correspondingly inflated by this asymmetry, not fabricated but
+overstated -- see the corrected table below.
+
+**The actual cause of "more hits is worse," found by reading
+`Automaton::insert_sorted` next to `PackedAutomatonBlock::merge_into`
+side by side**: `Automaton::insert_sorted` keeps `path: Vec<(StateId,
+u8)>` *outside* its per-term loop and, for each incoming term, calls
+`confirm_path(..., common_prefix_len(last_word, word) + 1, ...)` --
+only the states *deeper* than the shared prefix with the *previous*
+term get re-walked and re-confirmed; a long shared prefix across many
+consecutive sorted terms is walked and confirmed once, not once per
+term. `PackedAutomatonBlock::merge_into`, by contrast, still does `for
+&term in &incoming { self.packed.insert(term); }` -- `PackedAutomaton::
+insert` has no memory of the previous call, so it rebuilds `path: Vec<u32>
+= vec![self.root]` and walks from the root fresh, every single term.
+For a batch of terms sharing a long prefix (exactly what "more hits"
+means), this redoes the *entire shared prefix's* walk-and-confirm work
+once per term instead of once per batch -- an O(terms x shared-depth)
+cost where `Automaton`'s own batch algorithm is closer to O(unique
+states touched). This is why redundancy makes it *worse*, not better:
+redundancy is exactly what a real batch algorithm turns into savings,
+and what a term-at-a-time loop turns into repeated, wasted work instead.
+None of the register-level fixes above (hasher, scratch buffer, capacity
+hint) touch this -- they reduced the *cost per confirm*, not the *number
+of redundant confirms*, which is the actual, larger problem.
+
+**Corrected, fair comparison** (fixed benchmark, `perf stat`, 300,000
+terms):
+
+| corpus | `Automaton` | `PackedAutomaton` | ratio |
+|---|---|---|---|
+| clustered | 1.381B cycles (0.61s) | 9.070B cycles (3.86s) | packed 6.6x *more* |
+| hashlike | 13.183B cycles (5.98s) | 12.563B cycles (4.64s) | packed 1.05x *fewer* (~parity) |
+
+The hashlike "win" from the previous section shrinks from 1.44x to
+essentially parity once the benchmark asymmetry is removed -- still not
+a loss, but not the clear win previously reported either. Clustered's
+gap got slightly *larger* (6.2x -> 6.6x) now that `Automaton`'s number
+isn't artificially inflated. Given the root cause identified above is
+algorithmic (missing batch sharing in `merge_into`), not something the
+register-level fixes could reach, a real `PackedAutomaton::insert_sorted`
+-- `insert_sorted`'s exact persistent-path, confirm-on-divergence
+technique, targeting the packed representation the same way
+`PackedAutomaton::build_sorted` already does for the from-scratch case
+-- is the next real fix, not yet attempted. `PackedAutomatonBlock::
+merge_into` would call it once per batch instead of looping single-term
+`insert`, the same way `AutomatonBlock::merge_into` already calls
+`insert_sorted` instead of looping `Automaton::insert`.
+
+## PackedAutomaton::insert_sorted, and the gap actually closes
+
+Built exactly that: `PackedAutomaton::insert_sorted`, `Automaton::
+insert_sorted`'s persistent-rightmost-path technique targeting the
+packed representation, the same way `build_sorted` already targets it
+for from-scratch construction. `frames`/`path_bytes`/`last_word` are now
+carried *across* the whole incoming batch; between consecutive terms,
+`confirm_down_to` only re-confirms frames deeper than `common_prefix_len
+(last_word, word) + 1`, and matching continues from `common` by reading
+`frames.last().children` (a binary search) rather than restarting from
+`self.root`. No clone-if-shared/generation bookkeeping is needed, unlike
+the slab's own `insert_sorted`: every frame on the path is already a
+private, in-memory `StagingFrame`, never a live reference other content
+could alias -- the same reason plain `insert` never needed it either.
+
+One real correctness fix fell out of building this: `confirm_down_to`
+(shared with `build_sorted`) used to splice a resolved child into its
+parent with a blind `push`, safe only because `build_sorted`'s frames
+are always freshly created (a diverging byte is always greater than
+every existing sibling). `insert_sorted` reuses the same helper to
+re-confirm frames opened from *pre-existing* structure, where the byte
+being spliced back may already have an entry -- a blind `push` there
+would silently duplicate it. Fixed by switching to the same
+`binary_search_by_key`-based update-or-insert `insert` already uses,
+harmless for `build_sorted` (a no-op search that always misses at the
+end) and correctness-critical for `insert_sorted`.
+
+**Correctness first**: two new differential tests
+(`packed_automaton_insert_sorted_matches_build_sorted`;
+`packed_automaton_insert_sorted_matches_automaton_insert_sorted`, a
+mixed batch of re-insertions and brand-new terms against an
+already-populated baseline, checked against both `Automaton::
+insert_sorted` and a fresh rebuild's `reachable_state_count`) pass,
+alongside the full suite (112 tests) including the 400-step fuzz runs
+that exercise `merge_into`'s new call path continuously.
+
+Wired into `PackedAutomatonBlock::merge_into`, replacing the `for &term
+in &incoming { self.packed.insert(term); }` loop with one
+`self.packed.insert_sorted(incoming.iter().copied())` call.
+
+**The result, `perf stat`-confirmed, reproduced**:
+
+| corpus | `Automaton` | `PackedAutomaton` (naive loop) | `PackedAutomaton` (`insert_sorted`) |
+|---|---|---|---|
+| clustered | 1.381B cycles (0.61s) | 9.070B cycles (3.86s) | **0.84-0.87B cycles (0.39-0.41s)** |
+| hashlike | 13.183B cycles (5.98s) | 12.563B cycles (4.64s) | **7.79-7.99B cycles (3.62-3.72s)** |
+
+`PackedAutomatonDictionary` now beats `AutomatonDictionary` on insert
+speed in **both** regimes -- clustered by ~1.6x fewer cycles (a 10.8x
+improvement over the naive loop), hashlike by ~1.7x fewer cycles (a
+1.6x improvement over the naive loop). This directly confirms the
+diagnosis: the naive per-term loop's cost was dominated by redundant
+re-confirmation of shared prefixes, not by anything inherent to the
+register/hasher/allocation layer those earlier fixes targeted --
+removing the redundancy at the algorithm level did far more than any of
+those lower-level fixes individually, and this is the first point in
+the whole investigation where the byte-packed representation wins on
+speed as well as memory, in both tested regimes, not a tradeoff between
+them.
+
+A bonus, not the point of this change but worth recording: memory
+improved too. Hashlike dropped from 132.2 to ~104.2 bytes/term (~21%
+smaller); clustered was already good and stayed flat (~14.7-14.8).
+Makes sense in hindsight -- the naive loop's redundant re-confirmation
+of a shared prefix didn't just cost cycles, each redundant re-confirm
+also wrote (or, on a lucky register hit, at least *attempted*) a fresh
+record, so cutting the redundancy cuts dead-record accumulation too,
+not just the CPU time spent producing it.
+
+## decode_ranks_into, ported and wired through
+
+`Automaton::decode_ranks_into` (a recursive descent that partitions a
+sorted batch of requested ranks against each state's own transitions,
+visiting a state only when some target actually falls in its range --
+`AutomatonDictionary::get_terms_seeked_into`'s own primitive) had no
+`PackedAutomaton` counterpart. Ported directly: `PackedAutomaton::
+decode_ranks_into`/`decode_batch` mirror the slab algorithm exactly,
+with one real adaptation -- `Transitions::at(idx)` re-derives any index
+in O(1) for the slab's small typed array, but a packed record has no
+such re-entry point, so a one-transition lookahead cache (`next`) parses
+transition `idx + 1` once, when it's peeked for the sibling boundary,
+and reuses that parse as `current` on the following iteration, keeping
+this a single sequential pass over the record either way (same
+reasoning as `PackedTermsStream`'s own cursor caching).
+
+Two differential tests, mirroring `Automaton`'s own exactly (every rank
+in one batch with decorrelated output positions; several widely
+separated rank clusters plus a duplicate, the shape that broke an
+earlier seek-then-crawl design) -- both pass. Wired all the way through:
+`PackedAutomatonBlock::decode_sorted_ranks_into` and
+`PackedAutomatonDictionary::get_terms_seeked_into`, mirroring
+`AutomatonBlock`/`AutomatonDictionary`'s own exactly, with their own
+differential tests. Full suite: 117 tests, clippy clean. Not yet
+measured against `get_terms_into`/`get_terms_scattered_into`-equivalent
+approaches the way `s-bench`'s `dict_bench` measures the slab's three
+strategies against each other -- `PackedAutomatonDictionary` only has
+this one bulk-decode path so far, so there's nothing to compare it
+against yet within this crate.
+
+## decode_ranks_into, measured
+
+Four new perf probes (`perf_probe_decode_ranks_cost_{automaton,
+packed_automaton}_{clustered,hashlike}`), a "seeked" query shape --
+several small (5-rank) clusters scattered across the term set with
+large, deliberately awkward gaps between them, the shape `decode_ranks_
+into`/`get_terms_seeked_into` actually exist for, not "every rank in
+order" (already covered separately by `stream`). First attempt used the
+same `DECODE_PROBE_REPEATS = 20` every other decode probe uses and
+produced untrustworthy numbers -- the actual decode work (200 targets,
+20 reps) finished in ~0.2ms, far too small relative to process startup
+for `perf stat` to attribute meaningfully; bumped to a dedicated
+`DECODE_RANKS_PROBE_REPEATS = 2000` for these four probes specifically,
+landing the measured work at 22-88ms, comparable to the other decode
+probes' magnitude.
+
+`Automaton`'s own numbers need no correction (no separate compile step);
+`PackedAutomaton`'s do, same methodology as every other packed decode
+comparison in this document -- subtracting `perf_probe_setup_only_
+clustered`/`_hashlike`'s `build + compile` baseline from the full probe:
+
+| corpus | `Automaton` (cycles) | `PackedAutomaton`, decode-only (cycles) | ratio |
+|---|---|---|---|
+| clustered | 89.87M | ~83.4M (86.7-87.1M full - 3.47M setup) | packed ~1.08x fewer |
+| hashlike | 679.30M | ~304.9M (911-938M full - ~619M setup) | packed ~2.23x fewer |
+
+`PackedAutomaton::decode_ranks_into` is faster than `Automaton`'s own in
+both regimes -- roughly at parity for clustered, a real 2.2x win for
+hashlike. Consistent with every other *decode-only* (compile excluded)
+comparison already made in this document (`rank`/`term_at_into`, and now
+this batch primitive): the byte-packed layout's decode advantage holds
+across every decode operation measured so far, not just the two
+originally checked.
+
+## the real RDF finding: states/term itself grows, and it's boundary-sensitive
+
+An external experiment wired both dictionaries into a real RDF parser
+over a real large file, reproducing the original memory-scaling problem
+this whole investigation started from -- and found `PackedAutomatonDictionary`
+mitigates it (19-28% less retained memory than `AutomatonDictionary` at
+both 524K and 4.58M distinct terms, slower growth: `size_bytes()` +69%
+vs. automaton's +146% over that range) but doesn't fix it: both still
+grow super-linearly while `Dictionary` (fst) stays flat.
+
+**First lead, real but secondary.** `release()` (`src/micro_fst.rs:2379`)
+explicitly removes a state's `Signature` from `Automaton`'s register the
+moment its refcount hits zero -- the register only ever holds entries
+for currently-reachable states, matching `size_bytes()`'s own scope.
+`PackedAutomaton`'s register has no equivalent: `write_confirmed_state`
+only ever `insert`s, by design (no refcounting at all, a deliberate
+simplification from when `PackedAutomaton` was first built) -- so it
+tracks *every* state signature ever confirmed for that automaton's
+whole lifetime, live or dead, each one a separate heap-allocated
+`Vec`, entirely invisible to `size_bytes()` (which only sums
+`self.bytes.len()`). This explains why packed's retained-vs-`size_bytes()`
+gap is much wider than automaton's (a ~68-point spread vs. an ~11-point
+one, in the reported numbers) -- a real, previously unmeasured cost.
+But it's secondary: it explains why *packed's* overhead is worse than
+*automaton's*, not why *both* grow super-linearly while `fst` doesn't,
+since `PackedAutomaton`'s bytes are a direct serialization of the same
+minimal DAG `Automaton` itself computes.
+
+**Reframing the question.** If packed's structure is `Automaton`'s own
+DAG serialized, the shared root cause has to be upstream of both --
+either the true *state count per term* is growing with corpus scale (a
+property of minimization/content, which `fst` would share too, just
+hidden by its much smaller per-state byte cost), or state count is flat
+and something else is amplifying an invisible trend into a visible one.
+`reachable_state_count()` (on `Automaton` and `PackedAutomaton`) already
+existed for tests; un-gated from `#[cfg(test)]` and given real
+counterparts: `Block::reachable_state_count()` (walks `fst::raw::Fst`'s
+own node graph via `Node::transitions`/`CompiledAddr` -- public API, no
+vendored-crate changes needed) and `Dictionary::reachable_state_count()`,
+plus the matching `AutomatonBlock`/`AutomatonDictionary`/
+`PackedAutomatonBlock`/`PackedAutomatonDictionary` wrappers. Wired into
+`examples/perf_scale_memory.rs` as a `states`/`states/term` column
+alongside the existing bytes ones.
+
+**First result, at 2,000,000 clustered terms:** all three start
+*exactly equal* (24,650 states at 200K terms) and diverge from there.
+By 2M terms, `fst` has 256,937 states vs. automaton/packed's 366,962
+for the identical term set -- **43% more**, and `PackedAutomaton` tracks
+`Automaton` state-for-state throughout (as expected -- same DAG). So
+it's real: state count itself is growing faster for our own
+minimization than for `fst`'s, not just per-state byte cost.
+
+**Isolating which content pattern is responsible**
+(`namespace_clustered_terms_range` interleaves four different suffix
+shapes): built a throwaway diagnostic driving each pattern alone
+through `AutomatonDictionary`/`Dictionary` at increasing scale.
+Decimal-digit suffixes diverge badly -- unpadded entity/property ids up
+to **+56.7%** by 500K terms, fixed-width zero-padded isbn up to
+**+30.1%** -- while hex blank-node ids (also digit-suffixed, also
+unpadded) stay under **+3%**. `fst`'s states/term is essentially flat
+for both decimal patterns (0.1794, 0.1031, unmoving) but *does* drift a
+little for hex (+7%) -- the opposite direction from automaton's own
+pattern. This points at base-10 digit branching specifically.
+
+**Four decisive, isolating experiments**, using new `#[doc(hidden)]`
+`__internal_bench` primitives (`build_automaton_states`,
+`build_fst_states`, `incremental_insert_sorted_rounds_states` --
+kept, low-cost, useful for any follow-on): all built and run on
+consecutive, zero-padded 13-digit isbn-shaped strings, isolating one
+candidate mechanism at a time.
+
+1. *One global, unbounded automaton over 0..200,000* (no blocks at
+   all): automaton = fst = 14 states. Zero divergence -- a single
+   regular counting sequence compresses identically either way.
+2. *2,000 independent, cleanly-aligned 256-term slices* (built
+   directly, bypassing the dictionary/router entirely, at every offset
+   from 0 to 512,000): automaton = fst at every single one. Zero
+   divergence -- clean block boundaries alone don't cause it.
+3. *Multi-round incremental `insert_sorted`* (10 separate rounds into
+   one never-split automaton) vs. one-shot `build_sorted` over the
+   identical final term set: 14 states either way. Zero divergence --
+   incremental insertion doesn't drift away from minimality on its own.
+4. *The real `AutomatonDictionary`/`Dictionary`, same 100,000-term
+   corpus, `insert_batch` chunk size varied* (64 up to the full
+   corpus in one call): divergence tracks chunk size almost exactly --
+   **0%** when chunk size equals `block_max` (256) or the whole corpus
+   arrives in one bootstrap call (both give the same 391, cleanly-cut
+   blocks), up to **+83%** at chunk=4096 (585-736 blocks, each boundary
+   chosen by `split()`'s repeated median-halving of an oversized
+   block). `fst`'s own state count stays almost flat across every
+   chunk size (6898-6955, aside from two much-smaller-chunk outliers);
+   automaton's swings from 6,955 to 13,585 -- **nearly 2x** -- for the
+   *same final term set*, cut differently.
+
+**Conclusion, narrowed and now mechanistically explained**: this isn't
+block partitioning, isn't incremental-insertion drift, and isn't
+inherent to digit sequences in general -- it's specifically that
+`Automaton`'s minimization is *sensitive to exactly where a block
+boundary falls* for regular digit sequences, in a way `fst`'s is not.
+`fst` gives close to the same total state count regardless of cut
+position; ours varies sharply. `split()`'s median-halving of an
+overflowing block (not `bootstrap`'s round, evenly-divided chunking) is
+what produces the boundary positions that trigger it.
+
+## why: output-pushing, not registry completeness
+
+Reading `fst`'s own vendored source (`vendor/fst`) and the literature
+both implementations draw from resolved the mechanism -- written up in
+full, with code and paper citations, in `AUTOMATON_REFERENCE.md`. Short
+version: `fst`'s registry (`vendor/fst/src/raw/registry.rs`) is a
+*bounded, lossy* LRU cache -- `fst`'s own doc comment says outright
+(`vendor/fst/src/raw/mod.rs:226-238`) that it does not guarantee a
+minimal transducer, trading exactness for constant memory. `s-dict`'s
+own `Register` (`micro_fst.rs:489`) is the opposite: an *unbounded,
+exhaustive* `HashMap`, strictly more thorough at finding exact matches.
+`fst` still wins on state count, because it's searching a *larger space
+of what counts as a match*: `fst`'s `Builder` implements Mihov &
+Maurel's output-pushing (`vendor/fst/src/raw/build.rs:406-453`, a
+min-plus-semiring `Output::prefix`/`sub`/`cat` algebra,
+`vendor/fst/src/raw/mod.rs:1276-1322`) -- a transition's output value is
+*renegotiated*, not fixed, as later siblings arrive, so two subtrees
+with the same shape but different absolute rank offsets become
+byte-identical once the common offset is factored out. `s-dict`'s
+`Automaton` computes each state's children's outputs as a one-shot
+prefix sum at confirmation time (`finalize_outputs_and_count`,
+`micro_fst.rs:2604-2630`) and never revisits them. An exhaustive search
+over the narrower ("raw values must already match") space loses to a
+lossy search over the wider ("match after renegotiation") space, because
+the wider space contains merges the narrower one can never find no
+matter how exhaustively it looks -- and a `split()`-produced boundary,
+an arbitrary slice of a regular sequence with no reason to already have
+aligned raw output values, is exactly the case that needs the
+renegotiation to expose its shared structure.
+
+Not yet done: isolating output-pushing's contribution from the
+registry-boundedness difference (they differ simultaneously here), or
+attempting to add output-pushing to `Automaton`/`PackedAutomaton` --
+`AUTOMATON_REFERENCE.md`'s §5 has the specific next experiments this
+would need, not attempted in this pass.

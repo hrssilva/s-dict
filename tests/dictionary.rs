@@ -16,7 +16,8 @@
 //! isolated, block-level-only differential tests.
 
 use s_dict::{
-    AutomatonDictionary, Dictionary, FrontCodedDictionary, PlainDictionary, TermDictionary, TermId,
+    AutomatonDictionary, Dictionary, FrontCodedDictionary, PackedAutomatonDictionary,
+    PlainDictionary, TermDictionary, TermId,
 };
 
 /// A small deterministic xorshift64* PRNG, avoiding a `rand` dependency for
@@ -87,6 +88,7 @@ fn run_fuzz(seed: u64, block_min: usize, block_max: usize, steps: usize) {
     let mut fst_blocked = Dictionary::with_block_bounds(block_min, block_max);
     let mut front_coded = FrontCodedDictionary::with_block_bounds(block_min, block_max);
     let mut automaton_blocked = AutomatonDictionary::with_block_bounds(block_min, block_max);
+    let mut packed_automaton = PackedAutomatonDictionary::with_block_bounds(block_min, block_max);
     let mut present: std::collections::HashSet<String> = std::collections::HashSet::new();
 
     for step in 0..steps {
@@ -104,6 +106,7 @@ fn run_fuzz(seed: u64, block_min: usize, block_max: usize, steps: usize) {
             let b = fst_blocked.insert(term);
             let c = front_coded.insert(term);
             let d = automaton_blocked.insert(term);
+            let e = packed_automaton.insert(term);
             assert_eq!(a, b, "step {step}: id diverged inserting {term:?} (fst)");
             assert_eq!(
                 a, c,
@@ -113,12 +116,17 @@ fn run_fuzz(seed: u64, block_min: usize, block_max: usize, steps: usize) {
                 a, d,
                 "step {step}: id diverged inserting {term:?} (automaton)"
             );
+            assert_eq!(
+                a, e,
+                "step {step}: id diverged inserting {term:?} (packed automaton)"
+            );
             present.insert(term.clone());
         } else {
             let a = plain.remove(term);
             let b = fst_blocked.remove(term);
             let c = front_coded.remove(term);
             let d = automaton_blocked.remove(term);
+            let e = packed_automaton.remove(term);
             assert_eq!(a, b, "step {step}: id diverged removing {term:?} (fst)");
             assert_eq!(
                 a, c,
@@ -127,6 +135,10 @@ fn run_fuzz(seed: u64, block_min: usize, block_max: usize, steps: usize) {
             assert_eq!(
                 a, d,
                 "step {step}: id diverged removing {term:?} (automaton)"
+            );
+            assert_eq!(
+                a, e,
+                "step {step}: id diverged removing {term:?} (packed automaton)"
             );
             present.remove(term.as_str());
         }
@@ -149,14 +161,24 @@ fn run_fuzz(seed: u64, block_min: usize, block_max: usize, steps: usize) {
             automaton_blocked.len(),
             "step {step}: length diverged (automaton)"
         );
+        assert_eq!(
+            plain.len(),
+            packed_automaton.len(),
+            "step {step}: length diverged (packed automaton)"
+        );
         for t in &present {
             let a: Option<TermId> = plain.get_id(t);
             let b: Option<TermId> = fst_blocked.get_id(t);
             let c: Option<TermId> = front_coded.get_id(t);
             let d: Option<TermId> = automaton_blocked.get_id(t);
+            let e: Option<TermId> = packed_automaton.get_id(t);
             assert_eq!(a, b, "step {step}: get_id diverged for {t:?} (fst)");
             assert_eq!(a, c, "step {step}: get_id diverged for {t:?} (front-coded)");
             assert_eq!(a, d, "step {step}: get_id diverged for {t:?} (automaton)");
+            assert_eq!(
+                a, e,
+                "step {step}: get_id diverged for {t:?} (packed automaton)"
+            );
             assert_eq!(
                 plain.get_term(a.unwrap()).as_deref(),
                 fst_blocked.get_term(b.unwrap()).as_deref(),
@@ -171,6 +193,11 @@ fn run_fuzz(seed: u64, block_min: usize, block_max: usize, steps: usize) {
                 plain.get_term(a.unwrap()).as_deref(),
                 automaton_blocked.get_term(d.unwrap()).as_deref(),
                 "step {step}: get_term diverged for {t:?} (automaton)"
+            );
+            assert_eq!(
+                plain.get_term(a.unwrap()).as_deref(),
+                packed_automaton.get_term(e.unwrap()).as_deref(),
+                "step {step}: get_term diverged for {t:?} (packed automaton)"
             );
         }
     }
@@ -260,6 +287,48 @@ fn automaton_dictionary_round_trips_real_rdf_terms() {
     // insert_batch: same terms, fresh dictionary, one call instead of
     // sequential inserts -- exercises insert_ordered/bootstrap directly.
     let mut batch_dict = AutomatonDictionary::with_block_bounds(4, 16);
+    let batch_ids = batch_dict.insert_batch(&terms);
+    for (term, &id) in terms.iter().zip(&batch_ids) {
+        assert_eq!(batch_dict.get_id(term), Some(id));
+        assert_eq!(batch_dict.get_term(id).as_deref(), Some(*term));
+    }
+}
+
+/// Same round-trip as `automaton_dictionary_round_trips_real_rdf_terms`,
+/// through `PackedAutomatonDictionary` instead -- including a `remove`
+/// (which, unlike `AutomatonBlock`'s O(1) removal, rebuilds the whole
+/// block from scratch, since `PackedAutomaton` has no incremental remove;
+/// see `packed_automaton_block.rs`'s module doc comment).
+#[test]
+fn packed_automaton_dictionary_round_trips_real_rdf_terms() {
+    let mut dict = PackedAutomatonDictionary::with_block_bounds(4, 16);
+    let terms = [
+        "http://www.w3.org/1999/02/22-rdf-syntax-ns#type",
+        "http://www.w3.org/2000/01/rdf-schema#Class",
+        "http://dbpedia.org/resource/Berlin",
+        "http://dbpedia.org/ontology/populationTotal",
+        "\"Berlin\"@en",
+        "\"42\"^^http://www.w3.org/2001/XMLSchema#integer",
+        "_:b0",
+    ];
+
+    let ids: Vec<TermId> = terms.iter().map(|t| dict.insert(t)).collect();
+    for (term, &id) in terms.iter().zip(&ids) {
+        assert_eq!(dict.get_id(term), Some(id));
+        assert_eq!(dict.get_term(id).as_deref(), Some(*term));
+    }
+
+    let removed = dict.remove(terms[2]).unwrap();
+    assert_eq!(dict.get_term(removed), None);
+    assert_eq!(dict.get_id(terms[2]), None);
+    for (term, &id) in terms.iter().zip(&ids) {
+        if *term == terms[2] {
+            continue;
+        }
+        assert_eq!(dict.get_id(term), Some(id));
+    }
+
+    let mut batch_dict = PackedAutomatonDictionary::with_block_bounds(4, 16);
     let batch_ids = batch_dict.insert_batch(&terms);
     for (term, &id) in terms.iter().zip(&batch_ids) {
         assert_eq!(batch_dict.get_id(term), Some(id));

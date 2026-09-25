@@ -13,9 +13,9 @@
 //! checkpoints, printing `size_bytes() / len()` at each one so a trend
 //! (or its absence) is visible directly, not just at two endpoints.
 //!
-//! Usage: `cargo run --release --example perf_scale_memory -- automaton|fst [total] [checkpoints]`
+//! Usage: `cargo run --release --example perf_scale_memory -- automaton|fst|packed [clustered|hashlike] [total] [checkpoints]`
 
-use s_dict::{AutomatonDictionary, Dictionary, TermDictionary};
+use s_dict::{AutomatonDictionary, Dictionary, PackedAutomatonDictionary, TermDictionary};
 
 fn namespace_clustered_terms_range(start: u32, count: u32) -> Vec<String> {
     (start..start + count)
@@ -63,7 +63,7 @@ fn hashlike_terms_range(start: u32, count: u32) -> Vec<String> {
 
 fn main() {
     let mut args = std::env::args().skip(1);
-    let kind = args.next().expect("first arg: automaton or fst");
+    let kind = args.next().expect("first arg: automaton, fst, or packed");
     let generator = args.next().unwrap_or_else(|| "clustered".to_string());
     let total: u32 = args.next().and_then(|s| s.parse().ok()).unwrap_or(200_000);
     let checkpoints: u32 = args.next().and_then(|s| s.parse().ok()).unwrap_or(10);
@@ -87,12 +87,12 @@ fn main() {
                 dict.insert_batch(&refs);
                 let len = dict.len();
                 let bytes = dict.size_bytes();
-                let packed = dict.estimate_packed_bytes();
+                let states = dict.reachable_state_count();
                 eprintln!(
                     "{len:>10} terms  size_bytes={bytes:>14}  bytes/term={:.2}  \
-                     packed_estimate={packed:>14}  packed_bytes/term={:.2}  blocks={}",
+                     states={states:>10}  states/term={:.3}  blocks={}",
                     bytes as f64 / len as f64,
-                    packed as f64 / len as f64,
+                    states as f64 / len as f64,
                     dict.block_count(),
                 );
             }
@@ -105,12 +105,33 @@ fn main() {
                 dict.insert_batch(&refs);
                 let len = dict.len();
                 let bytes = dict.size_bytes();
+                let states = dict.reachable_state_count();
                 eprintln!(
-                    "{len:>10} terms  size_bytes={bytes:>14}  bytes/term={:.2}",
+                    "{len:>10} terms  size_bytes={bytes:>14}  bytes/term={:.2}  \
+                     states={states:>10}  states/term={:.3}",
                     bytes as f64 / len as f64,
+                    states as f64 / len as f64,
                 );
             }
         }
-        other => panic!("unknown kind {other:?}; expected automaton or fst"),
+        "packed" => {
+            let mut dict = PackedAutomatonDictionary::new();
+            for cp in 1..=checkpoints {
+                let terms = gen_range((cp - 1) * chunk, chunk);
+                let refs: Vec<&str> = terms.iter().map(String::as_str).collect();
+                dict.insert_batch(&refs);
+                let len = dict.len();
+                let bytes = dict.size_bytes();
+                let states = dict.reachable_state_count();
+                eprintln!(
+                    "{len:>10} terms  size_bytes={bytes:>14}  bytes/term={:.2}  \
+                     states={states:>10}  states/term={:.3}  blocks={}",
+                    bytes as f64 / len as f64,
+                    states as f64 / len as f64,
+                    dict.block_count(),
+                );
+            }
+        }
+        other => panic!("unknown kind {other:?}; expected automaton, fst, or packed"),
     }
 }
