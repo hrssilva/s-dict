@@ -226,14 +226,27 @@ right one -- it's consistent with every one of the four isolating
 experiments in DESIGN.md, not just asserted by analogy. It does **not**
 yet establish:
 
-- The exact quantitative contribution of output-pushing alone, isolated
-  from the registry-boundedness difference (both differ between the two
-  implementations at once; no experiment here holds the register fixed
-  and only varies output handling). A clean test would be: port
-  `fst`'s bounded LRU registry into `s-dict`'s `Automaton` *without*
-  output-pushing, and separately, add output-pushing to `s-dict`'s
-  `Automaton` *without* changing its register, then re-run the same
-  chunk-size-sensitivity experiment against each in isolation.
+- ~~The exact quantitative contribution of output-pushing alone,
+  isolated from the registry-boundedness difference~~ -- half done.
+  `PackedAutomaton`'s own `PackedRegister` (unbounded exact `HashMap`)
+  has been replaced with `PackedRegistry`, `fst`'s bounded LRU registry
+  ported directly (`DESIGN.md`'s "replacing PackedAutomaton's register
+  with a bounded LRU cache", `FST_VS_PACKED_AUTOMATON.md`'s "Dedup
+  structure" section) -- output-pushing *not* added alongside it. Result:
+  on the low-redundancy (hashlike) corpus, the growth this document's
+  §4 attributed to output-pushing turned out to have been entangled
+  with plain register-unboundedness all along -- fixing only the
+  register flattened it completely (`bytes/term` 104-132, growing ->
+  104.5-109.5, flat). On the high-redundancy (clustered) corpus, the
+  growth persisted unchanged after the same fix (`states/term` still
+  0.123 -> 0.183 vs. `fst`'s flat 0.123-0.128) -- direct, measured
+  confirmation that output-pushing is the real cause of *that* gap,
+  now cleanly isolated rather than argued by elimination across four
+  indirect experiments. Still not done: the slab `Automaton`'s own
+  `Register` was left exact and unbounded (this round only touched
+  `PackedAutomaton`); porting the bounded registry there too, and
+  separately, actually adding output-pushing to either type, remain
+  open.
 - Whether adding output-pushing to `s-dict`'s `Automaton` (a real,
   nontrivial change to `finalize_outputs_and_count`/`confirm_path`, and
   to `PackedAutomaton`'s equivalent, since rank-as-output is exactly
@@ -241,3 +254,48 @@ yet establish:
   keep working) is worth the complexity given the project's own
   established discipline (measure before building) -- not attempted or
   recommended here, only diagnosed.
+
+## 6. Correction: on real RDF, output-pushing is not the cause
+
+§4 attributes `fst`'s lower state count to output-pushing. Measured
+directly on identical term sets (every block of a real-RDF dictionary,
+6.3M terms; DESIGN.md's "real-RDF decomposition"):
+
+| construction, same term sets | states/term |
+|---|---|
+| `PackedAutomaton::build_sorted` (fresh) | 2.722 |
+| `fst` | 2.717 |
+| exact minimal (`Automaton::build_sorted`, unbounded register) | 2.606 |
+| `PackedAutomaton` built by incremental merges | 2.996 |
+
+Fresh packed builds match `fst` to 0.2%; both lose ~4.5% to the
+bounded LRU registry. The gap §4 set out to explain lives entirely in
+the incremental row.
+
+The theory agrees. §3.2's outputs are *local*: a state's transition
+outputs are a prefix sum of its children's subtree counts, so they are
+a function of the state's right language -- two equivalent states
+always get identical outputs, and output handling can't block a merge.
+This is Lucchesi & Kowaltowski's (1993) construction for minimal
+perfect hashing: a minimal acyclic acceptor annotated with word counts
+already supports ranking, with no larger transducer needed. Mihov &
+Maurel's output-pushing matters for transducers whose outputs carry
+information beyond the right language; for rank-as-output it brings
+nothing `PackedAutomaton` doesn't already have.
+
+What §4 measured instead: the dictionary-scale experiments it relies on
+(`perf_scale_memory`, the boundary-sensitivity runs) build blocks
+through several `insert_batch` calls, i.e. incremental merges, where
+new records can't dedup against ones written before the merge's
+registry existed. That mechanism also matches the boundary sensitivity:
+how much a block is rebuilt incrementally depends on where batch and
+split boundaries fall. §5's open question -- whether to add
+output-pushing -- is answered: no; reducing merge non-minimality (or
+compacting) is the lever.
+
+Additional references for the encoding side (FST_VS_PACKED_AUTOMATON.md's
+representation section): Daciuk, "Experiments with Automata Compression"
+(CIAA 2000) and Daciuk & Weiss, "Smaller Representation of Finite State
+Automata" (CIAA 2011 / TCS 2012) -- NEXT flags, label indexing in flag
+bytes, variable-length pointers; Lucene's FST (`BIT_TARGET_NEXT`,
+fixed-length arcs for binary search / direct addressing on wide nodes).

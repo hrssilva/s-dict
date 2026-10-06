@@ -1137,6 +1137,19 @@ impl Automaton {
         self.states.len()
     }
 
+    /// The number of entries in `register` -- for measuring, not
+    /// assuming, that `release`'s pruning (`register.remove(&sig)` on
+    /// refcount-zero, `src/micro_fst.rs:2420`) actually keeps it bounded
+    /// to the reachable state set, as opposed to `PackedAutomaton`'s own
+    /// register, which has no equivalent pruning at all. Compare
+    /// directly against `reachable_state_count`. Measured in
+    /// `measure_automaton_register_tracks_reachable_under_churn`
+    /// (`DESIGN.md`'s "measuring the register-pruning gap directly").
+    #[cfg(test)]
+    pub(crate) fn register_len(&self) -> usize {
+        self.register.len()
+    }
+
     /// The number of *reachable* states -- the true minimality signal.
     /// `states.len()` alone would overcount, since bulk construction and
     /// incremental insertion both leave discarded duplicates as
@@ -1251,28 +1264,162 @@ impl Automaton {
     }
 }
 
-/// The register-deduplication key for [`PackedAutomaton`] -- exactly
-/// [`Signature`]'s own role, `u32` (a byte address into `bytes`) in
-/// place of `StateId` as the target type, since that's what a
-/// transition in this representation actually stores.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-struct PackedSignature {
+/// `PackedAutomaton`'s dedup structure: a **bounded, lossy** N-way
+/// set-associative LRU cache, `fst`'s own `Registry`
+/// (`vendor/fst/src/raw/registry.rs`) applied to this crate's own target
+/// type (`u32` byte offsets into `bytes`, in place of `fst`'s
+/// `CompiledAddr`). This replaced a prior, unbounded, exact
+/// `HashMap<PackedSignature, u32, FxHasher>` -- measured, not assumed,
+/// to grow without bound under sustained inserts
+/// (`measure_packed_automaton_register_growth_under_sustained_inserts`
+/// before this change: 91 -> 62,632 entries over 2000 inserts while
+/// `reachable_state_count` stayed flat at 91 -> 120; see DESIGN.md's
+/// "replacing PackedAutomaton's register with a bounded LRU cache").
+/// `write_confirmed_state` only ever inserted, never removed -- there
+/// was no refcounting to tell an exact register a signature's target
+/// had become unreachable, unlike the slab `Automaton`'s own
+/// `release()`-pruned `Register`. `fst`'s bounded cache sidesteps that
+/// problem entirely instead of solving it: fixed size, allocated once,
+/// **evicts** the least-recently-used entry in a bucket instead of
+/// growing, at the cost of a documented, deliberate non-minimality
+/// (`vendor/fst/src/raw/mod.rs:226-238`) `PackedAutomaton` now accepts
+/// too, the same tradeoff `fst` has always made.
+///
+/// Each cell stores its own clone of the signature it was inserted
+/// with (`is_final` + sorted `(byte, output, target)` transitions) for
+/// comparison, independent of whatever's currently written at `target`
+/// in `bytes` -- `fst`'s own `RegistryCell` does the same (`node:
+/// BuilderNode`, not a re-fetch through `addr`). `FxHasher` (this
+/// crate's own established choice over `fst`'s FNV-1a -- `Register`'s
+/// doc comment, alongside `Signature`) hashes into a bucket; `mru_size`
+/// cells within that bucket are linearly scanned, promoted-on-hit,
+/// LRU-evicted-on-miss -- `fst`'s own `RegistryCache::entry`'s exact
+/// algorithm, ported rather than re-derived.
+#[derive(Clone, Debug)]
+struct PackedRegistryCell {
+    /// `PACKED_REGISTRY_NONE` when this cell has never been written.
+    target: u32,
     is_final: bool,
     transitions: Vec<(u8, u32, u32)>,
 }
 
-/// [`Register`]'s exact reasoning applied to [`PackedAutomaton`]'s own
-/// register: `FxHasher` (defined above, alongside `Signature`) in place
-/// of std's default `SipHash`. This one was missed when `PackedAutomaton`
-/// was first built -- plain `HashMap::new()` silently defaulted to
-/// `SipHash` -- and a `perf record` profile of a real dictionary-scale
-/// workload found hashing `PackedSignature` (`hash_one` plus
-/// `SipHash`'s own `write`) was, combined, close to 40% of all cycles,
-/// the single largest cost by far, exactly the class of cost `Register`
-/// already fixed for the slab automaton's own register years earlier in
-/// this project's history. See DESIGN.md's dictionary-level insert-speed
-/// section.
-type PackedRegister = HashMap<PackedSignature, u32, BuildHasherDefault<FxHasher>>;
+/// `u32::MAX` as an empty-cell sentinel -- this file's own existing
+/// idiom for "no value" in a `u32` field (`rank`/`term_at_into`'s
+/// `next.map_or(u32::MAX, ..)` boundary sentinel), not a new convention.
+/// A real `PackedAutomaton` address colliding with this would require
+/// `bytes` to exceed 4 GiB, already an unsupported size for this
+/// prototype's `u32` addressing elsewhere.
+const PACKED_REGISTRY_NONE: u32 = u32::MAX;
+
+impl PackedRegistryCell {
+    fn none() -> PackedRegistryCell {
+        PackedRegistryCell {
+            target: PACKED_REGISTRY_NONE,
+            is_final: false,
+            transitions: Vec::new(),
+        }
+    }
+
+    fn is_none(&self) -> bool {
+        self.target == PACKED_REGISTRY_NONE
+    }
+
+    fn matches(&self, is_final: bool, transitions: &[(u8, u32, u32)]) -> bool {
+        !self.is_none() && self.is_final == is_final && self.transitions == transitions
+    }
+}
+
+#[derive(Clone, Debug)]
+struct PackedRegistry {
+    /// `table_size * mru_size` cells, allocated once in `new`/
+    /// `with_capacity_hint`, never resized -- the fixed bound that
+    /// replaces unbounded `HashMap` growth. Laid out as `table_size`
+    /// buckets of `mru_size` contiguous cells each (`fst`'s own
+    /// `Registry::entry`'s exact slicing).
+    table: Vec<PackedRegistryCell>,
+    table_size: usize,
+    mru_size: usize,
+}
+
+#[allow(dead_code)]
+impl PackedRegistry {
+    fn new(table_size: usize, mru_size: usize) -> PackedRegistry {
+        let ncells = table_size * mru_size;
+        PackedRegistry {
+            table: (0..ncells).map(|_| PackedRegistryCell::none()).collect(),
+            table_size,
+            mru_size,
+        }
+    }
+
+    /// `Block::build`'s own sizing (`src/block.rs:71`, "a micro-block
+    /// needs a much smaller construction cache than the generic
+    /// builder's 20,000 cells"), reused as-is: `s-dict` blocks (and so
+    /// `PackedAutomaton`'s own term count, `DEFAULT_BLOCK_MAX =
+    /// 256`, `src/dictionary.rs:33`) are already size-bounded by this
+    /// crate's own split policy, so a table sized once from the initial
+    /// build's term count stays proportioned across further incremental
+    /// `insert`s rather than needing to track growth. `mru_size = 2`,
+    /// `fst`'s own default for this same reason.
+    fn with_capacity_hint(capacity_hint: usize) -> PackedRegistry {
+        let rows = capacity_hint.saturating_mul(4).clamp(64, 10_000);
+        PackedRegistry::new(rows, 2)
+    }
+
+    fn hash(&self, is_final: bool, transitions: &[(u8, u32, u32)]) -> usize {
+        let mut hasher = FxHasher::default();
+        is_final.hash(&mut hasher);
+        transitions.hash(&mut hasher);
+        (hasher.finish() as usize) % self.table_size
+    }
+
+    fn bucket(&mut self, is_final: bool, transitions: &[(u8, u32, u32)]) -> &mut [PackedRegistryCell] {
+        let bucket = self.hash(is_final, transitions);
+        let start = bucket * self.mru_size;
+        &mut self.table[start..start + self.mru_size]
+    }
+
+    fn get(&mut self, is_final: bool, transitions: &[(u8, u32, u32)]) -> Option<u32> {
+        let cells = self.bucket(is_final, transitions);
+        let pos = cells.iter().position(|c| c.matches(is_final, transitions))?;
+        let target = cells[pos].target;
+        promote(cells, pos);
+        Some(target)
+    }
+
+    /// Always inserts, evicting the bucket's least-recently-used cell
+    /// if every cell is already occupied -- the "lossy" half of this
+    /// structure's tradeoff. Caller's responsibility to have just
+    /// missed via `get` on the same signature.
+    fn insert(&mut self, is_final: bool, transitions: &[(u8, u32, u32)], target: u32) {
+        let cells = self.bucket(is_final, transitions);
+        let last = cells.len() - 1;
+        cells[last].is_final = is_final;
+        cells[last].transitions.clear();
+        cells[last].transitions.extend_from_slice(transitions);
+        cells[last].target = target;
+        promote(cells, last);
+    }
+
+    /// Current occupancy -- always `<= table_size * mru_size`, the
+    /// bound the prior unbounded `HashMap` register had no equivalent
+    /// of. See `PackedAutomaton::register_len`.
+    fn len(&self) -> usize {
+        self.table.iter().filter(|c| !c.is_none()).count()
+    }
+}
+
+/// `fst`'s own `RegistryCache::promote`: move the cell at `i` to the
+/// front of its bucket (most-recently-used), shifting everything
+/// between it and the front back by one -- so position 0 is always the
+/// MRU cell and the last position is always the next eviction target.
+fn promote(cells: &mut [PackedRegistryCell], mut i: usize) {
+    while i > 0 {
+        cells.swap(i - 1, i);
+        i -= 1;
+    }
+}
+
 
 /// One state being incrementally (re)built by [`PackedAutomaton::insert`],
 /// before it's confirmed and written -- the packed-representation
@@ -1282,12 +1429,13 @@ type PackedRegister = HashMap<PackedSignature, u32, BuildHasherDefault<FxHasher>
 /// persistent structure.
 struct StagingFrame {
     is_final: bool,
-    /// `(byte, output, target)`, kept sorted by byte throughout --
-    /// outputs are stale placeholders until this frame is confirmed
-    /// (`PackedAutomaton::confirm_frame` recomputes every one of them
-    /// from scratch, the same prefix-sum-of-sibling-subtree-counts
-    /// technique `finalize_outputs_and_count` uses), so nothing reads
-    /// them meaningfully before that.
+    /// `(byte, child_subtree_count, target)`, kept sorted by byte
+    /// throughout. Records don't store subtree counts; they're carried
+    /// here instead, derived top-down (`PackedAutomaton::open_frame`:
+    /// from the parent's count and its transitions' outputs) or known at
+    /// confirmation (`confirm_frame` returns it). `confirm_frame` turns
+    /// them into outputs -- the prefix-sum-of-sibling-subtree-counts
+    /// technique `finalize_outputs_and_count` uses.
     children: Vec<(u8, u32, u32)>,
 }
 
@@ -1343,29 +1491,43 @@ struct StagingFrame {
 /// That dead weight is a real, separately-measured cost under sustained
 /// inserts (20-37x a fresh rebuild's size within 128-200 inserts, per
 /// `measure_packed_automaton_dead_bytes_under_sustained_inserts`),
-/// **unaffected by this flat-buffer change** -- it comes from every
-/// ancestor's `subtree_count` genuinely changing on every insert, which
-/// no addressing scheme removes. Still open; see DESIGN.md.
+/// **unaffected by this flat-buffer change** -- every ancestor on an
+/// insert path is rewritten (its outputs or its child's address change),
+/// which no addressing scheme removes. Dead records are reclaimed by
+/// [`PackedAutomaton::compact`], which callers trigger (see
+/// `PackedAutomatonBlock::merge_into` and DESIGN.md's "copy-compaction").
 ///
-/// Record layout, unchanged from the blocked version: `[flag_count:
-/// u8]` (top bit `is_final`, low 7 bits transition count -- safe up to
-/// 127, comfortably above this corpus's branching factor),
-/// `[subtree_count: LEB128 varint]` (this state's own `count`, per
-/// [`State::count`]'s doc comment -- not needed for decode, genuinely
-/// needed by `insert` to recompute a modified state's children's
-/// outputs without walking whole subtrees), then per transition in
-/// byte-sorted order, `[byte: u8][output: LEB128 varint][target: u32
-/// LE]`. `target` (and this automaton's own `root`) is a plain byte
-/// offset into `bytes`.
+/// Record layout (fst-style, DESIGN.md's "fst-style record encoding"):
+/// a record's address is its *last* byte, the header, and it is parsed
+/// downward from there (`fst`'s own convention), so every field can be
+/// written while appending in postorder. Header: bit 7 `is_final`, bit 6
+/// NEXT, bits 0-5 transition count (63 = escape: one more byte below
+/// holds `count - 63`). Then, per transition in byte order, reading
+/// downward: `[byte: u8]`, `[output: reversed LEB128]` (omitted for the
+/// first transition: always `is_final`), `[target delta: reversed
+/// LEB128]` (`field_start - target`; omitted when NEXT, which only
+/// single-transition records set, meaning the target is the record
+/// immediately below). No subtree counts are stored: `term_count` holds
+/// the root's, and every other state's is derived top-down while
+/// descending (`open_frame`).
 #[allow(dead_code)]
 #[derive(Clone, Debug)]
 pub(crate) struct PackedAutomaton {
     bytes: Vec<u8>,
     root: u32,
-    register: PackedRegister,
-    /// Reused across every `write_confirmed_state` call -- see its own
-    /// doc comment.
-    sig_scratch: Vec<(u8, u32, u32)>,
+    /// The root's subtree count (= number of terms). The only count
+    /// stored anywhere: every other state's count is derived top-down
+    /// while descending (see `StagingFrame::children`).
+    term_count: u32,
+    /// Construction-time dedup cache only -- never read by any query.
+    /// `None` after [`Self::release_construction_state`]; recreated on
+    /// demand by [`Self::registry`] the next time a record is written.
+    /// Long-lived holders (`PackedAutomatonBlock`) release it between
+    /// mutations: kept resident, its fixed-size table plus each cell's
+    /// own transitions `Vec` measured ~5x the automaton's `bytes` on
+    /// real RDF (DESIGN.md's "releasing PackedAutomaton's registry
+    /// between mutations").
+    register: Option<PackedRegistry>,
 }
 
 #[allow(dead_code)]
@@ -1391,11 +1553,8 @@ impl PackedAutomaton {
         let mut result = PackedAutomaton {
             bytes: Vec::new(),
             root: 0,
-            register: PackedRegister::with_capacity_and_hasher(
-                automaton.len(),
-                BuildHasherDefault::default(),
-            ),
-            sig_scratch: Vec::new(),
+            term_count: automaton.len() as u32,
+            register: Some(PackedRegistry::with_capacity_hint(automaton.len())),
         };
         let mut written: HashMap<StateId, u32> = HashMap::new();
         let root = Self::compile_state(automaton, automaton.root, &mut result, &mut written);
@@ -1422,7 +1581,7 @@ impl PackedAutomaton {
             children.push((b, out, child_pos));
             i += 1;
         }
-        let pos = result.write_confirmed_state(state.is_final, state.count, &children);
+        let pos = result.write_confirmed_state(state.is_final, &children);
         written.insert(id, pos);
         pos
     }
@@ -1459,11 +1618,8 @@ impl PackedAutomaton {
         let mut result = PackedAutomaton {
             bytes: Vec::new(),
             root: 0,
-            register: PackedRegister::with_capacity_and_hasher(
-                capacity_hint,
-                BuildHasherDefault::default(),
-            ),
-            sig_scratch: Vec::new(),
+            term_count: 0,
+            register: Some(PackedRegistry::with_capacity_hint(capacity_hint)),
         };
         // frames[i] is the state reached after `path_bytes[..i]` of
         // `last_word`; frames[0] (root) has no incoming byte, so
@@ -1527,19 +1683,19 @@ impl PackedAutomaton {
         while frames.len() > keep_from.max(1) {
             let frame = frames.pop().expect("loop guard ensures at least one entry");
             let byte = path_bytes.pop().expect("one byte per non-root frame");
-            let pos = result.confirm_frame(&frame);
+            let (pos, count) = result.confirm_frame(&frame);
 
             let parent = frames
                 .last_mut()
                 .expect("path always has at least the root");
             match parent.children.binary_search_by_key(&byte, |&(b, _, _)| b) {
-                Ok(idx) => parent.children[idx].2 = pos,
-                Err(idx) => parent.children.insert(idx, (byte, 0, pos)),
+                Ok(idx) => parent.children[idx] = (byte, count, pos),
+                Err(idx) => parent.children.insert(idx, (byte, count, pos)),
             }
         }
         if keep_from == 0 {
             let root_frame = frames.pop().expect("root frame always present");
-            result.root = result.confirm_frame(&root_frame);
+            (result.root, result.term_count) = result.confirm_frame(&root_frame);
         }
     }
 
@@ -1568,10 +1724,7 @@ impl PackedAutomaton {
     /// sorted-merge walk) don't need this to report it back, so unlike
     /// the slab's own `insert_sorted` this returns nothing.
     pub(crate) fn insert_sorted<'a>(&mut self, terms: impl Iterator<Item = &'a str>) {
-        let mut frames: Vec<StagingFrame> = vec![StagingFrame {
-            is_final: self.is_final(self.root),
-            children: self.read_children(self.root),
-        }];
+        let mut frames: Vec<StagingFrame> = vec![self.open_frame(self.root, self.term_count)];
         let mut path_bytes: Vec<u8> = Vec::new();
         let mut last_word: Vec<u8> = Vec::new();
 
@@ -1593,11 +1746,8 @@ impl PackedAutomaton {
                 let cur = frames.last().expect("frames always has at least the root");
                 match cur.children.binary_search_by_key(&byte, |&(b, _, _)| b) {
                     Ok(idx) => {
-                        let target = cur.children[idx].2;
-                        frames.push(StagingFrame {
-                            is_final: self.is_final(target),
-                            children: self.read_children(target),
-                        });
+                        let (_, child_count, target) = cur.children[idx];
+                        frames.push(self.open_frame(target, child_count));
                         path_bytes.push(byte);
                         matched += 1;
                     }
@@ -1643,36 +1793,31 @@ impl PackedAutomaton {
     pub(crate) fn insert(&mut self, term: &str) {
         let word = term.as_bytes();
 
-        // Walk existing transitions as far as they match.
-        let mut path: Vec<u32> = vec![self.root];
+        // Walk existing transitions as far as they match, "opening" every
+        // matched state into an editable frame holding its existing
+        // children (read straight from its still-unmodified packed
+        // record) -- opened while descending, since each child's subtree
+        // count is derived from its parent's (`open_frame`).
+        let mut staging: Vec<StagingFrame> = vec![self.open_frame(self.root, self.term_count)];
         let mut path_bytes: Vec<u8> = Vec::new();
         let mut matched = 0usize;
         while matched < word.len() {
-            let cur = *path.last().expect("path always has at least the root");
-            match self.get(cur, word[matched]) {
-                Some((_, target)) => {
-                    path.push(target);
+            let cur = staging.last().expect("staging always has at least the root");
+            match cur.children.binary_search_by_key(&word[matched], |&(b, _, _)| b) {
+                Ok(idx) => {
+                    let (_, child_count, target) = cur.children[idx];
+                    let frame = self.open_frame(target, child_count);
+                    staging.push(frame);
                     path_bytes.push(word[matched]);
                     matched += 1;
                 }
-                None => break,
+                Err(_) => break,
             }
         }
 
-        if matched == word.len() && self.is_final(*path.last().expect("non-empty path")) {
+        if matched == word.len() && staging.last().expect("non-empty staging").is_final {
             return; // already present
         }
-
-        // "Open" every matched state into an editable frame holding its
-        // existing children, read straight from its (still unmodified)
-        // packed record.
-        let mut staging: Vec<StagingFrame> = path
-            .iter()
-            .map(|&pos| StagingFrame {
-                is_final: self.is_final(pos),
-                children: self.read_children(pos),
-            })
-            .collect();
 
         // Extend with brand-new states for the unmatched suffix.
         for &b in &word[matched..] {
@@ -1688,101 +1833,278 @@ impl PackedAutomaton {
             .is_final = true;
 
         // Confirm bottom-up: write each frame (or reuse an existing
-        // equivalent record via the register), then splice its
-        // resolved `(byte, _, pos)` into its parent's own children --
-        // the parent's stale placeholder output for that byte (0, or
-        // whatever it was before) gets overwritten for real when the
-        // parent itself is confirmed, one step up.
+        // equivalent record via the register), then splice its resolved
+        // `(byte, count, pos)` into its parent's own children.
         while staging.len() > 1 {
             let frame = staging.pop().expect("staging.len() > 1 just checked");
             let byte = path_bytes.pop().expect("one byte per non-root frame");
-            let pos = self.confirm_frame(&frame);
+            let (pos, count) = self.confirm_frame(&frame);
 
             let parent = staging.last_mut().expect("staging.len() > 1 just checked");
             match parent.children.binary_search_by_key(&byte, |&(b, _, _)| b) {
-                Ok(idx) => parent.children[idx].2 = pos,
-                Err(idx) => parent.children.insert(idx, (byte, 0, pos)),
+                Ok(idx) => parent.children[idx] = (byte, count, pos),
+                Err(idx) => parent.children.insert(idx, (byte, count, pos)),
             }
         }
 
         let root_frame = staging.pop().expect("root frame always present");
-        self.root = self.confirm_frame(&root_frame);
+        (self.root, self.term_count) = self.confirm_frame(&root_frame);
     }
 
-    /// Recomputes `frame`'s outputs from scratch (the same
-    /// prefix-sum-of-sibling-subtree-counts technique
-    /// `finalize_outputs_and_count` uses, reading each child's already-
-    /// written `subtree_count` back via [`Self::read_subtree_count`]
-    /// instead of a live `count` field) and writes (or reuses, via the
-    /// register) the confirmed record, returning its address.
-    fn confirm_frame(&mut self, frame: &StagingFrame) -> u32 {
+    /// Removes `term` if present, returning whether it was -- `insert`'s
+    /// mirror: open the path's frames (counts derived top-down), clear the
+    /// final flag, prune states left with no terms, and re-confirm the
+    /// path bottom-up. Superseded records become dead bytes, reclaimed by
+    /// [`Self::compact`] like `insert`'s.
+    pub(crate) fn remove(&mut self, term: &str) -> bool {
+        let word = term.as_bytes();
+        let mut staging: Vec<StagingFrame> = vec![self.open_frame(self.root, self.term_count)];
+        for &byte in word {
+            let cur = staging.last().expect("staging always has at least the root");
+            let Ok(idx) = cur.children.binary_search_by_key(&byte, |&(b, _, _)| b) else {
+                return false;
+            };
+            let (_, child_count, target) = cur.children[idx];
+            let frame = self.open_frame(target, child_count);
+            staging.push(frame);
+        }
+        let last = staging.last_mut().expect("staging always has at least the root");
+        if !last.is_final {
+            return false;
+        }
+        last.is_final = false;
+
+        for &byte in word.iter().rev() {
+            let frame = staging.pop().expect("one frame per byte plus the root");
+            let resolved = if !frame.is_final && frame.children.is_empty() {
+                None
+            } else {
+                Some(self.confirm_frame(&frame))
+            };
+            let parent = staging.last_mut().expect("the root is never popped here");
+            let idx = parent
+                .children
+                .binary_search_by_key(&byte, |&(b, _, _)| b)
+                .expect("descended through this transition");
+            match resolved {
+                Some((pos, count)) => parent.children[idx] = (byte, count, pos),
+                None => {
+                    parent.children.remove(idx);
+                }
+            }
+        }
+        let root_frame = staging.pop().expect("root frame always present");
+        (self.root, self.term_count) = self.confirm_frame(&root_frame);
+        true
+    }
+
+    /// `(number of terms sorting before term, whether term is present)` --
+    /// one descent, with each state's subtree count derived top-down from
+    /// `term_count` and the outputs, as in `open_frame`.
+    pub(crate) fn lower_bound(&self, term: &str) -> (u32, bool) {
+        let mut pos = self.root;
+        let mut count = self.term_count;
+        let mut value = 0u32;
+        for &byte in term.as_bytes() {
+            let (is_final, n, next, mut cursor) = self.header(pos);
+            // (output, target) of the matching transition, and the output
+            // of the first transition after it (its subtree's end).
+            let mut matched: Option<(u32, u32)> = None;
+            let mut end = count;
+            for i in 0..n {
+                let (b, out, target, after) = self.read_transition_at(cursor, i == 0, is_final, next);
+                cursor = after;
+                if let Some((_, _)) = matched {
+                    end = out;
+                    break;
+                }
+                if b == byte {
+                    matched = Some((out, target));
+                } else if b > byte {
+                    return (value + out, false);
+                }
+            }
+            let Some((out, target)) = matched else {
+                return (value + count, false);
+            };
+            value += out;
+            count = end - out;
+            pos = target;
+        }
+        (value, self.is_final(pos))
+    }
+
+    /// Computes `frame`'s outputs from its children's subtree counts
+    /// (the prefix-sum-of-sibling-subtree-counts technique
+    /// `finalize_outputs_and_count` uses) and writes (or reuses, via the
+    /// register) the confirmed record. Returns `(address, subtree_count)`.
+    fn confirm_frame(&mut self, frame: &StagingFrame) -> (u32, u32) {
         let mut running = u32::from(frame.is_final);
         let mut children = Vec::with_capacity(frame.children.len());
-        for &(b, _stale_output, target) in &frame.children {
+        for &(b, child_count, target) in &frame.children {
             children.push((b, running, target));
-            running += self.read_subtree_count(target);
+            running += child_count;
         }
-        self.write_confirmed_state(frame.is_final, running, &children)
+        (self.write_confirmed_state(frame.is_final, &children), running)
     }
 
-    /// `Signature`/`signature_of_into`'s exact reasoning applied here:
-    /// building `PackedSignature { transitions: children.to_vec(), .. }`
-    /// fresh on every call allocates a new `Vec` for every single
-    /// register lookup, the overwhelming majority of which are hits
-    /// (the whole point of the register) that throw that `Vec` straight
-    /// away. `sig_scratch` is reused across every call instead --
-    /// `extend_from_slice` into an already-allocated buffer, not a fresh
-    /// allocation, and reclaimed back out of the dropped `PackedSignature`
-    /// on a hit rather than let it deallocate. A `perf record` profile of
-    /// a real dictionary-scale workload found allocation churn from
-    /// exactly this pattern (`cfree`/`_int_malloc` combined with
-    /// `HashMap::insert`) a real, substantial cost -- see DESIGN.md's
-    /// dictionary-level insert-speed section.
-    fn write_confirmed_state(
-        &mut self,
-        is_final: bool,
-        subtree_count: u32,
-        children: &[(u8, u32, u32)],
-    ) -> u32 {
-        self.sig_scratch.clear();
-        self.sig_scratch.extend_from_slice(children);
-        let sig = PackedSignature {
-            is_final,
-            transitions: std::mem::take(&mut self.sig_scratch),
-        };
-        if let Some(&existing) = self.register.get(&sig) {
-            self.sig_scratch = sig.transitions;
+    /// Opens the record at `pos` (whose subtree count is `count`) into an
+    /// editable frame. Child counts are the differences between
+    /// consecutive outputs; the last child gets the rest of `count`.
+    fn open_frame(&self, pos: u32, count: u32) -> StagingFrame {
+        let transitions = self.read_children(pos);
+        let mut children = Vec::with_capacity(transitions.len());
+        for (i, &(b, out, target)) in transitions.iter().enumerate() {
+            let end = transitions.get(i + 1).map_or(count, |&(_, next_out, _)| next_out);
+            children.push((b, end - out, target));
+        }
+        StagingFrame {
+            is_final: self.is_final(pos),
+            children,
+        }
+    }
+
+    /// `get`/`insert` take `children` by reference, so unlike the prior
+    /// exact `HashMap<PackedSignature, u32>` version, a hit never
+    /// allocates at all -- `PackedRegistry::get` hashes and compares
+    /// straight off the caller's own slice; only a miss touches a
+    /// cell's `transitions: Vec`, and even then via `clear` +
+    /// `extend_from_slice` into that cell's already-allocated buffer
+    /// (`PackedRegistry::insert`), not a fresh allocation.
+    fn write_confirmed_state(&mut self, is_final: bool, children: &[(u8, u32, u32)]) -> u32 {
+        if let Some(existing) = self.registry().get(is_final, children) {
             return existing;
         }
-        let pos = self.append_record(is_final, subtree_count, children);
-        self.register.insert(sig, pos);
+        let pos = self.append_record(is_final, children);
+        self.registry().insert(is_final, children, pos);
         pos
+    }
+
+    /// The live registry, recreating it if released. Sized from
+    /// `term_count`, the same hint
+    /// `build_sorted` uses. A recreated registry starts empty, so records
+    /// written before the release can't be deduplicated against -- the
+    /// same kind of lost sharing the bounded LRU's eviction already
+    /// accepts (measured: +4% `bytes` on real RDF, DESIGN.md).
+    fn registry(&mut self) -> &mut PackedRegistry {
+        if self.register.is_none() {
+            self.register = Some(PackedRegistry::with_capacity_hint(self.term_count as usize));
+        }
+        self.register.as_mut().expect("just ensured")
+    }
+
+    /// Recreates a released registry sized for a mutation touching
+    /// `terms` terms, instead of `registry`'s whole-automaton default. A
+    /// recreated registry can only dedup records written during this
+    /// mutation, so sizing it to the automaton just allocates and zeroes
+    /// cells nothing will use -- measured as most of a single-term insert's
+    /// cost in a 1024-term block (DESIGN.md's "incremental single-term
+    /// mutation").
+    pub(crate) fn reserve_registry(&mut self, terms: usize) {
+        if self.register.is_none() {
+            self.register = Some(PackedRegistry::with_capacity_hint(terms));
+        }
+    }
+
+    /// Drops everything only construction needs: frees the registry and
+    /// trims `bytes`' spare growth capacity, so a resident automaton's
+    /// heap matches `size_bytes`. Further `insert`/`insert_sorted` calls
+    /// remain valid (see [`Self::registry`]).
+    pub(crate) fn release_construction_state(&mut self) {
+        self.register = None;
+        self.bytes.shrink_to_fit();
+    }
+
+    /// Rewrites `bytes` to hold only reachable records, merging records
+    /// that become identical once their children are rewritten. Dead
+    /// records (left behind by `insert`/`insert_sorted`, see the struct
+    /// doc comment) are dropped, and the exact dedup is bottom-up
+    /// minimization (Revuz 1992): outputs are a function of each state's
+    /// right language, so equivalent states have equal signatures once
+    /// their children are canonical, and the result is the minimal
+    /// automaton -- tighter than `build_sorted`'s bounded registry. The
+    /// dedup map is temporary; the registry is released, so this is
+    /// O(reachable records) time with no retained construction state.
+    /// Records are re-emitted in postorder, children in byte order, as
+    /// `build_sorted` writes them, so NEXT targets apply.
+    pub(crate) fn compact(&mut self) {
+        let old = PackedAutomaton {
+            bytes: std::mem::take(&mut self.bytes),
+            root: self.root,
+            term_count: self.term_count,
+            register: None,
+        };
+        self.register = None;
+        let mut moved: HashMap<u32, u32, BuildHasherDefault<FxHasher>> = HashMap::default();
+        let mut canonical: HashMap<(bool, Vec<(u8, u32, u32)>), u32, BuildHasherDefault<FxHasher>> =
+            HashMap::default();
+        // (old address, its children, next child to visit)
+        let mut stack: Vec<(u32, Vec<(u8, u32, u32)>, usize)> =
+            vec![(old.root, old.read_children(old.root), 0)];
+        while let Some((pos, children, next)) = stack.last_mut() {
+            if let Some(&(_, _, child)) = children.get(*next) {
+                *next += 1;
+                if !moved.contains_key(&child) {
+                    let grandchildren = old.read_children(child);
+                    stack.push((child, grandchildren, 0));
+                }
+                continue;
+            }
+            let pos = *pos;
+            let mut children = std::mem::take(children);
+            stack.pop();
+            for child in &mut children {
+                child.2 = moved[&child.2];
+            }
+            let is_final = old.is_final(pos);
+            let key = (is_final, children);
+            let new_pos = match canonical.get(&key) {
+                Some(&existing) => existing,
+                None => {
+                    let new_pos = self.append_record(is_final, &key.1);
+                    canonical.insert(key, new_pos);
+                    new_pos
+                }
+            };
+            moved.insert(pos, new_pos);
+        }
+        self.root = moved[&old.root];
+        self.bytes.shrink_to_fit();
     }
 
     /// Appends one state's record to `bytes` -- ordinary amortized-growth
     /// `Vec` reallocation, no capping. This is the *only* place bytes
     /// are ever written: once appended, a record's address is permanent
     /// (see the struct doc comment for why that's sound here).
-    fn append_record(
-        &mut self,
-        is_final: bool,
-        subtree_count: u32,
-        children: &[(u8, u32, u32)],
-    ) -> u32 {
+    fn append_record(&mut self, is_final: bool, children: &[(u8, u32, u32)]) -> u32 {
+        debug_assert!(children.len() <= 256, "at most one transition per byte value");
         debug_assert!(
-            children.len() <= 0x7F,
-            "branching factor exceeds this prototype's 7-bit transition-count field"
+            children.first().is_none_or(|&(_, out, _)| out == u32::from(is_final)),
+            "the first output is always is_final, so it is implicit"
         );
-        let addr = self.bytes.len() as u32;
-        let flag_count = (u8::from(is_final) << 7) | (children.len() as u8);
-        self.bytes.push(flag_count);
-        write_leb128(&mut self.bytes, subtree_count);
-        for &(b, out, target) in children {
+        let next = children.len() == 1
+            && !self.bytes.is_empty()
+            && children[0].2 as usize == self.bytes.len() - 1;
+        // Written in reverse so the record reads forward from its header
+        // downward: t_0 is nearest the header.
+        for (i, &(b, out, target)) in children.iter().enumerate().rev() {
+            if !next {
+                let field = self.bytes.len() as u32;
+                write_leb128_rev(&mut self.bytes, field - target);
+            }
+            if i > 0 {
+                write_leb128_rev(&mut self.bytes, out);
+            }
             self.bytes.push(b);
-            write_leb128(&mut self.bytes, out);
-            self.bytes.extend_from_slice(&target.to_le_bytes());
         }
-        addr
+        if children.len() >= PACKED_COUNT_ESCAPE {
+            self.bytes.push((children.len() - PACKED_COUNT_ESCAPE) as u8);
+        }
+        let header = (u8::from(is_final) << 7)
+            | (u8::from(next) << 6)
+            | children.len().min(PACKED_COUNT_ESCAPE) as u8;
+        self.bytes.push(header);
+        (self.bytes.len() - 1) as u32
     }
 
     /// Total size of `bytes` -- directly comparable to `Automaton::
@@ -1792,6 +2114,21 @@ impl PackedAutomaton {
     /// which this still counts).
     pub(crate) fn size_bytes(&self) -> usize {
         self.bytes.len()
+    }
+
+    /// The number of entries in `register` -- unlike `Automaton::
+    /// register_len`, this has no pruning mechanism to measure the
+    /// bound of: `write_confirmed_state` only ever inserts, never
+    /// removes, so this tracks every distinct signature ever confirmed
+    /// across this automaton's whole mutation history, live or dead.
+    /// Compare directly against `reachable_state_count`. Measured in
+    /// `measure_packed_automaton_register_growth_under_sustained_inserts`
+    /// (`DESIGN.md`'s "measuring the register-pruning gap directly") --
+    /// grows unboundedly (91 -> 62,632 over 2000 inserts) while
+    /// `reachable_state_count` stays flat.
+    #[cfg(test)]
+    pub(crate) fn register_len(&self) -> usize {
+        self.register.as_ref().map_or(0, PackedRegistry::len)
     }
 
     /// The number of *reachable* records -- `Automaton::
@@ -1880,7 +2217,7 @@ impl PackedAutomaton {
         if targets.is_empty() {
             return;
         }
-        let (is_final, count, mut cursor) = self.header(pos);
+        let (is_final, count, next_flag, mut cursor) = self.header(pos);
         let mut remaining = targets;
         if is_final {
             // Every leading target still at value_offset (i.e. local
@@ -1899,7 +2236,7 @@ impl PackedAutomaton {
 
         let mut idx = 0usize;
         let mut next = (idx < count).then(|| {
-            let (b, o, t, next_cursor) = self.read_transition_at(cursor);
+            let (b, o, t, next_cursor) = self.read_transition_at(cursor, idx == 0, is_final, next_flag);
             cursor = next_cursor;
             (b, o, t)
         });
@@ -1908,7 +2245,7 @@ impl PackedAutomaton {
                 next.expect("value must be reachable via some transition at this state");
             idx += 1;
             next = (idx < count).then(|| {
-                let (b, o, t, next_cursor) = self.read_transition_at(cursor);
+                let (b, o, t, next_cursor) = self.read_transition_at(cursor, idx == 0, is_final, next_flag);
                 cursor = next_cursor;
                 (b, o, t)
             });
@@ -1933,21 +2270,20 @@ impl PackedAutomaton {
         self.bytes[pos as usize] & 0x80 != 0
     }
 
-    fn read_subtree_count(&self, pos: u32) -> u32 {
-        let (subtree_count, _) = read_leb128(&self.bytes[pos as usize + 1..]);
-        subtree_count
-    }
 
-    /// `(is_final, transition_count, cursor)` -- `cursor` is the offset
-    /// into `bytes` of the first transition's own `byte` field (i.e.
-    /// right after `flag_count` and the `subtree_count` varint).
+    /// `(is_final, transition_count, next, cursor)` -- `cursor` is the
+    /// offset of the first transition's `byte` field; transitions are
+    /// parsed downward from there (see the struct doc comment).
     #[inline]
-    fn header(&self, pos: u32) -> (bool, usize, usize) {
-        let flag_count = self.bytes[pos as usize];
-        let is_final = flag_count & 0x80 != 0;
-        let transition_count = (flag_count & 0x7F) as usize;
-        let (_subtree_count, count_len) = read_leb128(&self.bytes[pos as usize + 1..]);
-        (is_final, transition_count, pos as usize + 1 + count_len)
+    fn header(&self, pos: u32) -> (bool, usize, bool, usize) {
+        let header = self.bytes[pos as usize];
+        let mut cursor = (pos as usize).wrapping_sub(1);
+        let mut count = (header & 0x3F) as usize;
+        if count == PACKED_COUNT_ESCAPE {
+            count += self.bytes[cursor] as usize;
+            cursor = cursor.wrapping_sub(1);
+        }
+        (header & 0x80 != 0, count, header & 0x40 != 0, cursor)
     }
 
     /// Sequentially scans this state's transitions for `byte`, parsing
@@ -1969,18 +2305,10 @@ impl PackedAutomaton {
     /// whatever LLVM's default heuristic happens to decide.
     #[inline]
     fn get(&self, pos: u32, byte: u8) -> Option<(u32, u32)> {
-        let (_is_final, count, mut cursor) = self.header(pos);
-        for _ in 0..count {
-            let b = self.bytes[cursor];
-            cursor += 1;
-            let (output, len) = read_leb128(&self.bytes[cursor..]);
-            cursor += len;
-            let target = u32::from_le_bytes(
-                self.bytes[cursor..cursor + 4]
-                    .try_into()
-                    .expect("4 bytes were written for every target address"),
-            );
-            cursor += 4;
+        let (is_final, count, next, mut cursor) = self.header(pos);
+        for i in 0..count {
+            let (b, output, target, after) = self.read_transition_at(cursor, i == 0, is_final, next);
+            cursor = after;
             if b == byte {
                 return Some((output, target));
             }
@@ -1997,19 +2325,11 @@ impl PackedAutomaton {
     /// way. See `get`'s doc comment for the fuller story.
     #[inline(always)]
     fn last_output_at_most(&self, pos: u32, value: u32) -> (u8, u32, u32) {
-        let (_is_final, count, mut cursor) = self.header(pos);
+        let (is_final, count, next, mut cursor) = self.header(pos);
         let mut best: Option<(u8, u32, u32)> = None;
-        for _ in 0..count {
-            let b = self.bytes[cursor];
-            cursor += 1;
-            let (output, len) = read_leb128(&self.bytes[cursor..]);
-            cursor += len;
-            let target = u32::from_le_bytes(
-                self.bytes[cursor..cursor + 4]
-                    .try_into()
-                    .expect("4 bytes were written for every target address"),
-            );
-            cursor += 4;
+        for i in 0..count {
+            let (b, output, target, after) = self.read_transition_at(cursor, i == 0, is_final, next);
+            cursor = after;
             if output > value {
                 return best.expect("value must be reachable via some transition at this state");
             }
@@ -2022,19 +2342,11 @@ impl PackedAutomaton {
     /// `insert`'s own way of "opening" a matched state into an editable
     /// [`StagingFrame`].
     fn read_children(&self, pos: u32) -> Vec<(u8, u32, u32)> {
-        let (_is_final, count, mut cursor) = self.header(pos);
+        let (is_final, count, next, mut cursor) = self.header(pos);
         let mut result = Vec::with_capacity(count);
-        for _ in 0..count {
-            let b = self.bytes[cursor];
-            cursor += 1;
-            let (output, len) = read_leb128(&self.bytes[cursor..]);
-            cursor += len;
-            let target = u32::from_le_bytes(
-                self.bytes[cursor..cursor + 4]
-                    .try_into()
-                    .expect("4 bytes were written for every target address"),
-            );
-            cursor += 4;
+        for i in 0..count {
+            let (b, output, target, after) = self.read_transition_at(cursor, i == 0, is_final, next);
+            cursor = after;
             result.push((b, output, target));
         }
         result
@@ -2053,18 +2365,34 @@ impl PackedAutomaton {
     /// comment on how sensitive that path proved to be to exactly this
     /// kind of restructuring), and this function existing is no reason
     /// to risk perturbing it again without a fresh measurement.
-    #[inline]
-    fn read_transition_at(&self, cursor: usize) -> (u8, u32, u32, usize) {
+    ///
+    /// `first`/`is_final`/`next` come from the record's header: the first
+    /// transition's output is implicit (`is_final`), and a `next` record's
+    /// one target is the record immediately below it.
+    #[inline(always)]
+    fn read_transition_at(
+        &self,
+        cursor: usize,
+        first: bool,
+        is_final: bool,
+        next: bool,
+    ) -> (u8, u32, u32, usize) {
         let b = self.bytes[cursor];
-        let mut cursor = cursor + 1;
-        let (output, len) = read_leb128(&self.bytes[cursor..]);
-        cursor += len;
-        let target = u32::from_le_bytes(
-            self.bytes[cursor..cursor + 4]
-                .try_into()
-                .expect("4 bytes were written for every target address"),
-        );
-        cursor += 4;
+        let mut cursor = cursor.wrapping_sub(1);
+        let output = if first {
+            u32::from(is_final)
+        } else {
+            let (value, start) = read_leb128_rev(&self.bytes, cursor);
+            cursor = start.wrapping_sub(1);
+            value
+        };
+        let target = if next {
+            cursor as u32
+        } else {
+            let (delta, start) = read_leb128_rev(&self.bytes, cursor);
+            cursor = start.wrapping_sub(1);
+            start as u32 - delta
+        };
         (b, output, target, cursor)
     }
 
@@ -2092,12 +2420,14 @@ impl PackedAutomaton {
     /// stream`'s own amortized cost rather than a naive port of its
     /// per-visit re-lookup.
     pub(crate) fn stream(&self) -> PackedTermsStream<'_> {
-        let (is_final, count, cursor) = self.header(self.root);
+        let (is_final, count, next, cursor) = self.header(self.root);
         PackedTermsStream {
             packed: self,
             buf: Vec::new(),
             stack: vec![PackedStreamFrame {
                 is_final,
+                next,
+                first: true,
                 yielded_final: false,
                 remaining: count,
                 cursor,
@@ -2116,6 +2446,36 @@ fn write_leb128(bytes: &mut Vec<u8>, mut value: u32) {
             break;
         }
         bytes.push(byte | 0x80);
+    }
+}
+
+/// `PackedAutomaton`'s header escape: a transition count `>= 63` stores
+/// 63 in the header's 6-bit field plus `count - 63` in one extra byte.
+const PACKED_COUNT_ESCAPE: usize = 63;
+
+/// LEB128 with its bytes reversed, so a reader walking *downward* from
+/// the highest byte sees the least-significant group first.
+fn write_leb128_rev(bytes: &mut Vec<u8>, value: u32) {
+    let start = bytes.len();
+    write_leb128(bytes, value);
+    bytes[start..].reverse();
+}
+
+/// Reads a [`write_leb128_rev`] value whose highest byte is at `end`;
+/// returns `(value, lowest_byte_index)`.
+#[inline(always)]
+fn read_leb128_rev(bytes: &[u8], end: usize) -> (u32, usize) {
+    let mut value = 0u32;
+    let mut shift = 0;
+    let mut i = end;
+    loop {
+        let byte = bytes[i];
+        value |= u32::from(byte & 0x7F) << shift;
+        if byte & 0x80 == 0 {
+            return (value, i);
+        }
+        shift += 7;
+        i -= 1;
     }
 }
 
@@ -2217,6 +2577,10 @@ impl<'a> TermsStream<'a> {
 /// index, per [`PackedAutomaton::stream`]'s own doc comment.
 struct PackedStreamFrame {
     is_final: bool,
+    /// The record's NEXT flag (see `read_transition_at`).
+    next: bool,
+    /// No transition visited yet (the first one's output is implicit).
+    first: bool,
     yielded_final: bool,
     /// Transitions not yet visited at this state.
     remaining: usize,
@@ -2257,14 +2621,19 @@ impl<'a> PackedTermsStream<'a> {
                 }
                 continue;
             }
-            let cursor = self.stack[depth - 1].cursor;
-            let (b, _out, target, next_cursor) = self.packed.read_transition_at(cursor);
-            self.stack[depth - 1].remaining -= 1;
-            self.stack[depth - 1].cursor = next_cursor;
+            let frame = &mut self.stack[depth - 1];
+            let (b, _out, target, next_cursor) =
+                self.packed
+                    .read_transition_at(frame.cursor, frame.first, frame.is_final, frame.next);
+            frame.first = false;
+            frame.remaining -= 1;
+            frame.cursor = next_cursor;
             self.buf.push(b);
-            let (child_is_final, child_count, child_cursor) = self.packed.header(target);
+            let (child_is_final, child_count, child_next, child_cursor) = self.packed.header(target);
             self.stack.push(PackedStreamFrame {
                 is_final: child_is_final,
+                next: child_next,
+                first: true,
                 yielded_final: false,
                 remaining: child_count,
                 cursor: child_cursor,
@@ -3134,6 +3503,127 @@ mod tests {
         }
     }
 
+    /// Empirically grounds the "dedup structure" comparison against
+    /// `fst` and `PackedAutomaton` (`AUTOMATON_REFERENCE.md` §3.3,
+    /// `FST_VS_PACKED_AUTOMATON.md`'s "Dedup structure" section): both
+    /// claim `release()` (`src/micro_fst.rs:2382`-ish) keeps `register`
+    /// trimmed to exactly the reachable state set, but neither document
+    /// ever measured `register.len()` directly -- only argued it from
+    /// reading `release()`'s body. Same sustained one-out-one-in churn
+    /// as `measure_slot_reclamation_gap_under_sustained_churn` (which
+    /// measures the *slab*, not the register); this measures
+    /// `register_len()` against `reachable_state_count()` instead. If
+    /// the pruning claim holds, the two should stay equal (or very
+    /// close -- a handful of states can be mid-flight unconfirmed on the
+    /// rightmost path at any instant) every round, never drifting apart
+    /// as cumulative mutation count grows.
+    #[test]
+    #[ignore = "manual measurement, not part of the regular suite"]
+    fn measure_automaton_register_tracks_reachable_under_churn() {
+        let mut live = namespace_clustered_terms(200); // 800 terms
+        live.sort_unstable();
+        live.dedup();
+        let mut automaton = Automaton::build_sorted(live.iter().map(String::as_str));
+
+        eprintln!(
+            "round 0: register={} reachable={}",
+            automaton.register_len(),
+            automaton.reachable_state_count(),
+        );
+
+        let mut rng = 0x5EED_u64;
+        const ROUNDS: usize = 2000;
+        const REPORT_EVERY: usize = 200;
+        for round in 1..=ROUNDS {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            let idx = (rng as usize) % live.len();
+            let removed = live.swap_remove(idx);
+            assert!(automaton.remove(&removed));
+
+            let new_term = format!("http://example.org/churn-{round:08x}");
+            automaton.insert(&new_term);
+            live.push(new_term);
+
+            if round % REPORT_EVERY == 0 {
+                let register = automaton.register_len();
+                let reachable = automaton.reachable_state_count();
+                eprintln!(
+                    "round {round}: register={register} reachable={reachable} \
+                     ratio={:.3}x live_terms={}",
+                    register as f64 / reachable as f64,
+                    live.len(),
+                );
+            }
+        }
+
+        let final_register = automaton.register_len();
+        let final_reachable = automaton.reachable_state_count();
+        eprintln!(
+            "after {ROUNDS} churn rounds ({} total mutations): \
+             register={final_register} reachable={final_reachable} ratio={:.3}x",
+            ROUNDS * 2,
+            final_register as f64 / final_reachable as f64,
+        );
+    }
+
+    /// `PackedAutomaton`'s counterpart: `write_confirmed_state` only ever
+    /// inserts into `PackedRegister`, never removes (the struct's own
+    /// doc comment and `FST_VS_PACKED_AUTOMATON.md`'s "Dedup structure"
+    /// section argue this from reading the code; this measures it).
+    /// Same sustained insert-only churn as `measure_packed_automaton_
+    /// dead_bytes_under_sustained_inserts` (which measures `size_bytes()`,
+    /// not the register). If the no-pruning claim holds, `register_len()`
+    /// should climb roughly linearly with cumulative insert count while
+    /// `reachable_state_count()` stays flat (the live term count is held
+    /// constant by `PackedAutomaton` having no `remove` at all here --
+    /// every insert is a net-new term, so reachable count grows too, but
+    /// far slower than register_len if old, superseded confirmed states
+    /// are piling up).
+    #[test]
+    #[ignore = "manual measurement, not part of the regular suite"]
+    fn measure_packed_automaton_register_growth_under_sustained_inserts() {
+        let mut live = namespace_clustered_terms(200); // 800 terms
+        live.sort_unstable();
+        live.dedup();
+        let automaton = Automaton::build_sorted(live.iter().map(String::as_str));
+        let mut packed = PackedAutomaton::compile(&automaton);
+
+        eprintln!(
+            "round 0: register={} reachable={}",
+            packed.register_len(),
+            packed.reachable_state_count(),
+        );
+
+        const ROUNDS: usize = 2000;
+        const REPORT_EVERY: usize = 200;
+        for round in 1..=ROUNDS {
+            let new_term = format!("http://example.org/churn-{round:08x}");
+            packed.insert(&new_term);
+            live.push(new_term);
+
+            if round % REPORT_EVERY == 0 {
+                let register = packed.register_len();
+                let reachable = packed.reachable_state_count();
+                eprintln!(
+                    "round {round}: register={register} reachable={reachable} \
+                     ratio={:.3}x live_terms={}",
+                    register as f64 / reachable as f64,
+                    live.len(),
+                );
+            }
+        }
+
+        let final_register = packed.register_len();
+        let final_reachable = packed.reachable_state_count();
+        eprintln!(
+            "after {ROUNDS} inserts: register={final_register} reachable={final_reachable} \
+             ratio={:.3}x",
+            final_register as f64 / final_reachable as f64,
+        );
+    }
+
     fn build_both(mut terms: Vec<String>) -> (Automaton, Block, Vec<String>) {
         terms.sort_unstable();
         terms.dedup();
@@ -3307,9 +3797,16 @@ mod tests {
 
     /// Sorted construction's `build_sorted` and `insert`'s general
     /// walk-match-extend algorithm are two different code paths that must
-    /// agree: inserting the same sorted term set one term at a time (via
-    /// `insert`, starting from an empty automaton) must reach exactly the
-    /// same minimal structure `build_sorted` reaches directly.
+    /// agree on every answer. They are *not* required to reach the same
+    /// `reachable_state_count` any more: `PackedRegistry` (see its own
+    /// doc comment) is a bounded LRU cache, so its eviction decisions --
+    /// and so its final structure -- depend on access history, which
+    /// `build_sorted`'s direct confirmation order and `insert`'s
+    /// one-at-a-time order genuinely differ on, even over the identical
+    /// final term set. This is the same construction-order sensitivity
+    /// `fst` itself has (`AUTOMATON_REFERENCE.md`); asserting exact
+    /// structural equality here would be asserting the one property
+    /// this design deliberately no longer guarantees.
     #[test]
     fn packed_automaton_build_sorted_matches_incremental_insert() {
         let mut terms = namespace_clustered_terms(80); // 320 terms
@@ -3323,10 +3820,6 @@ mod tests {
             inserted.insert(term);
         }
 
-        assert_eq!(
-            built.reachable_state_count(),
-            inserted.reachable_state_count()
-        );
         for (expected_rank, term) in terms.iter().enumerate() {
             assert_eq!(built.rank(term), Some(expected_rank as u32));
             assert_eq!(built.rank(term), inserted.rank(term));
@@ -3334,8 +3827,10 @@ mod tests {
     }
 
     /// `PackedAutomaton::insert_sorted`, starting from an empty automaton,
-    /// must reach exactly the same structure `build_sorted` reaches
-    /// directly over the same term set.
+    /// must agree with `build_sorted` on every answer over the same term
+    /// set. Not required to match its `reachable_state_count` --
+    /// `packed_automaton_build_sorted_matches_incremental_insert`'s own
+    /// doc comment explains why, and applies identically here.
     #[test]
     fn packed_automaton_insert_sorted_matches_build_sorted() {
         let mut terms = namespace_clustered_terms(80); // 320 terms
@@ -3347,10 +3842,6 @@ mod tests {
         let mut inserted = PackedAutomaton::build_sorted(std::iter::empty());
         inserted.insert_sorted(terms.iter().map(String::as_str));
 
-        assert_eq!(
-            built.reachable_state_count(),
-            inserted.reachable_state_count()
-        );
         for (expected_rank, term) in terms.iter().enumerate() {
             assert_eq!(inserted.rank(term), Some(expected_rank as u32));
             assert_eq!(built.rank(term), inserted.rank(term));
@@ -3433,12 +3924,163 @@ mod tests {
         assert_eq!(packed.rank("carsx"), None);
     }
 
-    /// `PackedAutomaton::compile(..).size_bytes()` should be the *exact*
-    /// real-world value `Automaton::estimate_packed_bytes` predicted --
-    /// both are built from the same documented layout, so this is a
-    /// direct check that the earlier estimate wasn't just plausible
-    /// arithmetic, but actually matched what compiling for real
-    /// produces.
+    /// `PackedAutomaton::compile(..).size_bytes()` was once exactly
+    /// `Automaton::estimate_packed_bytes` (same layout). The record format
+    /// has since shrunk (DESIGN.md's "fst-style record encoding"), so the
+    /// estimate is now an upper bound.
+    /// Exercises the record format's edge cases: a root with more than
+    /// `PACKED_COUNT_ESCAPE` transitions (header escape byte), long unique
+    /// tails (NEXT chains), and targets far enough back to need
+    /// multi-byte deltas -- via `build_sorted`, `insert_sorted` and
+    /// `insert`, checked against the sorted term list.
+    #[test]
+    fn packed_automaton_wide_fanout_and_long_tails_round_trip() {
+        let mut terms: Vec<String> = (1u8..=250)
+            .map(|b| {
+                let c = char::from_u32(u32::from(b)).unwrap_or('x');
+                format!("{c}{}", "tail".repeat(usize::from(b % 40)))
+            })
+            .collect();
+        terms.extend((0..300).map(|i| format!("p/{i:05}/{}", "z".repeat(i % 97))));
+        terms.sort_unstable();
+        terms.dedup();
+        let (first, second): (Vec<_>, Vec<_>) =
+            terms.iter().enumerate().partition(|(i, _)| i % 3 != 0);
+        let first: Vec<&str> = first.into_iter().map(|(_, t)| t.as_str()).collect();
+        let second: Vec<&str> = second.into_iter().map(|(_, t)| t.as_str()).collect();
+
+        let built = PackedAutomaton::build_sorted(terms.iter().map(String::as_str));
+        let mut batched = PackedAutomaton::build_sorted(first.iter().copied());
+        batched.release_construction_state();
+        batched.insert_sorted(second.iter().copied());
+        let mut single = PackedAutomaton::build_sorted(std::iter::empty());
+        for t in terms.iter().rev() {
+            single.insert(t);
+        }
+
+        for packed in [&built, &batched, &single] {
+            let mut buf = Vec::new();
+            for (rank, term) in terms.iter().enumerate() {
+                assert_eq!(packed.rank(term), Some(rank as u32));
+                packed.term_at_into(rank as u32, &mut buf);
+                assert_eq!(buf, term.as_bytes());
+            }
+            let mut stream = packed.stream();
+            for term in &terms {
+                assert_eq!(stream.next(), Some(term.as_bytes()));
+            }
+            assert_eq!(stream.next(), None);
+            let targets: Vec<(usize, u32)> = (0..terms.len()).map(|r| (r, r as u32)).collect();
+            let mut out = vec![None; terms.len()];
+            packed.decode_ranks_into(&targets, &mut out);
+            for (term, decoded) in terms.iter().zip(&out) {
+                assert_eq!(decoded.as_deref(), Some(term.as_str()));
+            }
+            assert_eq!(packed.rank("p/0000"), None);
+        }
+    }
+
+    /// `compact` after sustained incremental merges: answers unchanged,
+    /// dead records gone, and the reachable state count equals the exact
+    /// minimal automaton's (bottom-up exact dedup is minimization).
+    #[test]
+    fn packed_automaton_compact_is_exactly_minimal_and_preserves_answers() {
+        let mut terms = namespace_clustered_terms(1200);
+        terms.extend((0..600).map(|i| format!("_:b{i}x{}", i * 7919 % 1000)));
+        terms.sort_unstable();
+        terms.dedup();
+        let mut packed = PackedAutomaton::build_sorted(std::iter::empty());
+        for round in 0..12 {
+            let batch: Vec<&str> = terms
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| i % 12 == round)
+                .map(|(_, t)| t.as_str())
+                .collect();
+            packed.insert_sorted(batch.into_iter());
+            packed.release_construction_state();
+        }
+        let before = packed.size_bytes();
+        packed.compact();
+        assert!(packed.size_bytes() < before);
+        let exact = Automaton::build_sorted(terms.iter().map(String::as_str));
+        assert_eq!(packed.reachable_state_count(), exact.reachable_state_count());
+        let fresh = PackedAutomaton::build_sorted(terms.iter().map(String::as_str));
+        assert!(packed.size_bytes() <= fresh.size_bytes());
+
+        let mut buf = Vec::new();
+        for (rank, term) in terms.iter().enumerate() {
+            assert_eq!(packed.rank(term), Some(rank as u32));
+            packed.term_at_into(rank as u32, &mut buf);
+            assert_eq!(buf, term.as_bytes());
+        }
+        // Still mutable afterwards.
+        packed.insert("zzz-after-compact");
+        assert_eq!(packed.rank("zzz-after-compact"), Some(terms.len() as u32));
+        packed.compact();
+        assert_eq!(packed.rank("zzz-after-compact"), Some(terms.len() as u32));
+    }
+
+    /// `remove`/`insert`/`lower_bound` against a sorted-set model, under
+    /// a deterministic pseudo-random mix of inserts and removes (shared
+    /// prefixes, prefix-of-another-term cases, removing absent terms).
+    #[test]
+    fn packed_automaton_remove_and_lower_bound_match_model() {
+        let pool: Vec<String> = (0..400)
+            .map(|i| match i % 4 {
+                0 => format!("http://ex.org/a/{}", i / 4),
+                1 => format!("http://ex.org/a/{}x", i / 8),
+                2 => format!("_:b{}", i % 37),
+                _ => format!("\"{}\"@en", i * 31 % 97),
+            })
+            .collect();
+        let mut model = std::collections::BTreeSet::<String>::new();
+        let mut packed = PackedAutomaton::build_sorted(std::iter::empty());
+        let mut state = 0x9E37_79B9_u32;
+        for step in 0..3000 {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            let term = &pool[state as usize % pool.len()];
+            if state % 3 == 0 {
+                assert_eq!(packed.remove(term), model.remove(term), "step {step} remove {term}");
+            } else {
+                packed.insert(term);
+                model.insert(term.clone());
+            }
+            packed.release_construction_state();
+            if step % 97 == 0 {
+                packed.compact();
+            }
+            if step % 50 == 0 || step == 2999 {
+                let sorted: Vec<&String> = model.iter().collect();
+                let mut buf = Vec::new();
+                for (rank, t) in sorted.iter().enumerate() {
+                    assert_eq!(packed.rank(t), Some(rank as u32));
+                    assert_eq!(packed.lower_bound(t), (rank as u32, true));
+                    packed.term_at_into(rank as u32, &mut buf);
+                    assert_eq!(buf, t.as_bytes());
+                }
+                for probe in pool.iter().map(|t| format!("{t}~")).chain(["".to_string(), "zzz".to_string(), "h".to_string()]) {
+                    let below = sorted.iter().filter(|t| t.as_str() < probe.as_str()).count() as u32;
+                    assert_eq!(packed.lower_bound(&probe), (below, model.contains(&probe)), "probe {probe:?}");
+                }
+                let streamed: Vec<Vec<u8>> = {
+                    let mut st = packed.stream();
+                    let mut v = Vec::new();
+                    while let Some(t) = st.next() {
+                        v.push(t.to_vec());
+                    }
+                    v
+                };
+                assert_eq!(streamed, sorted.iter().map(|t| t.as_bytes().to_vec()).collect::<Vec<_>>());
+            }
+        }
+        packed.compact();
+        let exact = Automaton::build_sorted(model.iter().map(String::as_str));
+        assert_eq!(packed.reachable_state_count(), exact.reachable_state_count());
+    }
+
     #[test]
     fn packed_automaton_size_matches_the_earlier_estimate() {
         let mut terms = namespace_clustered_terms(300);
@@ -3446,7 +4088,9 @@ mod tests {
         terms.dedup();
         let automaton = Automaton::build_sorted(terms.iter().map(String::as_str));
         let packed = PackedAutomaton::compile(&automaton);
-        assert_eq!(packed.size_bytes(), automaton.estimate_packed_bytes());
+        // The estimate models the original fixed-width layout; the current
+        // one (implicit outputs/counts, delta/NEXT targets) is never larger.
+        assert!(packed.size_bytes() <= automaton.estimate_packed_bytes());
     }
 
     /// `PackedAutomaton::insert`, built up one term at a time in
@@ -3511,17 +4155,20 @@ mod tests {
         assert_eq!(packed.reachable_state_count(), before_reachable);
     }
 
-    /// The minimality regression test the original design plan called
-    /// for (step 4: "after a scripted sequence of incremental inserts,
-    /// the resulting automaton's state count must equal a fresh
-    /// `build_sorted` over the same final term set"), applied to the
-    /// packed representation: `insert` is expected to leave dead,
-    /// unreachable *bytes* behind (see the struct doc comment), but the
-    /// live, reachable structure it leaves behind must still be exactly
-    /// as minimal as building fresh from scratch -- not merely correct,
-    /// but not bloated either.
+    /// The original design plan's minimality regression test (step 4:
+    /// "after a scripted sequence of incremental inserts, the resulting
+    /// automaton's state count must equal a fresh `build_sorted` over
+    /// the same final term set") no longer holds exactly, now that
+    /// `PackedRegistry` is a bounded LRU cache rather than an exact,
+    /// unbounded one (its own doc comment has the full reasoning, and
+    /// why this is the right tradeoff rather than a regression). What
+    /// must still hold: every answer stays correct, and the lossy cache
+    /// can only ever find *fewer or equal* merges than an exact one --
+    /// its equivalence classes are a subset of an exact register's --
+    /// so `reachable_state_count` can only be `>=` a fresh minimal
+    /// build's, never less.
     #[test]
-    fn packed_automaton_insert_reaches_same_minimality_as_fresh_build() {
+    fn packed_automaton_insert_stays_correct_though_no_longer_exactly_minimal() {
         let mut pool = namespace_clustered_terms(150); // 600 distinct terms
         pool.sort_unstable();
         pool.dedup();
@@ -3544,10 +4191,7 @@ mod tests {
         }
 
         let fresh = Automaton::build_sorted(pool.iter().map(String::as_str));
-        assert_eq!(
-            packed.reachable_state_count(),
-            fresh.reachable_state_count()
-        );
+        assert!(packed.reachable_state_count() >= fresh.reachable_state_count());
 
         for (expected_rank, term) in pool.iter().enumerate() {
             assert_eq!(packed.rank(term), Some(expected_rank as u32));

@@ -35,9 +35,30 @@ use crate::TermId;
 use crate::entries_arena::EntriesArena;
 use crate::micro_fst::PackedAutomaton;
 
+/// `merge_into` compacts a block (`PackedAutomaton::compact`) once its
+/// bytes per term exceed this multiple of the value right after its last
+/// fresh build or compaction. Dead records accumulate with every merge;
+/// this bounds them during a load, cheaply, while
+/// `PackedAutomatonDictionary::shrink_to_fit` compacts every block at the
+/// end. See DESIGN.md's "copy-compaction" for the measured tradeoff.
+const COMPACT_GROWTH_RATIO: f32 = 2.0;
+
+/// `merge_into` switches from streaming the whole block to one
+/// `lower_bound` descent per incoming term when the run is at most
+/// `1 / SMALL_RUN_FACTOR` of the block. See DESIGN.md's "incremental
+/// single-term mutation" for the measurement behind it.
+const SMALL_RUN_FACTOR: usize = 2;
+
+fn bytes_per_term(packed: &PackedAutomaton, terms: usize) -> f32 {
+    packed.size_bytes() as f32 / terms.max(1) as f32
+}
+
 #[derive(Debug)]
 pub(crate) struct PackedAutomatonBlock {
     packed: PackedAutomaton,
+    /// Bytes per term right after the last fresh build or compaction --
+    /// the baseline `merge_into` compares growth against.
+    compact_bytes_per_term: f32,
     ids: Vec<TermId>,
     min_key: Box<str>,
 }
@@ -64,12 +85,22 @@ impl PackedAutomatonBlock {
         let pairs: Vec<(&'a str, TermId)> = entries.collect();
         let min_key: Box<str> = pairs.first().map_or_else(Box::default, |&(t, _)| t.into());
         let ids: Vec<TermId> = pairs.iter().map(|&(_, id)| id).collect();
-        let packed = PackedAutomaton::build_sorted(pairs.iter().map(|&(t, _)| t));
+        let mut packed = PackedAutomaton::build_sorted(pairs.iter().map(|&(t, _)| t));
+        // Blocks are long-lived: keep only what queries need.
+        packed.release_construction_state();
         PackedAutomatonBlock {
+            compact_bytes_per_term: bytes_per_term(&packed, ids.len()),
             packed,
             ids,
             min_key,
         }
+    }
+
+    /// Drops dead records and minimizes (`PackedAutomaton::compact`),
+    /// resetting the growth baseline `merge_into` compares against.
+    pub(crate) fn compact(&mut self) {
+        self.packed.compact();
+        self.compact_bytes_per_term = bytes_per_term(&self.packed, self.ids.len());
     }
 
     pub(crate) fn len(&self) -> usize {
@@ -176,6 +207,10 @@ impl PackedAutomatonBlock {
             };
         }
 
+        if incoming.len() * SMALL_RUN_FACTOR <= self.ids.len() {
+            return self.merge_small_run(&incoming, alloc_id, resolved);
+        }
+
         let mut new_ids = Vec::with_capacity(self.ids.len() + incoming.len());
         let mut unchanged_prefix = None;
         let mut added = 0usize;
@@ -214,18 +249,78 @@ impl PackedAutomatonBlock {
             resolved(id);
         }
         let unchanged_prefix = unchanged_prefix.unwrap_or(new_ids.len());
-
         if added > 0 {
-            self.packed.insert_sorted(incoming.iter().copied());
-            self.ids = new_ids;
-            if unchanged_prefix == 0 {
-                self.min_key = self.term_at(0).into_boxed_str();
-            }
+            self.apply_merge(&incoming, new_ids, unchanged_prefix);
         }
-
         PackedMergeOutcome {
             added,
             unchanged_prefix,
+        }
+    }
+
+    /// `merge_into` for a run much smaller than the block: one
+    /// `PackedAutomaton::lower_bound` descent per incoming term finds its
+    /// old rank, instead of streaming every term in the block -- the
+    /// single-term insert and typical bulk-load case (a batch spread over
+    /// thousands of blocks lands a few terms in each).
+    fn merge_small_run(
+        &mut self,
+        incoming: &[&str],
+        mut alloc_id: impl FnMut() -> TermId,
+        mut resolved: impl FnMut(TermId),
+    ) -> PackedMergeOutcome {
+        let mut new_ids = Vec::with_capacity(self.ids.len() + incoming.len());
+        let mut new_terms: Vec<&str> = Vec::new();
+        let mut unchanged_prefix = None;
+        let mut copied = 0usize;
+        for &term in incoming {
+            let (rank, found) = self.packed.lower_bound(term);
+            let rank = rank as usize;
+            new_ids.extend_from_slice(&self.ids[copied..rank]);
+            copied = rank;
+            if found {
+                // Copied with the rest of the old ids at its own position.
+                resolved(self.ids[rank]);
+            } else {
+                unchanged_prefix.get_or_insert(new_ids.len());
+                let id = alloc_id();
+                new_ids.push(id);
+                new_terms.push(term);
+                resolved(id);
+            }
+        }
+        new_ids.extend_from_slice(&self.ids[copied..]);
+        let added = new_terms.len();
+        let unchanged_prefix = unchanged_prefix.unwrap_or(new_ids.len());
+        if added > 0 {
+            self.apply_merge(&new_terms, new_ids, unchanged_prefix);
+        }
+        PackedMergeOutcome {
+            added,
+            unchanged_prefix,
+        }
+    }
+
+    /// Inserts `terms` (sorted; already-present ones are no-ops) and
+    /// installs the merged id order.
+    fn apply_merge(&mut self, terms: &[&str], new_ids: Vec<TermId>, unchanged_prefix: usize) {
+        self.packed.reserve_registry(terms.len());
+        self.packed.insert_sorted(terms.iter().copied());
+        self.packed.release_construction_state();
+        self.ids = new_ids;
+        self.compact_if_grown();
+        if unchanged_prefix == 0 {
+            self.min_key = self.term_at(0).into_boxed_str();
+        }
+    }
+
+    /// Compacts once bytes/term exceed `COMPACT_GROWTH_RATIO` times the
+    /// value right after the last fresh build or compaction.
+    fn compact_if_grown(&mut self) {
+        if bytes_per_term(&self.packed, self.ids.len())
+            > COMPACT_GROWTH_RATIO * self.compact_bytes_per_term
+        {
+            self.compact();
         }
     }
 
@@ -233,30 +328,23 @@ impl PackedAutomatonBlock {
     /// of leading entries left unchanged (== the removed term's old rank,
     /// same reasoning as `AutomatonBlock::remove`). Unlike
     /// `AutomatonBlock::remove` (an O(1) `Vec::remove`, no decode),
-    /// `PackedAutomaton` has no incremental remove at all -- this decodes
-    /// every other entry and rebuilds the whole block from scratch, the
-    /// same full-rebuild shape `Block`'s fst-backed `remove` already has.
-    /// An honest, not-hidden cost: worth watching for in any timing
-    /// comparison that includes removals.
+    /// Removes `term` if present, returning its former id and the count
+    /// of leading entries left unchanged (== the removed term's old rank,
+    /// same reasoning as `AutomatonBlock::remove`). Incremental:
+    /// `PackedAutomaton::lower_bound` finds the rank and
+    /// `PackedAutomaton::remove` rewrites only the term's path; dead
+    /// records are reclaimed by the usual growth-triggered compaction.
     pub(crate) fn remove(&mut self, term: &str) -> Option<(TermId, usize)> {
-        let old_rank = self.rank(term)?;
-        let removed_id = self.ids[old_rank];
-
-        let mut remaining_terms: Vec<String> = Vec::with_capacity(self.ids.len() - 1);
-        let mut stream = self.packed.stream();
-        let mut local_rank = 0usize;
-        while let Some(term_bytes) = stream.next() {
-            if local_rank != old_rank {
-                remaining_terms.push(
-                    std::str::from_utf8(term_bytes)
-                        .expect("keys were inserted as valid UTF-8 str bytes")
-                        .to_string(),
-                );
-            }
-            local_rank += 1;
+        let (rank, found) = self.packed.lower_bound(term);
+        if !found {
+            return None;
         }
-        self.ids.remove(old_rank);
-        self.packed = PackedAutomaton::build_sorted(remaining_terms.iter().map(String::as_str));
+        let old_rank = rank as usize;
+        let removed_id = self.ids.remove(old_rank);
+        self.packed.reserve_registry(1);
+        self.packed.remove(term);
+        self.packed.release_construction_state();
+        self.compact_if_grown();
 
         if self.ids.is_empty() {
             self.min_key = Box::default();

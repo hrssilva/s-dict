@@ -11,8 +11,9 @@
 //!
 //! Deliberately smaller in scope than `AutomatonDictionary` itself
 //! (already smaller in scope than `Dictionary` -- see its own module doc
-//! comment): no `PreparedBatch`/`insert_prepared`, no `get_terms_into`/
-//! `get_terms_scattered_into`. `get_terms_seeked_into` *is* implemented
+//! comment): no `get_terms_into`/`get_terms_scattered_into`.
+//! `insert_prepared` *is* implemented, so worker threads can sort/dedup
+//! batches off the writer thread exactly as for `Dictionary`. `get_terms_seeked_into` *is* implemented
 //! (`PackedAutomatonBlock::decode_sorted_ranks_into`, via
 //! `PackedAutomaton::decode_ranks_into` -- ported from `Automaton`'s own
 //! once `PackedAutomaton` grew the same recursive-descent batch-decode
@@ -28,9 +29,10 @@
 
 use std::num::NonZeroU32;
 
-use crate::batch::BatchOrder;
+use crate::batch::{BatchOrder, PreparedBatch};
 use crate::entries_arena::EntriesArena;
 use crate::packed_automaton_block::PackedAutomatonBlock;
+use crate::reverse_map::ReverseMap;
 use crate::{TermDictionary, TermId};
 
 /// A stable handle for a block: an index into `PackedAutomatonDictionary`'s
@@ -51,8 +53,22 @@ impl PackedAutomatonBlockId {
     }
 }
 
-const DEFAULT_BLOCK_MIN: usize = 64;
-const DEFAULT_BLOCK_MAX: usize = 256;
+/// Larger than `Dictionary`'s 64..=256: incremental merges make bigger
+/// blocks cheap here (an `fst` block is rebuilt on every change). On real
+/// RDF, 256..=1024 vs 64..=256 measured -8% logical size, -11% bulk
+/// insertion and -17% `get_id`. Single-term insert/remove no longer scale
+/// with block size (~20 us each; DESIGN.md's "incremental single-term
+/// mutation"). DESIGN.md's "block size and fill".
+const DEFAULT_BLOCK_MIN: usize = 256;
+
+/// Target fill of the chunks `split_while_oversized` produces, as a
+/// percentage of `block_max`. 100% leaves bulk-loaded blocks full, so the
+/// first single-term inserts afterwards split a third of the time (651 of
+/// 2,000 measured; 134 us average insert). 90% removed those splits
+/// (21.5 us) for +0.4% size. DESIGN.md's "incremental single-term
+/// mutation".
+const SPLIT_FILL_PERCENT: usize = 90;
+const DEFAULT_BLOCK_MAX: usize = 1024;
 
 /// See the module doc comment. Same macro structure as `AutomatonDictionary`,
 /// `PackedAutomatonBlock` in place of `AutomatonBlock`.
@@ -61,7 +77,7 @@ pub struct PackedAutomatonDictionary {
     blocks: Vec<Option<PackedAutomatonBlock>>,
     free_block_slots: Vec<u32>,
     directory: Vec<(Box<str>, PackedAutomatonBlockId)>,
-    id_to_block: Vec<Option<(PackedAutomatonBlockId, u16)>>,
+    id_to_block: ReverseMap,
     free_term_ids: Vec<u32>,
     next_term_id: u32,
     block_min: usize,
@@ -96,7 +112,7 @@ impl PackedAutomatonDictionary {
             blocks: Vec::new(),
             free_block_slots: Vec::new(),
             directory: Vec::new(),
-            id_to_block: Vec::new(),
+            id_to_block: ReverseMap::new(block_max),
             free_term_ids: Vec::new(),
             next_term_id: 0,
             block_min,
@@ -104,6 +120,36 @@ impl PackedAutomatonDictionary {
             len: 0,
             scratch: EntriesArena::new(),
         }
+    }
+
+    /// `Dictionary::insert_prepared`'s contract: insert a worker-prepared
+    /// batch without sorting or deduplicating it again. Returns IDs in
+    /// original input order, including duplicate occurrences.
+    pub fn insert_prepared(&mut self, prepared: PreparedBatch<'_>) -> Vec<TermId> {
+        let batch = prepared.batch;
+        self.insert_ordered(&batch.order, |u| batch.term(batch.order.first(u)))
+    }
+
+    /// Compacts every block (`PackedAutomaton::compact`: drops dead records
+    /// and minimizes exactly), then trims dictionary-level spare capacity
+    /// -- the reverse id table, directory, slot/id free lists, and the
+    /// split/merge scratch arena -- so retained heap tracks `size_bytes`.
+    /// Call after a bulk load; not done per batch, since trimming a
+    /// still-growing table would turn amortized growth into a
+    /// realloc-and-copy per batch, and per-merge compaction is only
+    /// triggered by growth (`COMPACT_GROWTH_RATIO`). Per-block construction
+    /// state is already released after every mutation
+    /// (`PackedAutomaton::release_construction_state`).
+    pub fn shrink_to_fit(&mut self) {
+        for block in self.blocks.iter_mut().flatten() {
+            block.compact();
+        }
+        self.blocks.shrink_to_fit();
+        self.free_block_slots.shrink_to_fit();
+        self.directory.shrink_to_fit();
+        self.id_to_block.shrink_to_fit();
+        self.free_term_ids.shrink_to_fit();
+        self.scratch = EntriesArena::new();
     }
 
     /// The number of live blocks, for introspection/testing.
@@ -124,8 +170,7 @@ impl PackedAutomatonDictionary {
             .iter()
             .map(|(key, _)| key.len() + std::mem::size_of::<PackedAutomatonBlockId>())
             .sum();
-        let id_to_block_bytes =
-            self.id_to_block.len() * std::mem::size_of::<Option<(PackedAutomatonBlockId, u16)>>();
+        let id_to_block_bytes = self.id_to_block.size_bytes();
         blocks_bytes + directory_bytes + id_to_block_bytes
     }
 
@@ -143,7 +188,7 @@ impl PackedAutomatonDictionary {
     /// `Dictionary::get_term_into`'s exact contract.
     pub fn get_term_into(&self, id: TermId, buf: &mut Vec<u8>) -> bool {
         buf.clear();
-        let Some((block_id, local_rank)) = self.id_to_block.get(id.0 as usize).and_then(|e| *e)
+        let Some((block_id, local_rank)) = self.reverse(id)
         else {
             return false;
         };
@@ -167,7 +212,7 @@ impl PackedAutomatonDictionary {
             std::collections::HashMap::new();
         for (pos, &id) in ids.iter().enumerate() {
             if let Some((block_id, local_rank)) =
-                self.id_to_block.get(id.0 as usize).copied().flatten()
+                self.reverse(id)
             {
                 by_block
                     .entry(block_id)
@@ -221,14 +266,26 @@ impl PackedAutomatonDictionary {
     }
 
     fn set_id_to_block(&mut self, id: TermId, block_id: PackedAutomatonBlockId, local_rank: usize) {
-        let idx = id.0 as usize;
-        if idx >= self.id_to_block.len() {
-            self.id_to_block.resize(idx + 1, None);
-        }
-        self.id_to_block[idx] = Some((block_id, local_rank as u16));
+        self.id_to_block.set(id.0, block_id.slot(), local_rank);
+    }
+
+    /// `(block, local rank)` for a live id. Ranks of a settled dictionary
+    /// are `< block_max <= u16::MAX`.
+    #[inline]
+    fn reverse(&self, id: TermId) -> Option<(PackedAutomatonBlockId, u16)> {
+        self.id_to_block
+            .get(id.0)
+            .map(|(slot, rank)| (PackedAutomatonBlockId::from_slot(slot), rank as u16))
     }
 
     fn assign_ranks(&mut self, block_id: PackedAutomatonBlockId, skip: usize) {
+        // A block over `block_max` (a batch run can overshoot by far more
+        // than `ReverseMap`'s rank bits allow) is always about to be split
+        // by `split_while_oversized`, which assigns every chunk from rank
+        // 0 -- so only settled blocks are assigned.
+        if self.block(block_id).len() > self.block_max {
+            return;
+        }
         let len = self.block(block_id).len();
         for local_rank in skip..len {
             let id = self.block(block_id).id_at(local_rank);
@@ -257,40 +314,49 @@ impl PackedAutomatonDictionary {
         Some(idx.saturating_sub(1))
     }
 
-    fn split_while_oversized(&mut self, start_dir_idx: usize) {
-        let mut stack = vec![start_dir_idx];
-        while let Some(dir_idx) = stack.pop() {
-            let block_id = self.directory[dir_idx].1;
-            if self.block(block_id).len() > self.block_max {
-                self.split(dir_idx);
-                stack.push(dir_idx);
-                stack.push(dir_idx + 1);
-            }
-        }
-    }
-
-    fn split(&mut self, dir_idx: usize) {
+    /// Splits the block at `dir_idx`, if it exceeds `block_max`, into
+    /// balanced chunks of at most `SPLIT_FILL_PERCENT` of `block_max` --
+    /// `Dictionary::rebuild_batch_block`'s shape -- rather than by repeated
+    /// median halving, which leaves blocks anywhere from half to completely
+    /// full after a large batch run (DESIGN.md's "block size and fill").
+    /// Each chunk holds at least `block_min` terms.
+    fn split_while_oversized(&mut self, dir_idx: usize) {
         let block_id = self.directory[dir_idx].1;
+        let total = self.block(block_id).len();
+        if total <= self.block_max {
+            return;
+        }
+        let target = (self.block_max * SPLIT_FILL_PERCENT / 100).max(2 * self.block_min);
+        let chunks = total.div_ceil(target);
+        let base = total / chunks;
+        let extra = total % chunks;
+
         let mut arena = std::mem::take(&mut self.scratch);
         arena.clear();
         self.block(block_id).decode_into(&mut arena);
-        let mid = arena.len() / 2;
-
-        let left_block = PackedAutomatonBlock::build(arena.range(0, mid));
-        let right_block = PackedAutomatonBlock::build(arena.range(mid, arena.len()));
-        let right_min: Box<str> = right_block.min_key().into();
-
-        *self.block_mut(block_id) = left_block;
-        self.assign_ranks(block_id, 0);
-
-        let right_block_id = self.alloc_block(right_block);
-        self.assign_ranks(right_block_id, 0);
-
+        let mut new_directory = Vec::with_capacity(chunks - 1);
+        let mut start = 0;
+        for chunk in 0..chunks {
+            let end = start + base + usize::from(chunk < extra);
+            let block = PackedAutomatonBlock::build(arena.range(start, end));
+            // The first chunk keeps the original id and min key.
+            let chunk_id = if chunk == 0 {
+                *self.block_mut(block_id) = block;
+                block_id
+            } else {
+                let min_key: Box<str> = block.min_key().into();
+                let id = self.alloc_block(block);
+                new_directory.push((min_key, id));
+                id
+            };
+            self.assign_ranks(chunk_id, 0);
+            start = end;
+        }
         self.scratch = arena;
-
-        self.directory
-            .insert(dir_idx + 1, (right_min, right_block_id));
+        // Shift the router's tail once, rather than once per chunk.
+        self.directory.splice(dir_idx + 1..dir_idx + 1, new_directory);
     }
+
 
     fn remove_empty_block(&mut self, dir_idx: usize) {
         let (_, block_id) = self.directory.remove(dir_idx);
@@ -442,7 +508,7 @@ impl TermDictionary for PackedAutomatonDictionary {
     }
 
     fn get_term(&self, id: TermId) -> Option<String> {
-        let (block_id, local_rank) = self.id_to_block.get(id.0 as usize)?.as_ref().copied()?;
+        let (block_id, local_rank) = self.reverse(id)?;
         Some(self.block(block_id).term_at(local_rank as usize))
     }
 
@@ -490,7 +556,7 @@ impl TermDictionary for PackedAutomatonDictionary {
         let block_ref = self.block_mut(block_id);
         let (id, unchanged_prefix) = block_ref.remove(term)?;
 
-        self.id_to_block[id.0 as usize] = None;
+        self.id_to_block.clear(id.0);
         self.free_term_ids.push(id.0);
         self.len -= 1;
 
@@ -620,6 +686,88 @@ mod tests {
             drained < full,
             "size_bytes should shrink as terms are removed"
         );
+    }
+
+    /// A later batch landing far more than `2 * block_max` terms in one
+    /// block: ranks must be assigned only after splitting (the packed
+    /// reverse map has no room for them before).
+    #[test]
+    fn oversized_batch_run_is_split_before_ranks_are_assigned() {
+        let mut dict = PackedAutomatonDictionary::with_block_bounds(4, 16);
+        let first: Vec<String> = (0..40).map(|i| format!("k{:05}", i * 100)).collect();
+        let first_refs: Vec<&str> = first.iter().map(String::as_str).collect();
+        dict.insert_batch(&first_refs);
+        let second: Vec<String> = (0..4000).map(|i| format!("k{i:05}x")).collect();
+        let second_refs: Vec<&str> = second.iter().map(String::as_str).collect();
+        let ids = dict.insert_batch(&second_refs);
+        for (t, id) in second_refs.iter().zip(&ids) {
+            assert_eq!(dict.get_id(t), Some(*id));
+            assert_eq!(dict.get_term(*id).as_deref(), Some(*t));
+        }
+        for t in &first_refs {
+            let id = dict.get_id(t).expect("first batch term present");
+            assert_eq!(dict.get_term(id).as_deref(), Some(*t));
+        }
+    }
+
+    /// Mixed single inserts, small and large batches (both `merge_into`
+    /// paths), and removes (incremental, with neighbor merges at these
+    /// tiny bounds), checked against a model after every operation batch.
+    #[test]
+    fn mixed_mutations_match_model() {
+        let mut dict = PackedAutomatonDictionary::with_block_bounds(8, 32);
+        let mut model: std::collections::BTreeMap<String, TermId> = Default::default();
+        let mut state = 0x2545_F491_u32;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            state
+        };
+        for round in 0..400 {
+            let op = next() % 10;
+            if op < 4 {
+                let t = format!("t{:04}", next() % 3000);
+                let id = dict.insert(&t);
+                assert_eq!(*model.entry(t).or_insert(id), id);
+            } else if op < 7 {
+                let n = if op == 6 { 300 } else { 1 + next() as usize % 6 };
+                let batch: Vec<String> = (0..n).map(|_| format!("t{:04}", next() % 3000)).collect();
+                let refs: Vec<&str> = batch.iter().map(String::as_str).collect();
+                let ids = dict.insert_batch(&refs);
+                for (t, id) in batch.iter().zip(ids) {
+                    assert_eq!(*model.entry(t.clone()).or_insert(id), id);
+                }
+            } else {
+                let t = format!("t{:04}", next() % 3000);
+                assert_eq!(dict.remove(&t), model.remove(&t), "round {round} remove {t}");
+            }
+            if round % 20 == 0 || round == 399 {
+                assert_eq!(dict.len(), model.len());
+                for (t, &id) in &model {
+                    assert_eq!(dict.get_id(t), Some(id), "round {round} get_id {t}");
+                    assert_eq!(dict.get_term(id).as_deref(), Some(t.as_str()));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn insert_prepared_matches_insert_batch() {
+        let terms: Vec<String> = (0..2000).map(|i| format!("http://example.org/{}", i % 1500)).collect();
+        let refs: Vec<&str> = terms.iter().map(String::as_str).collect();
+        let mut batch = crate::TermBatch::new();
+        for t in &refs {
+            batch.push(t);
+        }
+        batch.prepare();
+        let mut prepared = PackedAutomatonDictionary::with_block_bounds(8, 32);
+        let ids = prepared.insert_prepared(batch.prepared().expect("prepared"));
+        let mut plain = PackedAutomatonDictionary::with_block_bounds(8, 32);
+        assert_eq!(ids, plain.insert_batch(&refs));
+        for (t, id) in refs.iter().zip(&ids) {
+            assert_eq!(prepared.get_id(t), Some(*id));
+        }
     }
 
     #[test]

@@ -3830,3 +3830,491 @@ registry-boundedness difference (they differ simultaneously here), or
 attempting to add output-pushing to `Automaton`/`PackedAutomaton` --
 `AUTOMATON_REFERENCE.md`'s §5 has the specific next experiments this
 would need, not attempted in this pass.
+
+## measuring the register-pruning gap directly
+
+`AUTOMATON_REFERENCE.md`/`FST_VS_PACKED_AUTOMATON.md` both asserted,
+from reading the code rather than running it, that `Automaton::release()`
+(`micro_fst.rs:2420`, `register.remove(&sig)` on refcount-zero) keeps
+`register` trimmed to the reachable state set, while `PackedAutomaton`'s
+`write_confirmed_state` (`micro_fst.rs:1751-1770`, `register.insert` at
+line 1768, no corresponding `remove` anywhere in the type) has no such
+mechanism. Added `register_len()` to both types (`#[cfg(test)]`,
+`micro_fst.rs:1146` and `:1814`) and two measurement tests
+(`measure_automaton_register_tracks_reachable_under_churn`,
+`measure_packed_automaton_register_growth_under_sustained_inserts`,
+both `#[ignore]`, `cargo test --release --lib <name> -- --ignored
+--nocapture`) to check this directly instead of leaving it asserted.
+
+**`Automaton`**, 2000 rounds of one-out-one-in churn (remove one live
+term, insert one new one, holding the live set at 800 terms, same shape
+as `measure_slot_reclamation_gap_under_sustained_churn`): `register_len`
+tracked `reachable_state_count` within 0.994-0.996x for every reported
+round, start to finish (round 0: register=90, reachable=91; round 2000:
+register=245, reachable=246 -- off by exactly 1, the root, which is
+never itself a register entry). The pruning claim holds, measured, not
+just read.
+
+**`PackedAutomaton`**, 2000 rounds of insert-only churn (no `remove`
+exists on this type; same corpus and new-term pattern as
+`measure_packed_automaton_dead_bytes_under_sustained_inserts`):
+`reachable_state_count` stayed essentially flat (91 -> 118 -> 120 across
+all 2000 rounds -- the inserted terms share a long common prefix, so
+almost nothing new becomes reachable), while `register_len` climbed
+without bound: 91 -> 62,632. The register/reachable ratio went from
+1.0x at round 0 to **522x** at round 2000, climbing roughly linearly the
+whole way (round 200: 55.3x; round 1000: 263.6x; round 2000: 521.9x).
+Every insert leaves the previous round's now-superseded confirmed
+states stranded in the register permanently -- measured, not inferred,
+and a materially worse gap than the qualitative "only ever grows"
+framing suggested before this was run.
+
+## replacing PackedAutomaton's register with a bounded LRU cache
+
+The unbounded exact `HashMap` register measured above is now gone.
+`PackedRegister`/`PackedSignature` were replaced with `PackedRegistry`/
+`PackedRegistryCell` (`src/micro_fst.rs`, just above `PackedAutomaton`'s
+own struct definition) -- `fst`'s own `Registry`
+(`vendor/fst/src/raw/registry.rs`) ported to this crate's target type
+(`u32` byte offsets, not `CompiledAddr`): a fixed `table_size *
+mru_size` array of cells, each holding its own clone of the signature
+it was inserted with, hashed into a bucket (`FxHasher`, this crate's
+own established choice, not `fst`'s FNV-1a), linearly scanned within
+that bucket, promoted-on-hit, LRU-evicted-on-miss -- `fst`'s own
+`RegistryCache::entry`'s exact algorithm. `table_size` is sized once,
+from the same formula `Block::build` already uses for its own `fst`
+registry (`entries.len() * 4, clamped [64, 10_000]`, `mru_size = 2`,
+`src/block.rs:71`), and never resized afterward -- sound specifically
+because `s-dict` blocks (and so a `PackedAutomaton`'s term count) are
+already size-bounded by this crate's own split policy (`DEFAULT_BLOCK_
+MAX = 256`, `src/dictionary.rs:33`), so a table sized from the initial
+build stays proportioned across further incremental `insert`s rather
+than needing to track growth. `write_confirmed_state` (`src/
+micro_fst.rs`) simplified alongside this: `get`/`insert` now take
+`children: &[(u8, u32, u32)]` directly, so a hit -- the overwhelming
+majority of calls -- touches no allocation at all; `sig_scratch` (the
+scratch-buffer-reuse workaround the old exact `HashMap` needed to avoid
+allocating a fresh `Vec` on every lookup) is gone entirely, no longer
+needed.
+
+This is the same tradeoff `fst` has always made, now applied to
+`PackedAutomaton` too: bounded, constant memory for the dedup
+structure itself, in exchange for a documented, accepted loss of exact
+minimality (`vendor/fst/src/raw/mod.rs:226-238`). Three existing tests
+asserted exact structural equality across different construction
+orders over the same term set (`packed_automaton_build_sorted_matches_
+incremental_insert`, `packed_automaton_insert_sorted_matches_build_
+sorted`, the former `packed_automaton_insert_reaches_same_minimality_
+as_fresh_build`) -- a property this design deliberately no longer
+guarantees, since a bounded LRU cache's eviction decisions (and so its
+final structure) depend on access history, which different construction
+orders genuinely differ on. Updated to assert what still must hold:
+every `rank`/`term_at` answer stays correct regardless of construction
+order, and a lossy cache's equivalence classes are a subset of an exact
+one's, so `reachable_state_count` can only be `>=` a fresh minimal
+build's, never less (`packed_automaton_insert_stays_correct_though_no_
+longer_exactly_minimal` now asserts `>=` in place of `==`).
+
+**Remeasured, same two corpora `measure_packed_automaton_register_
+growth_under_sustained_inserts` (above) used**, 2000 rounds of
+insert-only churn on an 800-term base set: `register_len` now plateaus
+at exactly 6,400 (= `table_size` 3,200 x `mru_size` 2, `with_capacity_
+hint(800)`'s own sizing) instead of climbing to 62,632 -- bounded, as
+designed, confirmed rather than assumed:
+
+```
+round    0: register=91    reachable=91
+round  200: register=4,662 reachable=118
+round  600: register=6,324 reachable=120
+round 1200: register=6,399 reachable=122
+round 2000: register=6,400 reachable=124   (plateaued since ~round 800)
+```
+
+**Remeasured at dictionary scale, `examples/perf_scale_memory.rs`,
+the exact two corpora/sizes the original RDF-report investigation
+used.** Low-redundancy (hashlike, 300K terms) is where the register
+growth actually showed up in `size_bytes()` before -- and it's fixed:
+
+| terms | `PackedAutomaton` bytes/term | `PackedAutomaton` states/term | `fst` states/term |
+|---|---|---|---|
+| 30,000  | 104.54 | 10.803 | 10.786 |
+| 90,000  | 104.83 | 10.540 | 10.566 |
+| 150,000 | 103.83 | 10.398 | 10.334 |
+| 210,000 | 109.45 | 10.208 | 10.192 |
+| 300,000 | 105.33 | 10.147 | 10.081 |
+
+(Full ten-checkpoint run, both `bytes/term` and `states/term`, in the
+"measuring the register-pruning gap directly" section's sibling run
+above this one -- `./target/release/examples/perf_scale_memory packed
+hashlike 300000 10` / `... fst hashlike 300000 10`.) `bytes/term` is
+now flat across the whole range (104.5 at 30K, 105.3 at 300K, no trend
+-- bouncing within noise, not climbing) where this exact corpus and
+scale previously showed real, recorded growth: 132.23 bytes/term at
+300K hashlike terms before this fix ("Memory, at real scale" section
+above, same `perf_scale_memory` harness), up from ~108 at 5K
+(`FST_VS_PACKED_AUTOMATON.md`'s "Memory at scale" row). The
+register-growth-driven bloat this whole investigation
+chased is gone on this corpus. `states/term` now tracks `fst`'s own
+curve closely (10.147 vs. 10.081 at 300K, both decreasing at
+essentially the same rate) -- confirming the fix addressed exactly the
+mechanism it targeted. The remaining `bytes`-level gap vs. `fst` (105
+vs. ~30 bytes/term) is the separate,
+already-documented coding-dimension difference (`fst`'s three adaptive
+node layouts + variable-width packed ints vs. this prototype's one
+uniform record format with fixed 4-byte addresses --
+`FST_VS_PACKED_AUTOMATON.md`'s "On-disk / in-memory representation"),
+not a dedup-structure question.
+
+High-redundancy (clustered, 2M terms) tells the other half of the
+story -- the part this fix was *not* expected to touch:
+
+| terms | `PackedAutomaton` states/term | `fst` states/term |
+|---|---|---|
+| 200,000   | 0.123 | 0.123 |
+| 1,000,000 | 0.176 | 0.127 |
+| 2,000,000 | 0.183 | 0.128 |
+
+`PackedAutomaton`'s `states/term` still grows on this corpus (0.123 ->
+0.183, +49%) while `fst`'s stays essentially flat (0.123 -> 0.128) --
+with the register now bounded and no longer the explanation, this is
+clean, direct evidence (not just the earlier isolating experiments)
+that the growth here is the *other*, separately-identified mechanism:
+`fst`'s output-pushing searching a wider match space than
+`PackedAutomaton`'s one-shot output computation
+(`AUTOMATON_REFERENCE.md` §4). This is the isolating experiment
+`AUTOMATON_REFERENCE.md` §5 asked for and hadn't been run yet --
+registry-boundedness and output-pushing really are two independent
+causes, now separated by direct measurement rather than argument:
+fixing the first left the second's signature untouched.
+
+**Speed, `perf stat`-confirmed** (`cycles:u`, 3 repeated runs each,
+tight agreement): single-term insert
+(`perf_probe_insert_cost_packed_automaton`) now costs ~707-712M cycles,
+down slightly from the pre-fix 729.3M -- the bounded cache's O(`mru_
+size`)=O(2) linear bucket scan is cheap, and there's no more incidental
+`HashMap` resize/rehash cost at all, since the table is never resized.
+Decode (`perf_probe_decode_cost_packed_automaton(_hashlike)`) is
+unaffected, as expected -- decode never touches the register, only
+`insert`/`compile`/`build_sorted` do.
+
+## releasing PackedAutomaton's registry between mutations
+
+Bounding the register fixed its *growth*, but every block still kept
+its whole registry resident for its entire lifetime -- between merges,
+when nothing reads it. Measured on a private real-RDF N-Triples corpus
+(first ~5M triples, 4.58M distinct terms, default 64..=256 blocks,
+`s-bench`'s `nt_dict_file_bench`), with a per-component heap breakdown
+of `PackedAutomatonDictionary`:
+
+| component | before | after |
+|---|---|---|
+| registry table (`table_size * 2` cells, 32 B each) | 944 MiB | 0 |
+| registry cells' `transitions` `Vec`s | 504 MiB | 0 |
+| `bytes` capacity (`size_bytes` counts only `len`) | 317 MiB (len 217) | = len |
+| `id_to_block` capacity | 64 MiB (len ~35) | = len |
+| **logical `size_bytes`** | 271 MiB | 282 MiB |
+| **retained allocation** | 1,866 MiB (6.9x) | 287 MiB (1.02x) |
+
+`with_capacity_hint` sizes the table at 8 cells/term, i.e. ~216 B/term
+of fixed table plus ~115 B/term of cell `Vec`s -- ~5x `bytes` itself.
+
+The fix: `register` is now `Option<PackedRegistry>`.
+`PackedAutomaton::release_construction_state` drops it and
+`shrink_to_fit`s `bytes`; `PackedAutomatonBlock` calls it after every
+`build`, `merge_into` and `remove`. `write_confirmed_state` recreates
+the registry on demand (sized from the root's `subtree_count`), so
+`PackedAutomaton`'s own API and tests are unchanged. Dictionary-level
+slack (`id_to_block`, directory, free lists, scratch arena) is trimmed
+by an explicit `PackedAutomatonDictionary::shrink_to_fit` after a bulk
+load, not per batch -- trimming a still-growing table per batch would
+turn amortized growth into a realloc-and-copy each time.
+
+Cost: a recreated registry starts empty, so new records can't dedup
+against records written before the last release -- `bytes` grew 4%
+(271 -> 282 MiB), the same class of lost sharing LRU eviction already
+accepts. Insertion got slightly *faster* (26.3s -> 24.3s): no large
+table to allocate-and-touch per block build. At 1M/10M triples the
+retained/logical ratio is 1.03x/1.02x (was 9.2x/7.7x).
+
+## real-RDF decomposition: where PackedAutomatonDictionary's bytes go
+
+Same private real-RDF N-Triples corpus as the previous section (first
+10M triples, 6.30M distinct terms, default 64..=256 blocks, one writer).
+A scratch instrument took each block's own term set and built it five
+ways -- the incremental automaton as the dictionary left it, a fresh
+`PackedAutomaton::build_sorted`, an exact-minimal `Automaton::build_sorted`
+(unbounded register), `Block::build` (`fst`), and re-emissions of the
+fresh graph under candidate encodings (validated: the "current format"
+re-emission reproduced the fresh build's byte count exactly).
+
+| layer (bytes/term) | |
+|---|---|
+| total logical size | 53.7 |
+| ids + reverse map + directory (not automaton) | 12.4 |
+| dead records (`bytes.len` - reachable records) | 12.9 |
+| incremental non-minimality (reachable - fresh build) | 3.0 |
+| record encoding (fresh - fst-style re-emission) | 19.0 |
+| fst-style encoding of the fresh automaton | 6.4 |
+| *`Dictionary` (fst) total / automaton* | *18.8 / 6.7* |
+
+**States/term** on identical term sets: fresh packed 2.722, `fst` 2.717,
+exact 2.606, incremental 2.996. Output-pushing contributes nothing
+measurable (AUTOMATON_REFERENCE.md §6); the bounded registry costs both
+implementations ~4.5%; incremental merges cost packed a further ~10%.
+
+**Shape**: 91% of fresh states have exactly one transition (unique term
+tails), which is why per-state overhead dominates.
+
+**Encoding re-emission** (fresh graphs, cumulative, bytes/term): current
+25.45; no output on 1-transition states 22.98; no subtree count on
+0/1-transition states 20.25; LEB128 backward-delta targets 10.85;
+implicit NEXT target 8.49; label folded into header (`fst`'s common
+inputs) 6.44. The fixed 4-byte target was the single largest cost.
+
+**Block size** (global sorted terms re-chunked, fresh builds, fst-style
+encoding / `fst`): 64: 7.65/8.18, 128: 6.74/7.01, 256: 6.14/6.31,
+512: 5.69/5.83, 1024: 5.32/5.44, 4096: 4.81/4.88. Packed blocks average
+175 terms (`Dictionary`'s: 214). Incremental insert makes 512-1024-term
+blocks affordable for packed in a way they aren't for `fst`.
+
+**Compaction by rebuilding from terms is too slow.** Variants of
+`merge_into` (10M triples, one writer): rebuild every merge 227 MiB /
+63.9s insertion; rebuild when a block exceeds 1.25x its post-build
+bytes/term 240 MiB / 56.3s; 1.5x 254 MiB / 50.2s; 2x 269 MiB / 40.0s;
+never 323 MiB / 33.9s (`fst`: 113 MiB / 50.9s). Rebuilding re-derives
+the automaton; reclaiming dead records should copy reachable records
+instead (still open).
+
+## fst-style record encoding, and insert_prepared
+
+Applied from the decomposition above (`micro_fst.rs`'s `PackedAutomaton`
+doc comment has the exact layout): records are addressed by their last
+byte (a header) and parsed downward, as in `fst`; the first transition's
+output is implicit (`is_final`); targets are reversed-LEB128 deltas from
+the field's own position; a NEXT header bit elides a single-transition
+record's target when its child is the record immediately below; the
+6-bit count escapes to one extra byte at 63 (the old 7-bit field had no
+escape at all). **No subtree counts are stored**: `term_count` holds the
+root's, and `StagingFrame` children carry counts derived top-down
+(`open_frame`: consecutive output differences, the last child takes the
+remainder), so `insert`/`insert_sorted` never read a count back from a
+record. Label folding was not adopted (see below).
+
+`PackedAutomatonDictionary::insert_prepared` was added (`Dictionary`'s
+contract), so batches are sorted/deduplicated on parser workers, as for
+`Dictionary`. Previously `nt_dict_file_bench` fell back to
+`insert_batch` for packed, putting sorting inside its timed insertion.
+
+Results, same corpus, one writer, logical size / insertion:
+
+| triples (terms) | `Dictionary` (fst) | packed, before | packed, after |
+|---|---|---|---|
+| 1M (1.01M) | 15.1 MiB / 4.8s | 42.8 MiB / 3.6s | 23.5 MiB / 3.0s |
+| 5M (4.58M) | 86.4 MiB / 30.6s | 282.3 MiB / 24.3s | 130.6 MiB / 20.7s |
+| 10M (6.30M) | 112.8 MiB / 50.9s | 322.6 MiB / 40.8s | 160.5 MiB / 33.9s |
+
+Dictionary-level lookups (5M triples, 200,000 ids spread over the whole
+range, two runs each, agreeing within 2%): `get_term` 1,418 -> 1,159 ns,
+`get_id` 1,805 -> 1,484 ns (`fst`: 1,790 / 1,610). Smaller records mean
+fewer cache misses at this scale.
+
+In-cache synthetic probes (`perf_probe_decode_cost_packed_automaton*`,
+wall clock, 3 runs after a warm-up outlier): clustered `rank` ~165 ->
+~110 ns/op, `term_at_into` ~152 -> ~139 ns/op; hashlike `rank` ~190 ->
+~190, `term_at_into` ~171 -> ~215 ns/op (+26%) -- the varint parse cost
+on wide states when nothing is cache-bound. Single-term `insert` probe
+4.19 -> 4.36 us/op.
+
+Open, in expected-value order: copy-compaction of dead records (now
+smaller, since dead records shrank with live ones); a packed reverse map
+(`Option<(BlockId, u16)>` is 8 bytes/term in both dictionaries); larger
+blocks; fixed-width transitions on wide states (Lucene-style, for the
+hashlike `term_at_into` regression); label folding (-2.1 bytes/term
+fresh, at more branch cost per transition).
+
+## copy-compaction: reclaiming dead records
+
+`PackedAutomaton::compact` re-emits only the reachable records into a
+fresh buffer (postorder, children in byte order, as `build_sorted`
+writes them, so NEXT targets still apply), deduplicating *exactly* with
+a temporary map keyed by `(is_final, rewritten children)`. Because
+outputs are a function of each state's right language (AUTOMATON_REFERENCE.md
+§6), this bottom-up exact dedup is Revuz-style minimization: the result
+is the minimal automaton, tighter than either `build_sorted` or `fst`
+(both lose ~4.5% to their bounded registries) --
+`packed_automaton_compact_is_exactly_minimal_and_preserves_answers`
+asserts equality with the unbounded-register slab build. Cost is
+O(reachable records); nothing is retained afterwards.
+
+Trigger sweep (same private real-RDF corpus, 10M triples, one writer;
+ratio = block bytes/term vs. its value right after its last fresh build
+or compaction, checked after each merge):
+
+| in-load trigger | final compaction | logical size | insertion |
+|---|---|---|---|
+| never | no | 160.5 MiB | 34.6s |
+| 2.0x | no | 138.1 MiB | 35.3s |
+| 1.5x | no | 130.7 MiB | 37.3s |
+| 1.25x | no | 124.2 MiB | 39.9s |
+| 1.1x | no | 122.2 MiB | 45.0s |
+| every merge | no | 121.2 MiB | 52.7s |
+| never | yes | 120.9 MiB | 38.5s |
+| 2.0x | yes | 120.9 MiB | 39.2s |
+
+Final compaction alone reaches the floor in one O(live) pass (~4s here),
+cheaper than any in-load ratio that gets close. Chosen: in-load 2.0x
+(`COMPACT_GROWTH_RATIO`, bounding dead records during a long load for
+~0.7s) plus compaction of every block in
+`PackedAutomatonDictionary::shrink_to_fit`.
+
+Result vs `Dictionary` (fst), same corpus (`nt_dict_file_bench`,
+insertion includes `shrink_to_fit`):
+
+| run | fst size / insertion | packed size / insertion |
+|---|---|---|
+| 1M triples, 1 writer | 15.11 MiB / 4.8s | 15.37 MiB / 3.6s |
+| 5M triples, 1 writer | 86.41 MiB / 30.5s | 94.40 MiB / 24.3s |
+| 10M triples, 1 writer | 112.75 MiB / 50.9s | 120.87 MiB / 38.5s |
+| 10M triples, 12 parser workers (wall) | 75.62 MiB / 25.8s | 78.26 MiB / 25.0s |
+
+Lookups after load (10M, 1 writer): `get_term` 1,086 ns vs 1,518;
+`get_id` 1,445 vs 1,652. Peak RSS is higher for packed (193 vs 159 MiB
+at 10M, 1 writer) -- dead records live until compaction. With 12
+workers both dictionaries are writer-bound and packed's insertion lead
+mostly disappears (compaction and merges on one thread).
+
+Remaining gap to `fst` (~1.3 bytes/term at 10M): more, smaller blocks
+(175 vs 214 terms average) and the unfolded labels (-2.1 bytes/term
+fresh, measured). Next targets: reverse-map packing (8 bytes/term, both
+dictionaries), larger blocks, label folding, and sharding the writer.
+
+## packing the reverse map
+
+`TermId -> (block, local rank)` was `Vec<Option<(BlockId, u16)>>`: 8
+bytes per id after padding, the largest fixed per-term cost in both
+`Dictionary` and `PackedAutomatonDictionary` (12.4 bytes/term of
+non-automaton overhead in total). `ReverseMap` (`src/reverse_map.rs`)
+packs `slot << rank_bits | rank` into one `u32`, `u32::MAX` meaning
+unassigned/removed, with `rank_bits` sized for `2 * block_max` (9 bits
+at the default 256 -> 23 bits, 8.4M block slots).
+
+Why `2 * block_max`: ranks are briefly assigned to blocks over
+`block_max` before their split -- by one term after a single insert, by
+under `block_min <= block_max / 2` after a neighbor merge -- and
+`Dictionary::split` relies on the left half's ranks already being
+correct. `PackedAutomatonDictionary`'s batch path can overshoot by a
+whole run, so its `assign_ranks` skips any block over `block_max`
+(`split_while_oversized` always follows and assigns every chunk from
+rank 0); `oversized_batch_run_is_split_before_ranks_are_assigned`
+caught the case where an intermediate half was still oversized.
+`ReverseMap::set` asserts both fields fit -- the previous
+`local_rank as u16` would have truncated silently.
+
+Same private real-RDF corpus, 10M triples, one writer: `Dictionary`
+112.75 -> 88.71 MiB, packed 120.87 -> 96.83 MiB (exactly 4 bytes x
+6.30M ids each); insertion and lookups unchanged within noise.
+
+## block size and fill
+
+Sweep after reverse-map packing (10M triples, one writer; bounds
+`max/4..=max`):
+
+| block_max | `Dictionary` size / insertion | packed (median halving) | packed (balanced chunks) |
+|---|---|---|---|
+| 256 | 88.71 MiB / 47.7s | 96.83 MiB / 39.3s | 95.08 MiB / 29.5s |
+| 512 | 84.61 MiB / 49.8s | 92.13 MiB / 34.3s | |
+| 1024 | 81.74 MiB / 50.2s | 88.44 MiB / 32.3s | 87.24 MiB / 26.3s |
+| 2048 | 79.44 MiB / 49.3s | 85.69 MiB / 30.7s | 84.88 MiB / 25.8s |
+
+**Fill**: packed split oversized blocks by repeated median halving,
+leaving blocks anywhere between half and completely full (~40% more
+blocks than `Dictionary` at every size). `Dictionary::rebuild_batch_block`
+cuts a merged run into `ceil(len / block_max)` balanced chunks instead;
+packed's `split_while_oversized` now does the same, giving the identical
+block layout (29,400 / 7,103 / 3,510 blocks) and much faster insertion
+-- one rebuild per chunk instead of one per halving level.
+
+**Size**: larger blocks share more structure (fewer repeated prefix
+paths, fewer directory keys) and make lookups faster in packed (`get_id`
+1,444 -> 1,155 -> 1,054 ns at 256/1024/2048). The cost is single-term
+mutation, which touches a whole block (2,000 absent terms inserted next
+to existing ones, then removed):
+
+| block_max | `Dictionary` insert / remove | packed insert / remove |
+|---|---|---|
+| 256 | 291 / 203 us | 93 / 180 us |
+| 1024 | 1,090 / 848 us | 237 / 694 us |
+| 2048 | 2,222 / 1,839 us | 431 / 1,424 us |
+
+`Dictionary` rebuilds a block on every change, so its default stays
+64..=256. Packed's default is now **256..=1024**: single insert stays
+below `Dictionary`'s at its own default; `remove` (still a full block
+rebuild for packed) is the price, ~3.4x `Dictionary`'s.
+
+Result at each dictionary's default, same corpus:
+
+| run | `Dictionary` size / insertion | packed size / insertion |
+|---|---|---|
+| 1M triples, 1 writer | 11.25 MiB / 4.8s | **9.78 MiB / 2.6s** |
+| 5M triples, 1 writer | 68.94 MiB / 30.6s | 69.18 MiB / **16.4s** |
+| 10M triples, 1 writer | 88.71 MiB / 50.5s | **87.24 MiB / 26.0s** |
+| 10M triples, 12 parser workers (wall) | 58.84 MiB / 26.8s | **55.42 MiB / 18.2s** |
+
+Lookups (10M, 1 writer): `get_term` 1,068 vs 1,551 ns, `get_id` 1,158 vs
+1,643 ns. Single-term insert 237 vs 276 us; remove 710 vs 215 us. Peak
+RSS 150 vs 134 MiB (dead records between compactions). Next: an
+incremental packed `remove`, label folding (~-2 bytes/term fresh), and
+sharding the writer.
+
+## incremental single-term mutation
+
+Starting point (10M triples, packed at 256..=1024): single-term insert
+237 us, remove 710 us (`nt_dict_file_bench`'s probe: 2,000 absent terms
+inserted next to existing ones across the id range, then removed). Four
+causes, fixed in turn:
+
+1. **`remove` rebuilt the block** (decode every term, `build_sorted`).
+   `PackedAutomaton::remove` is now `insert`'s mirror: open the path's
+   frames (counts derived top-down), clear the final flag, prune states
+   left with no terms, re-confirm bottom-up. Dead records go to the usual
+   growth-triggered compaction. 710 -> 31 us.
+2. **`merge_into` streamed the whole block** to place even one term.
+   `PackedAutomaton::lower_bound` (one descent: terms before `term`, and
+   whether it's present) gives each incoming term's old rank; runs of at
+   most half the block (`SMALL_RUN_FACTOR = 2`) use it. Bulk loads benefit
+   too -- a 65,536-triple batch spread over thousands of blocks lands a
+   few terms in each. Threshold sweep, bulk insertion: stream-only 27.7s,
+   1/32: 26.4s, 1/16: 25.9s, 1/8: 23.5s, 1/4: 22.5s, 1/2: 22.3s.
+3. **Each mutation recreated a block-sized registry** (`with_capacity_hint`
+   on the block's term count: ~7,000 cells, ~230 KB, allocated and
+   initialized per insert). A recreated registry can only dedup records
+   written during the same mutation, so `reserve_registry` now sizes it to
+   the run. Remove 31 -> 18 us; insert 149 -> 131 us.
+4. **Full blocks split.** Balanced chunking filled bulk-loaded blocks to
+   `block_max`, so 651 of 2,000 probe inserts (33%) split a block -- the
+   classic B-tree bulk-load effect. `SPLIT_FILL_PERCENT = 90` chunks to 90%
+   of `block_max`: 0 splits, insert 131 -> 21.5 us, logical size +0.4%
+   (87.24 -> 87.56 MiB), bulk insertion slightly faster. 75% bought
+   nothing further (23.3 us, +1.1%).
+
+New tests: `packed_automaton_remove_and_lower_bound_match_model` (3,000
+random inserts/removes against a sorted-set model, with compactions;
+exact minimality at the end) and `mixed_mutations_match_model` (single
+inserts, small and large batches, removes with neighbor merges, at tiny
+block bounds).
+
+Final, each dictionary at its default, same corpus:
+
+| run | `Dictionary` (fst) | packed |
+|---|---|---|
+| 1M, 1 writer: size / insertion | 11.25 MiB / 4.9s | **9.83 MiB / 2.4s** |
+| 5M, 1 writer | 68.94 MiB / 32.6s | 69.47 MiB / **13.8s** |
+| 10M, 1 writer | 88.71 MiB / 47.7s | **87.56 MiB / 22.1s** |
+| 10M, 1 writer: get_term / get_id | 1,550 / 1,703 ns | **1,089 / 1,269 ns** |
+| 10M, 1 writer: single insert / remove | 296 / 219 us | **22.5 / 19.9 us** |
+| 10M, 12 workers: wall time | 32.0s | **21.1s** |
+
+(With a triple cap and 12 workers the writer stops at whichever batches
+arrive first, so the two 12-worker runs held different term sets -- 4.40M
+vs 4.29M -- and their sizes aren't comparable.) Peak RSS at 10M, 1 writer:
+144 vs 134 MiB.

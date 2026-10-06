@@ -3,6 +3,7 @@ use std::num::NonZeroU32;
 use crate::batch::{BatchOrder, PreparedBatch};
 use crate::block::Block;
 use crate::entries_arena::EntriesArena;
+use crate::reverse_map::ReverseMap;
 use crate::{TermDictionary, TermId};
 
 /// A stable handle for a block: an index into `Dictionary`'s block slab.
@@ -10,9 +11,9 @@ use crate::{TermDictionary, TermId};
 /// "stable integer handles... physical movement caused by compaction
 /// should not invalidate logical references"). Wraps a `NonZeroU32`
 /// storing the slot index plus one, rather than a plain `u32`, so that
-/// `Option<BlockId>` -- as used throughout `id_to_block`, which is sized
-/// to the total term count rather than the block count -- costs 4 bytes
-/// via Rust's niche-filling optimization instead of 8.
+/// `Option<BlockId>` costs 4 bytes via Rust's niche-filling optimization
+/// instead of 8. (The per-term reverse map no longer stores `BlockId`s:
+/// see `ReverseMap`, which packs slot and rank into one `u32`.)
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct BlockId(NonZeroU32);
 
@@ -75,7 +76,7 @@ pub struct Dictionary {
     /// both: see DESIGN.md's "H3" section). `local_rank` is `u16`, not
     /// `usize`/`u32` -- bounded by `block_max`, which `with_block_bounds`
     /// asserts stays under `u16::MAX`.
-    id_to_block: Vec<Option<(BlockId, u16)>>,
+    id_to_block: ReverseMap,
     free_term_ids: Vec<u32>,
     next_term_id: u32,
     block_min: usize,
@@ -127,7 +128,7 @@ impl Dictionary {
             blocks: Vec::new(),
             free_block_slots: Vec::new(),
             directory: Vec::new(),
-            id_to_block: Vec::new(),
+            id_to_block: ReverseMap::new(block_max),
             free_term_ids: Vec::new(),
             next_term_id: 0,
             block_min,
@@ -159,6 +160,22 @@ impl Dictionary {
     /// reporting compressed-block size alone while excluding router/
     /// directory/id-array overhead. Does not account for allocator slack
     /// (`Vec` spare capacity) or heap allocation headers.
+    /// Trims dictionary-level spare capacity -- the reverse id table,
+    /// directory, slot/id free lists, and both scratch arenas -- so
+    /// retained heap tracks `size_bytes`. Call after a bulk load; not done
+    /// per batch, since trimming a still-growing table would turn
+    /// amortized growth into a realloc-and-copy per batch. Block bytes
+    /// are already trimmed as each block is built (`Block::build`).
+    pub fn shrink_to_fit(&mut self) {
+        self.blocks.shrink_to_fit();
+        self.free_block_slots.shrink_to_fit();
+        self.directory.shrink_to_fit();
+        self.id_to_block.shrink_to_fit();
+        self.free_term_ids.shrink_to_fit();
+        self.scratch_a = EntriesArena::new();
+        self.scratch_b = EntriesArena::new();
+    }
+
     pub fn size_bytes(&self) -> usize {
         let blocks_bytes: usize = self
             .blocks
@@ -171,8 +188,7 @@ impl Dictionary {
             .iter()
             .map(|(key, _)| key.len() + std::mem::size_of::<BlockId>())
             .sum();
-        let id_to_block_bytes =
-            self.id_to_block.len() * std::mem::size_of::<Option<(BlockId, u16)>>();
+        let id_to_block_bytes = self.id_to_block.size_bytes();
         blocks_bytes + directory_bytes + id_to_block_bytes
     }
 
@@ -282,7 +298,7 @@ impl Dictionary {
     /// allocation) rather than returned as a `String`.
     pub fn get_term_into(&self, id: TermId, buf: &mut Vec<u8>) -> bool {
         buf.clear();
-        let Some((block_id, local_rank)) = self.id_to_block.get(id.0 as usize).and_then(|e| *e)
+        let Some((block_id, local_rank)) = self.reverse(id)
         else {
             return false;
         };
@@ -309,7 +325,7 @@ impl Dictionary {
             std::collections::HashMap::new();
         for (pos, &id) in ids.iter().enumerate() {
             if let Some((block_id, local_rank)) =
-                self.id_to_block.get(id.0 as usize).copied().flatten()
+                self.reverse(id)
             {
                 by_block
                     .entry(block_id)
@@ -352,7 +368,7 @@ impl Dictionary {
         let mut buf = Vec::new();
         for (pos, &id) in ids.iter().enumerate() {
             let Some((block_id, local_rank)) =
-                self.id_to_block.get(id.0 as usize).copied().flatten()
+                self.reverse(id)
             else {
                 continue;
             };
@@ -404,11 +420,16 @@ impl Dictionary {
     }
 
     fn set_id_to_block(&mut self, id: TermId, block_id: BlockId, local_rank: usize) {
-        let idx = id.0 as usize;
-        if idx >= self.id_to_block.len() {
-            self.id_to_block.resize(idx + 1, None);
-        }
-        self.id_to_block[idx] = Some((block_id, local_rank as u16));
+        self.id_to_block.set(id.0, block_id.slot(), local_rank);
+    }
+
+    /// `(block, local rank)` for a live id. Ranks of a settled dictionary
+    /// are `< block_max <= u16::MAX`.
+    #[inline]
+    fn reverse(&self, id: TermId) -> Option<(BlockId, u16)> {
+        self.id_to_block
+            .get(id.0)
+            .map(|(slot, rank)| (BlockId::from_slot(slot), rank as u16))
     }
 
     /// Reassigns `TermId -> (block_id, local_rank)` for every entry in
@@ -656,7 +677,7 @@ impl TermDictionary for Dictionary {
     }
 
     fn get_term(&self, id: TermId) -> Option<String> {
-        let (block_id, local_rank) = self.id_to_block.get(id.0 as usize)?.as_ref().copied()?;
+        let (block_id, local_rank) = self.reverse(id)?;
         Some(self.block(block_id).term_at(local_rank as usize))
     }
 
@@ -737,7 +758,7 @@ impl TermDictionary for Dictionary {
         self.block(block_id).decode_into(&mut old);
         self.stats.entries_decoded += old.len() as u64;
 
-        self.id_to_block[id.0 as usize] = None;
+        self.id_to_block.clear(id.0);
         self.free_term_ids.push(id.0);
         self.len -= 1;
 
@@ -1096,14 +1117,6 @@ mod tests {
             std::mem::size_of::<Option<BlockId>>(),
             std::mem::size_of::<BlockId>()
         );
-    }
-
-    #[test]
-    fn id_to_block_entry_niche_optimization_holds() {
-        // The actual `id_to_block` element type: BlockId's NonZeroU32
-        // niche should still let Option<(BlockId, u16)> avoid a separate
-        // discriminant, landing at 8 bytes (4 + 2, padded) rather than 12.
-        assert_eq!(std::mem::size_of::<Option<(BlockId, u16)>>(), 8);
     }
 
     #[test]

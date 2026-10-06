@@ -84,9 +84,13 @@ impl Block {
                 .expect("entries are sorted and unique by construction");
             ids.push(id);
         }
-        let fst_bytes = builder
+        let mut fst_bytes = builder
             .into_inner()
             .expect("finishing an in-memory Vec<u8> writer cannot fail");
+        // Blocks are long-lived: drop the writer's amortized-growth slack
+        // so retained heap matches `payload_bytes` (as
+        // `PackedAutomaton::release_construction_state` does).
+        fst_bytes.shrink_to_fit();
         let fst = Map::new(fst_bytes).expect("bytes were just built by MapBuilder for this Map");
 
         Block {
