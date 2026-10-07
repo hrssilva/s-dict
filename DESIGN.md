@@ -4786,3 +4786,97 @@ one registry-hashed record per term-suffix byte -- building chains during
 construction, not only at the end, would cut that by the chain length);
 `BlockIds` rebuild per merge (~11%: incremental wavelet-matrix insertion
 instead of decode + re-encode); the batch sort on parser threads (~15%).
+
+## review pass: construction cost, safety, one implementation
+
+A review of the packed path for performance and security, measured on the
+same private real-RDF corpus. Every change was A/B'd by alternating the
+previous and new binaries in one session (this laptop's frequency scaling
+moves single runs by up to ~40%); sizes stayed byte-identical throughout
+unless noted. 10M-line sequential insertion, cumulative:
+
+| change | insertion | single insert / remove |
+|---|---|---|
+| start | 21.3-21.9s | 50-55 / 46-50 us |
+| registry: masked buckets, `(tag, address)` cells | 17.4-17.8s | 46-49 / 44-46 us |
+| one shared construction workspace | 16.2-17.3s | 43-45 / 43-45 us |
+| radix-sorted batches; 16-byte sort records | 15.8-16.0s | 40-41 / 40-41 us |
+| branch-free wavelet partition loops | 14.4-14.8s | 23-24 / 23-24 us |
+| prefix-sharing lower bounds for merge runs | 13.6s | 23-24 / 23 us |
+| one-word-per-transition signature hash | 13.4s | 23-24 / 23 us |
+
+- **Registry.** `hash % table_size` compiled to a 64-bit `div`, a quarter
+  of `confirm_frame` (the top symbol); each cell's copied signature was its
+  own heap `Vec`, so a probe took a dependent miss. Buckets are now a power
+  of two and a cell is a 32-bit tag plus the record address, confirmed on a
+  tag hit against the record already written (`record_matches`, as
+  `compact`'s dedup table does). Same dedup decisions.
+- **Workspace.** Construction state was boxed per automaton, created on
+  demand and dropped after every mutation: ~25 allocations per merge
+  (registry, frame pools, path buffers, id vectors, wavelet scratch). It is
+  now one `Workspace` per dictionary, lent to the block being mutated; the
+  registry and dedup table reset only the prefix an operation uses (a
+  reused dedup table first cleared its whole high-water allocation on every
+  compaction: 3x slower loads), and buffers grown past 64K entries by one
+  huge term are released afterwards. `build_sorted`, `insert_sorted` and
+  `insert` became one loop (`merge_sorted`).
+- **Batch sort.** Comparison sort plus a grouping pass: 215 ns/term
+  (`prepare` alone). An MSD radix sort over cached 7-byte keys (length in
+  the low byte; ties whose terms ended are the duplicate groups): 154
+  ns/term with self-contained 32-byte records, 159 with 16-byte records --
+  kept, since 32-byte records added ~6 MB to peak RSS per 65K-triple batch.
+  What remains is cache misses fetching term bytes (76% on one load).
+- **Wavelet loops.** `BlockIds` re-encodes a block's ids on every merge
+  and removal; its per-bit partition loops branched on effectively random
+  label bits. Branch-free versions halved single-term mutations.
+- **Lower bounds.** Small merge runs looked up each term from the root;
+  `lower_bounds_sorted` keeps the descent stack between the run's sorted
+  terms and resumes at their common prefix.
+- **Negative result: ranks from the insert walk.** Computing every term's
+  old rank inside `insert_sorted` (each path frame tracking where its
+  subtree's ranks start, unchanged frames keeping their record, frames
+  opened lazily) removes the separate lookup walk -- but the lookups only
+  ever read, while the insert walk does more per state, and only new terms
+  were inserted before. Measured 0.5-1% slower and 3-4 MB more peak RSS;
+  reverted.
+
+Safety fixes: `decode_ranks_into` recursed once per term byte, so a long
+literal overflowed the stack (`get_terms_seeked_into` on a 400 KB term
+aborted the process); it now walks an explicit path, and the batch sort is
+iterative too (tested with a 2 MB duplicated term). Term ids are checked
+(`u32::MAX` is never assigned; exhausting the space panics instead of
+wrapping into live ids), and batch lengths and offsets are checked rather
+than truncated.
+
+Full file (36.2M triples, 6.88M terms), before -> after:
+
+| | before | after |
+|---|---|---|
+| insertion, sequential | 33.2s | **21.2-22.5s** |
+| total parse + insertion, sequential | 61.5s | 47.0-50.8s |
+| wall time, 7 parsers + 5 writers | 13.8s | **11.5-12.1s** |
+| writer active time (sum), 7 + 5 | 47.1s | 33.7-34.8s |
+| logical size, sequential | 30.79 MiB | 30.79 MiB |
+| retained allocation, sequential | 32.49 MiB | 31.79 MiB |
+| get_term / get_id, sequential | 1,238 / 1,321 ns | 1,227-1,275 / 1,332-1,333 ns |
+| get_term / get_id, 7 + 5 | 1,173 / 1,340 ns | 1,242-1,263 / 1,398-1,406 ns |
+| single-term insert / remove, sequential | 51 / 48 us | **24 / 24-25 us** |
+| peak RSS, sequential / 7 + 5 | 95.1 / 557 MB | 97.4-97.9 / 552 MB |
+
+(`Dictionary`, the fst-block comparison, measured alongside: 79.4 MiB,
+79.7s sequential insertion, 29.8s wall at 7 + 5, 1,481 / 1,831 ns lookups,
+300 / 234 us single-term insert / remove, 143 MB sequential peak.) The
+sharded lookups and sequential peak RSS read slightly worse; the sharded
+layout differs between runs (batch arrival order), and only one "before"
+sample was taken.
+
+**One implementation.** With the packed dictionary ahead on every axis
+measured, the comparison implementations -- `Dictionary` (fst blocks),
+`FrontCodedDictionary`, `AutomatonDictionary` (slab automaton) and
+`PlainDictionary` -- were removed with their blocks, examples and the
+vendored `fst` crate (now under `s-bench`, which keeps a static-FST
+reference). The integration tests check against a plain model instead
+(`tests/common`), and the packed automaton's own tests check minimality
+against a brute-force Myhill-Nerode count rather than the slab automaton.
+Sections above that cite those types, files or `perf_probe_*` tests
+describe the code as it was; it is in the git history.

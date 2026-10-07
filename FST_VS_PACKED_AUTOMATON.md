@@ -1,5 +1,9 @@
 # `fst` vs. `PackedAutomaton`: a complete difference map
 
+> **Historical.** The `fst`-backed `Dictionary`, the slab `Automaton` and their
+> files were removed after this comparison (DESIGN.md's "review pass"); file and
+> line references below are to the code as it was, in the git history.
+
 A dimension-by-dimension comparison of the two per-block index
 representations `s-dict` can use: the vendored [`fst`](https://docs.rs/fst)
 crate (`Block`, `Dictionary`) and this project's own byte-packed

@@ -25,6 +25,11 @@ pub use batch::{PreparedBatch, TermBatch};
 pub use packed_automaton_dictionary::{PackedAutomatonBlockId, PackedAutomatonDictionary};
 pub use sharded::{ShardRouter, ShardedDictionary};
 
+/// Compiles and runs the README examples as doctests.
+#[cfg(doctest)]
+#[doc = include_str!("../README.md")]
+struct ReadmeDoctests;
+
 /// A stable identifier for an RDF term, independent of lexical order.
 ///
 /// `TermId`s are assigned on insertion and remain valid for as long as the

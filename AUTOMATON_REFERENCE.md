@@ -1,5 +1,9 @@
 # Minimal acyclic automaton/transducer construction: a reference survey
 
+> **Historical.** The `fst`-backed `Dictionary`, the slab `Automaton` and their
+> files were removed after this comparison (DESIGN.md's "review pass"); file and
+> line references below are to the code as it was, in the git history.
+
 Written to answer one specific question, empirically established but not
 yet mechanistically explained in DESIGN.md ("the real RDF finding"
 section): why does `s-dict`'s own `Automaton` need up to ~2x more states
