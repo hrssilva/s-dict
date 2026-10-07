@@ -1264,159 +1264,91 @@ impl Automaton {
     }
 }
 
-/// `PackedAutomaton`'s dedup structure: a **bounded, lossy** N-way
-/// set-associative LRU cache, `fst`'s own `Registry`
-/// (`vendor/fst/src/raw/registry.rs`) applied to this crate's own target
-/// type (`u32` byte offsets into `bytes`, in place of `fst`'s
-/// `CompiledAddr`). This replaced a prior, unbounded, exact
-/// `HashMap<PackedSignature, u32, FxHasher>` -- measured, not assumed,
-/// to grow without bound under sustained inserts
-/// (`measure_packed_automaton_register_growth_under_sustained_inserts`
-/// before this change: 91 -> 62,632 entries over 2000 inserts while
-/// `reachable_state_count` stayed flat at 91 -> 120; see DESIGN.md's
-/// "replacing PackedAutomaton's register with a bounded LRU cache").
-/// `write_confirmed_state` only ever inserted, never removed -- there
-/// was no refcounting to tell an exact register a signature's target
-/// had become unreachable, unlike the slab `Automaton`'s own
-/// `release()`-pruned `Register`. `fst`'s bounded cache sidesteps that
-/// problem entirely instead of solving it: fixed size, allocated once,
-/// **evicts** the least-recently-used entry in a bucket instead of
-/// growing, at the cost of a documented, deliberate non-minimality
-/// (`vendor/fst/src/raw/mod.rs:226-238`) `PackedAutomaton` now accepts
-/// too, the same tradeoff `fst` has always made.
+/// `PackedAutomaton`'s construction-time dedup structure: a **bounded,
+/// lossy** 2-way set-associative LRU cache, `fst`'s own `Registry`
+/// (`vendor/fst/src/raw/registry.rs`) over `u32` record addresses. It
+/// replaced an unbounded exact `HashMap` that grew without bound under
+/// sustained inserts (DESIGN.md's "replacing PackedAutomaton's register
+/// with a bounded LRU cache"); like `fst`, it accepts some lost sharing
+/// (eviction) in exchange for fixed memory.
 ///
-/// Each cell stores its own clone of the signature it was inserted
-/// with (`is_final` + sorted `(byte, output, target)` transitions) for
-/// comparison, independent of whatever's currently written at `target`
-/// in `bytes` -- `fst`'s own `RegistryCell` does the same (`node:
-/// BuilderNode`, not a re-fetch through `addr`). `FxHasher` (this
-/// crate's own established choice over `fst`'s FNV-1a -- `Register`'s
-/// doc comment, alongside `Signature`) hashes into a bucket; `mru_size`
-/// cells within that bucket are linearly scanned, promoted-on-hit,
-/// LRU-evicted-on-miss -- `fst`'s own `RegistryCache::entry`'s exact
-/// algorithm, ported rather than re-derived.
-#[derive(Clone, Debug)]
-struct PackedRegistryCell {
-    /// `PACKED_REGISTRY_NONE` when this cell has never been written.
-    target: u32,
-    is_final: bool,
-    transitions: Vec<(u8, u32, u32)>,
-}
-
-/// `u32::MAX` as an empty-cell sentinel -- this file's own existing
-/// idiom for "no value" in a `u32` field (`rank`/`term_at_into`'s
-/// `next.map_or(u32::MAX, ..)` boundary sentinel), not a new convention.
-/// A real `PackedAutomaton` address colliding with this would require
-/// `bytes` to exceed 4 GiB, already an unsupported size for this
-/// prototype's `u32` addressing elsewhere.
-const PACKED_REGISTRY_NONE: u32 = u32::MAX;
-
-impl PackedRegistryCell {
-    fn none() -> PackedRegistryCell {
-        PackedRegistryCell {
-            target: PACKED_REGISTRY_NONE,
-            is_final: false,
-            transitions: Vec::new(),
-        }
-    }
-
-    fn is_none(&self) -> bool {
-        self.target == PACKED_REGISTRY_NONE
-    }
-
-    fn matches(&self, is_final: bool, transitions: &[(u8, u32, u32)]) -> bool {
-        !self.is_none() && self.is_final == is_final && self.transitions == transitions
-    }
-}
-
+/// A cell holds only a 32-bit tag of the signature hash and the record's
+/// address: a tag hit is confirmed against the record already written at
+/// that address (`PackedAutomaton::record_matches`, records are
+/// append-only), the way `compact`'s `DedupTable` works. Storing a copy of
+/// each signature (`fst`'s approach, and this type's previous one) cost a
+/// heap `Vec` per cell and a dependent cache miss per probe. Buckets are a
+/// power of two, so the bucket index is a mask, not a division (a 64-bit
+/// `div` was a quarter of `confirm_frame`'s time).
 #[derive(Clone, Debug)]
 struct PackedRegistry {
-    /// `table_size * mru_size` cells, allocated once in `new`/
-    /// `with_capacity_hint`, never resized -- the fixed bound that
-    /// replaces unbounded `HashMap` growth. Laid out as `table_size`
-    /// buckets of `mru_size` contiguous cells each (`fst`'s own
-    /// `Registry::entry`'s exact slicing).
-    table: Vec<PackedRegistryCell>,
-    table_size: usize,
-    mru_size: usize,
+    /// `buckets * REGISTRY_WAYS` cells, most recently used first within a
+    /// bucket; never resized.
+    cells: Box<[RegistryCell]>,
+    /// `buckets - 1`.
+    mask: usize,
 }
 
-#[allow(dead_code)]
+/// Cells per registry bucket (`fst`'s `mru_size` default).
+const REGISTRY_WAYS: usize = 2;
+
+#[derive(Clone, Copy, Debug, Default)]
+struct RegistryCell {
+    /// High half of the signature hash (the low bits pick the bucket).
+    tag: u32,
+    /// Record address + 1; 0 marks an empty cell, so a fresh table is all
+    /// zeros (`alloc_zeroed`).
+    target_plus_one: u32,
+}
+
 impl PackedRegistry {
-    fn new(table_size: usize, mru_size: usize) -> PackedRegistry {
-        let ncells = table_size * mru_size;
+    /// Sized from the number of terms a construction will confirm:
+    /// `Block::build`'s `fst` sizing (`4 x terms` rows, at least 64),
+    /// rounded up to a power of two, capped at 16,384 rows (256 KiB).
+    fn with_capacity_hint(terms: usize) -> PackedRegistry {
+        let buckets = terms.saturating_mul(4).clamp(64, 1 << 14).next_power_of_two();
         PackedRegistry {
-            table: (0..ncells).map(|_| PackedRegistryCell::none()).collect(),
-            table_size,
-            mru_size,
+            cells: vec![RegistryCell::default(); buckets * REGISTRY_WAYS].into_boxed_slice(),
+            mask: buckets - 1,
         }
     }
 
-    /// `Block::build`'s own sizing (`src/block.rs:71`, "a micro-block
-    /// needs a much smaller construction cache than the generic
-    /// builder's 20,000 cells"), reused as-is: `s-dict` blocks (and so
-    /// `PackedAutomaton`'s own term count, `DEFAULT_BLOCK_MAX =
-    /// 256`, `src/dictionary.rs:33`) are already size-bounded by this
-    /// crate's own split policy, so a table sized once from the initial
-    /// build's term count stays proportioned across further incremental
-    /// `insert`s rather than needing to track growth. `mru_size = 2`,
-    /// `fst`'s own default for this same reason.
-    fn with_capacity_hint(capacity_hint: usize) -> PackedRegistry {
-        let rows = capacity_hint.saturating_mul(4).clamp(64, 10_000);
-        PackedRegistry::new(rows, 2)
+    #[inline]
+    fn bucket(&mut self, hash: u64) -> &mut [RegistryCell; REGISTRY_WAYS] {
+        let start = (hash as usize & self.mask) * REGISTRY_WAYS;
+        (&mut self.cells[start..start + REGISTRY_WAYS]).try_into().expect("bucket width")
     }
 
-    fn hash(&self, is_final: bool, transitions: &[(u8, u32, u32)]) -> usize {
-        let mut hasher = FxHasher::default();
-        is_final.hash(&mut hasher);
-        transitions.hash(&mut hasher);
-        (hasher.finish() as usize) % self.table_size
+    /// Addresses in `hash`'s bucket whose tag matches, most recent first.
+    #[inline]
+    fn candidates(&mut self, hash: u64) -> [Option<u32>; REGISTRY_WAYS] {
+        let tag = (hash >> 32) as u32;
+        self.bucket(hash)
+            .map(|c| (c.target_plus_one != 0 && c.tag == tag).then(|| c.target_plus_one - 1))
     }
 
-    fn bucket(&mut self, is_final: bool, transitions: &[(u8, u32, u32)]) -> &mut [PackedRegistryCell] {
-        let bucket = self.hash(is_final, transitions);
-        let start = bucket * self.mru_size;
-        &mut self.table[start..start + self.mru_size]
+    /// Marks way `way` of `hash`'s bucket most recently used.
+    #[inline]
+    fn promote(&mut self, hash: u64, way: usize) {
+        self.bucket(hash)[..=way].rotate_right(1);
     }
 
-    fn get(&mut self, is_final: bool, transitions: &[(u8, u32, u32)]) -> Option<u32> {
-        let cells = self.bucket(is_final, transitions);
-        let pos = cells.iter().position(|c| c.matches(is_final, transitions))?;
-        let target = cells[pos].target;
-        promote(cells, pos);
-        Some(target)
+    /// Inserts as most recently used, evicting the least recently used.
+    #[inline]
+    fn insert(&mut self, hash: u64, target: u32) {
+        let bucket = self.bucket(hash);
+        bucket.rotate_right(1);
+        bucket[0] = RegistryCell {
+            tag: (hash >> 32) as u32,
+            target_plus_one: target + 1,
+        };
     }
 
-    /// Always inserts, evicting the bucket's least-recently-used cell
-    /// if every cell is already occupied -- the "lossy" half of this
-    /// structure's tradeoff. Caller's responsibility to have just
-    /// missed via `get` on the same signature.
-    fn insert(&mut self, is_final: bool, transitions: &[(u8, u32, u32)], target: u32) {
-        let cells = self.bucket(is_final, transitions);
-        let last = cells.len() - 1;
-        cells[last].is_final = is_final;
-        cells[last].transitions.clear();
-        cells[last].transitions.extend_from_slice(transitions);
-        cells[last].target = target;
-        promote(cells, last);
-    }
-
-    /// Current occupancy -- always `<= table_size * mru_size`, the
-    /// bound the prior unbounded `HashMap` register had no equivalent
-    /// of. See `PackedAutomaton::register_len`.
+    /// Occupied cells -- always `<= cells.len()`. See
+    /// `PackedAutomaton::register_len`.
+    #[cfg(test)]
     fn len(&self) -> usize {
-        self.table.iter().filter(|c| !c.is_none()).count()
-    }
-}
-
-/// `fst`'s own `RegistryCache::promote`: move the cell at `i` to the
-/// front of its bucket (most-recently-used), shifting everything
-/// between it and the front back by one -- so position 0 is always the
-/// MRU cell and the last position is always the next eviction target.
-fn promote(cells: &mut [PackedRegistryCell], mut i: usize) {
-    while i > 0 {
-        cells.swap(i - 1, i);
-        i -= 1;
+        self.cells.iter().filter(|c| c.target_plus_one != 0).count()
     }
 }
 
@@ -2167,19 +2099,22 @@ impl PackedAutomaton {
         self.cons().scratch.frames.push(frame.children);
     }
 
-    /// `get`/`insert` take `children` by reference, so unlike the prior
-    /// exact `HashMap<PackedSignature, u32>` version, a hit never
-    /// allocates at all -- `PackedRegistry::get` hashes and compares
-    /// straight off the caller's own slice; only a miss touches a
-    /// cell's `transitions: Vec`, and even then via `clear` +
-    /// `extend_from_slice` into that cell's already-allocated buffer
-    /// (`PackedRegistry::insert`), not a fresh allocation.
+    /// Returns the address of a record with this signature: an equivalent
+    /// one the registry remembers (confirmed against the written bytes),
+    /// else a newly appended one.
     fn write_confirmed_state(&mut self, is_final: bool, children: &[(u8, u32, u32)]) -> u32 {
-        if let Some(existing) = self.registry().get(is_final, children) {
-            return existing;
+        let hash = signature_hash(is_final, children);
+        let candidates = self.registry().candidates(hash);
+        for (way, candidate) in candidates.into_iter().enumerate() {
+            if let Some(pos) = candidate
+                && self.record_matches(pos, is_final, children)
+            {
+                self.registry().promote(hash, way);
+                return pos;
+            }
         }
         let pos = self.append_record(is_final, children);
-        self.registry().insert(is_final, children, pos);
+        self.registry().insert(hash, pos);
         pos
     }
 
