@@ -131,8 +131,7 @@ impl BlockIds {
         if len == 0 {
             return Self::implicit(0, 0);
         }
-        let min = ids.iter().map(|id| id.0).min().expect("non-empty");
-        let max = ids.iter().map(|id| id.0).max().expect("non-empty");
+        let (min, max) = ids.iter().fold((u32::MAX, 0), |(lo, hi), id| (lo.min(id.0), hi.max(id.0)));
 
         // Greedy runs: (base, next expected id); label per rank.
         let mut runs: Vec<(u32, u64)> = Vec::new();

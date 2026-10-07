@@ -194,9 +194,11 @@ impl SymbolTable {
             // Whole-symbol comparison as one masked 64-bit XOR when 8 query
             // bytes are available; only a mismatch (or the query's tail)
             // looks at single bytes.
-            if code != ESCAPE && at + 8 <= query.len() {
+            if code != ESCAPE
+                && let Some(&word) = query[at..].first_chunk::<8>()
+            {
                 let len = self.lens[code as usize] as usize;
-                let q = u64::from_le_bytes(query[at..at + 8].try_into().expect("8 bytes"));
+                let q = u64::from_le_bytes(word);
                 let sym = u64::from_le_bytes(self.symbols[code as usize]);
                 let mask = if len == 8 { u64::MAX } else { (1u64 << (8 * len)) - 1 };
                 if (q ^ sym) & mask == 0 {

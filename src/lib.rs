@@ -22,7 +22,7 @@ mod range_map;
 mod sharded;
 
 pub use batch::{PreparedBatch, TermBatch};
-pub use packed_automaton_dictionary::{PackedAutomatonBlockId, PackedAutomatonDictionary};
+pub use packed_automaton_dictionary::PackedAutomatonDictionary;
 pub use sharded::{ShardRouter, ShardedDictionary};
 
 /// Compiles and runs the README examples as doctests.

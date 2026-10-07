@@ -104,9 +104,9 @@ impl Hasher for FxHasher {
 /// `div` was a quarter of `confirm_frame`'s time).
 #[derive(Clone, Debug, Default)]
 struct PackedRegistry {
-    /// At least `(mask + 1) * REGISTRY_WAYS` cells (only that prefix is in
-    /// use), most recently used first within a bucket.
-    cells: Vec<RegistryCell>,
+    /// At least `mask + 1` buckets (only that prefix is in use), most
+    /// recently used cell first within a bucket.
+    buckets: Vec<[RegistryCell; REGISTRY_WAYS]>,
     /// `buckets - 1`.
     mask: usize,
 }
@@ -132,19 +132,17 @@ impl PackedRegistry {
     /// Reuses the allocation; only grows.
     fn reset(&mut self, terms: usize) {
         let buckets = terms.saturating_mul(4).clamp(64, 1 << 14).next_power_of_two();
-        let cells = buckets * REGISTRY_WAYS;
-        if self.cells.len() < cells {
-            self.cells = vec![RegistryCell::default(); cells];
+        if self.buckets.len() < buckets {
+            self.buckets = vec![Default::default(); buckets];
         } else {
-            self.cells[..cells].fill(RegistryCell::default());
+            self.buckets[..buckets].fill(Default::default());
         }
         self.mask = buckets - 1;
     }
 
     #[inline]
     fn bucket(&mut self, hash: u64) -> &mut [RegistryCell; REGISTRY_WAYS] {
-        let start = (hash as usize & self.mask) * REGISTRY_WAYS;
-        (&mut self.cells[start..start + REGISTRY_WAYS]).try_into().expect("bucket width")
+        &mut self.buckets[hash as usize & self.mask]
     }
 
     /// Addresses in `hash`'s bucket whose tag matches, most recent first.
@@ -176,8 +174,8 @@ impl PackedRegistry {
     /// `PackedAutomaton::register_len`.
     #[cfg(test)]
     fn len(&self) -> usize {
-        let used = (self.mask + 1) * REGISTRY_WAYS;
-        self.cells[..used.min(self.cells.len())].iter().filter(|c| c.target_plus_one != 0).count()
+        let used = (self.mask + 1).min(self.buckets.len());
+        self.buckets[..used].iter().flatten().filter(|c| c.target_plus_one != 0).count()
     }
 }
 
@@ -438,7 +436,7 @@ impl PackedAutomaton {
     /// extended. Shares its loop with `insert_sorted` (`merge_sorted`),
     /// starting from an empty root instead of an opened one.
     pub(crate) fn build_sorted<'a>(
-        terms: impl ExactSizeIterator<Item = &'a str>,
+        terms: impl ExactSizeIterator<Item = &'a [u8]>,
         ws: &mut Workspace,
     ) -> PackedAutomaton {
         let mut automaton = PackedAutomaton::empty();
@@ -455,7 +453,7 @@ impl PackedAutomaton {
     /// (`open_frame`), and records are append-only, so nothing needs
     /// clone-if-shared bookkeeping: superseded records are just dead bytes
     /// until the next `compact`.
-    pub(crate) fn insert_sorted<'a>(&mut self, terms: impl ExactSizeIterator<Item = &'a str>, ws: &mut Workspace) {
+    pub(crate) fn insert_sorted<'a>(&mut self, terms: impl ExactSizeIterator<Item = &'a [u8]>, ws: &mut Workspace) {
         self.pristine = false;
         let root = self.open_frame(&mut ws.confirm, self.root, self.term_count);
         self.merge_sorted(root, terms, ws);
@@ -464,7 +462,7 @@ impl PackedAutomaton {
     /// Inserts `term` if not already present: `insert_sorted` of one term.
     #[cfg(test)]
     pub(crate) fn insert(&mut self, term: &str, ws: &mut Workspace) {
-        self.insert_sorted(std::iter::once(term), ws);
+        self.insert_sorted(std::iter::once(term.as_bytes()), ws);
     }
 
     /// The sorted-merge loop behind `build_sorted` and `insert_sorted`, from
@@ -472,7 +470,7 @@ impl PackedAutomaton {
     /// below its common prefix with the previous term, follow existing
     /// transitions as far as they match (opening each state reached), then
     /// extend with new frames for the rest.
-    fn merge_sorted<'a>(&mut self, root: StagingFrame, terms: impl ExactSizeIterator<Item = &'a str>, ws: &mut Workspace) {
+    fn merge_sorted<'a>(&mut self, root: StagingFrame, terms: impl ExactSizeIterator<Item = &'a [u8]>, ws: &mut Workspace) {
         let Workspace {
             confirm,
             path,
@@ -485,8 +483,8 @@ impl PackedAutomaton {
         path_bytes.clear();
         last_word.clear();
         path.push(root);
-        for term in terms {
-            let word = term.as_bytes();
+        for (i, word) in terms.enumerate() {
+            debug_assert!(i == 0 || last_word.as_slice() < word, "terms must be sorted and distinct");
             let common = common_prefix_len(last_word, word);
             self.confirm_down_to(confirm, path, path_bytes, common + 1);
 
@@ -547,7 +545,7 @@ impl PackedAutomaton {
     /// states left with no terms, and re-confirm the path bottom-up.
     /// Superseded records become dead bytes, reclaimed by [`Self::compact`].
     pub(crate) fn remove(&mut self, term: &str, ws: &mut Workspace) -> Option<u32> {
-        let (rank, found) = self.lower_bound(term);
+        let (rank, found) = self.lower_bound(term.as_bytes());
         if !found {
             return None;
         }
@@ -595,7 +593,7 @@ impl PackedAutomaton {
     /// `(number of terms sorting before term, whether term is present)` --
     /// one descent, with each state's subtree count derived top-down from
     /// `term_count` and the outputs, as in `open_frame`.
-    pub(crate) fn lower_bound(&self, term: &str) -> (u32, bool) {
+    pub(crate) fn lower_bound(&self, term: &[u8]) -> (u32, bool) {
         // Chains are rare (only after `compact_and_chain`), so they get
         // their own loop: handling them inline made the compiler spill
         // `value`/`count` in this hot loop (+60% of its time during loads).
@@ -603,7 +601,7 @@ impl PackedAutomaton {
             return self.lower_bound_chained(term);
         }
         let (mut pos, mut count, mut value) = (self.root, self.term_count, 0u32);
-        for &byte in term.as_bytes() {
+        for &byte in term {
             match self.step(pos, count, byte) {
                 Ok((out, child_count, target)) => {
                     value += out;
@@ -623,7 +621,7 @@ impl PackedAutomaton {
     /// call -- the shape of a merge's run of new terms into one block.
     pub(crate) fn lower_bounds_sorted<'a>(
         &self,
-        terms: impl Iterator<Item = &'a str>,
+        terms: impl Iterator<Item = &'a [u8]>,
         stack: &mut Vec<(u32, u32, u32)>,
         mut out: impl FnMut(u32, bool),
     ) {
@@ -637,8 +635,8 @@ impl PackedAutomaton {
         stack.clear();
         stack.push((self.root, 0, self.term_count));
         let mut prev: &[u8] = &[];
-        for term in terms {
-            let word = term.as_bytes();
+        for word in terms {
+            debug_assert!(prev <= word, "terms must be sorted");
             // A walk that stopped short of the common prefix resumes where
             // it stopped and stops there again, as it should.
             stack.truncate(common_prefix_len(prev, word) + 1);
@@ -711,8 +709,7 @@ impl PackedAutomaton {
     }
 
     #[inline(never)]
-    fn lower_bound_chained(&self, term: &str) -> (u32, bool) {
-        let t = term.as_bytes();
+    fn lower_bound_chained(&self, t: &[u8]) -> (u32, bool) {
         let mut pos = self.root;
         let mut count = self.term_count;
         let mut value = 0u32;
@@ -1113,6 +1110,15 @@ impl PackedAutomaton {
         true
     }
 
+    /// The address the next appended byte gets. Record addresses are `u32`:
+    /// a block whose records outgrow 4 GiB (a huge term, or a huge batch
+    /// run into one block before it splits) panics here rather than
+    /// wrapping into wrong addresses. Input-dependent, so always checked.
+    #[inline]
+    fn next_address(&self) -> u32 {
+        u32::try_from(self.bytes.len()).expect("a block's records exceed 4 GiB")
+    }
+
     /// Appends one state's record to `bytes` -- ordinary amortized-growth
     /// `Vec` reallocation, no capping. This is the *only* place bytes
     /// are ever written: once appended, a record's address is permanent
@@ -1134,7 +1140,7 @@ impl PackedAutomaton {
             // Single-transition form: `1 N cccccc`.
             let next = !self.bytes.is_empty() && target as usize == self.bytes.len() - 1;
             if !next {
-                let field = self.bytes.len() as u32;
+                let field = self.next_address();
                 write_leb128_rev(&mut self.bytes, field - target);
             }
             let code = label_table().code(byte);
@@ -1142,12 +1148,12 @@ impl PackedAutomaton {
                 self.bytes.push(byte);
             }
             self.bytes.push(0x80 | (u8::from(next) << 6) | code);
-            return (self.bytes.len() - 1) as u32;
+            return self.next_address() - 1;
         }
         // General form: `0 F nnnnnn`, transitions written in reverse so
         // the record reads forward from its header downward.
         for (i, &(b, out, target)) in children.iter().enumerate().rev() {
-            let field = self.bytes.len() as u32;
+            let field = self.next_address();
             write_leb128_rev(&mut self.bytes, field - target);
             if i > 0 {
                 write_leb128_rev(&mut self.bytes, out);
@@ -1159,7 +1165,7 @@ impl PackedAutomaton {
         }
         self.bytes
             .push((u8::from(is_final) << 6) | children.len().min(PACKED_COUNT_ESCAPE) as u8);
-        (self.bytes.len() - 1) as u32
+        self.next_address() - 1
     }
 
     /// Total size of `bytes` -- directly comparable to `Automaton::
@@ -1305,6 +1311,7 @@ impl PackedAutomaton {
         // (record, first rank of its subtree, end rank, buffer length on entry)
         let mut path: Vec<(u32, u32, u32, usize)> = Vec::new();
         let mut buf: Vec<u8> = Vec::new();
+        debug_assert!(targets.is_sorted_by_key(|&(_, rank)| rank), "targets must be sorted by rank");
         for &(position, rank) in targets {
             while let Some(&(_, lo, hi, len)) = path.last()
                 && !(lo..hi).contains(&rank)
@@ -1328,8 +1335,7 @@ impl PackedAutomaton {
                 }
                 let value = rank - lo;
                 if value == 0 && self.is_final(pos) {
-                    let term = std::str::from_utf8(&buf).expect("keys were inserted as valid UTF-8 str bytes");
-                    out[position] = Some(term.to_owned());
+                    out[position] = Some(decoded_term(buf.clone()));
                     break;
                 }
                 let (byte, child_lo, child_hi, target) = self.child_holding(pos, value, hi - lo);
@@ -1371,7 +1377,7 @@ impl PackedAutomaton {
         if !label.is_empty() {
             next = !self.bytes.is_empty() && target as usize == self.bytes.len() - 1;
             if !next {
-                let field = self.bytes.len() as u32;
+                let field = self.next_address();
                 write_leb128_rev(&mut self.bytes, field - target);
             }
             self.bytes.extend_from_slice(label);
@@ -1379,7 +1385,7 @@ impl PackedAutomaton {
         let len = u32::try_from(label.len()).expect("chain label fits u32");
         write_leb128_rev(&mut self.bytes, len << 2 | u32::from(coded) << 1 | u32::from(next));
         self.bytes.push(0);
-        (self.bytes.len() - 1) as u32
+        self.next_address() - 1
     }
 
     /// The chain record at `pos`, if it is a non-empty one. Checks
@@ -1963,6 +1969,23 @@ impl<'a> PackedTermsStream<'a> {
     }
 }
 
+/// A term decoded from an automaton, as a `String`, without re-validating
+/// it. Premise: terms only ever enter a dictionary as `&str`
+/// (`TermDictionary::insert`/`insert_batch`, `TermBatch::push`), and every
+/// byte string an automaton yields is one of them -- construction,
+/// incremental mutation, compaction and path compression all preserve the
+/// accepted language exactly, and FSST-coded chain labels decode to the
+/// bytes they encoded. Checked in debug builds.
+pub(crate) fn decoded_term(bytes: Vec<u8>) -> String {
+    debug_assert!(
+        std::str::from_utf8(&bytes).is_ok(),
+        "a decoded term is not UTF-8: the automaton no longer yields exactly its inserted terms"
+    );
+    // SAFETY: by the premise above, `bytes` is a complete term that was
+    // inserted as a `&str`, hence valid UTF-8.
+    unsafe { String::from_utf8_unchecked(bytes) }
+}
+
 pub(crate) fn common_prefix_len(a: &[u8], b: &[u8]) -> usize {
     a.iter().zip(b).take_while(|(x, y)| x == y).count()
 }
@@ -2014,7 +2037,7 @@ mod tests {
     }
 
     fn build(terms: &[String], ws: &mut Workspace) -> PackedAutomaton {
-        PackedAutomaton::build_sorted(terms.iter().map(String::as_str), ws)
+        PackedAutomaton::build_sorted(terms.iter().map(String::as_bytes), ws)
     }
 
     /// States of the minimal acyclic automaton of `terms` (Myhill-Nerode):
@@ -2045,7 +2068,7 @@ mod tests {
         let mut buf = Vec::new();
         for (rank, term) in terms.iter().enumerate() {
             assert_eq!(packed.rank(term), Some(rank as u32), "rank of {term:?}");
-            assert_eq!(packed.lower_bound(term), (rank as u32, true));
+            assert_eq!(packed.lower_bound(term.as_bytes()), (rank as u32, true));
             packed.term_at_into(rank as u32, &mut buf);
             assert_eq!(buf, term.as_bytes(), "term_at_into({rank})");
         }
@@ -2053,7 +2076,7 @@ mod tests {
         for probe in probes {
             let below = terms.partition_point(|t| t.as_str() < probe.as_str()) as u32;
             let present = terms.binary_search(&probe).is_ok();
-            assert_eq!(packed.lower_bound(&probe), (below, present), "lower_bound({probe:?})");
+            assert_eq!(packed.lower_bound(probe.as_bytes()), (below, present), "lower_bound({probe:?})");
             assert_eq!(packed.rank(&probe).is_some(), present);
         }
         // Batched descents over a sorted mix of present and absent terms
@@ -2063,8 +2086,8 @@ mod tests {
         queries.extend(["", "0", "h", "zzzz"].map(String::from));
         let queries = sorted(queries);
         let mut batched = Vec::new();
-        packed.lower_bounds_sorted(queries.iter().map(String::as_str), &mut Vec::new(), |rank, found| batched.push((rank, found)));
-        let single: Vec<(u32, bool)> = queries.iter().map(|q| packed.lower_bound(q)).collect();
+        packed.lower_bounds_sorted(queries.iter().map(String::as_bytes), &mut Vec::new(), |rank, found| batched.push((rank, found)));
+        let single: Vec<(u32, bool)> = queries.iter().map(|q| packed.lower_bound(q.as_bytes())).collect();
         assert_eq!(batched, single);
         let mut stream = packed.stream();
         for term in terms {
@@ -2085,7 +2108,7 @@ mod tests {
         let mut ws = Workspace::default();
         let empty = build(&[], &mut ws);
         assert_eq!(empty.rank(""), None);
-        assert_eq!(empty.lower_bound("a"), (0, false));
+        assert_eq!(empty.lower_bound(b"a"), (0, false));
         assert_eq!(empty.stream().next(), None);
         let one = vec!["only".to_string()];
         assert_answers(&build(&one, &mut ws), &one);
@@ -2118,8 +2141,8 @@ mod tests {
         let mut ws = Workspace::default();
 
         let built = build(&terms, &mut ws);
-        let mut batched = PackedAutomaton::build_sorted(first.iter().copied(), &mut ws);
-        batched.insert_sorted(second.iter().copied(), &mut ws);
+        let mut batched = PackedAutomaton::build_sorted(first.iter().map(|t| t.as_bytes()), &mut ws);
+        batched.insert_sorted(second.iter().map(|t| t.as_bytes()), &mut ws);
         let mut single = build(&[], &mut ws);
         for t in terms.iter().rev() {
             single.insert(t, &mut ws);
@@ -2145,8 +2168,8 @@ mod tests {
         let mut incoming: Vec<String> = base.iter().step_by(3).cloned().collect();
         incoming.extend((0..50).map(|i| format!("http://example.org/brand-new-{i:03}")));
         let incoming = sorted(incoming);
-        packed.insert_sorted(incoming.iter().map(String::as_str), &mut ws);
-        packed.insert_sorted(incoming.iter().map(String::as_str), &mut ws);
+        packed.insert_sorted(incoming.iter().map(String::as_bytes), &mut ws);
+        packed.insert_sorted(incoming.iter().map(String::as_bytes), &mut ws);
         let all = sorted(base.iter().chain(&incoming).cloned().collect());
         assert_answers(&packed, &all);
     }
@@ -2168,7 +2191,7 @@ mod tests {
         assert!(fresh.reachable_state_count() >= minimal_state_count(&terms));
         let mut packed = build(&[], &mut ws);
         for round in 0..12 {
-            let batch = terms.iter().enumerate().filter(|(i, _)| i % 12 == round).map(|(_, t)| t.as_str());
+            let batch = terms.iter().enumerate().filter(|(i, _)| i % 12 == round).map(|(_, t)| t.as_bytes());
             packed.insert_sorted(batch.collect::<Vec<_>>().into_iter(), &mut ws);
         }
         packed.insert("zzz-removed-again", &mut ws);
@@ -2242,8 +2265,8 @@ mod tests {
         let mut b = build(&b_terms, &mut ws);
         let a_more = sorted(namespace_clustered_terms(300, 10));
         let b_more = sorted(hashlike_terms(310)[300..].to_vec());
-        a.insert_sorted(a_more.iter().map(String::as_str), &mut ws);
-        b.insert_sorted(b_more.iter().map(String::as_str), &mut ws);
+        a.insert_sorted(a_more.iter().map(String::as_bytes), &mut ws);
+        b.insert_sorted(b_more.iter().map(String::as_bytes), &mut ws);
         assert!(PackedAutomaton::register_len(&ws) <= 64 * REGISTRY_WAYS, "sized for a 10-term merge");
         assert_answers(&a, &sorted(a_terms.into_iter().chain(a_more).collect()));
         assert_answers(&b, &sorted(b_terms.into_iter().chain(b_more).collect()));

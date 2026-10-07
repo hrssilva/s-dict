@@ -16,7 +16,9 @@ use crate::TermId;
 /// free. Callers that want fresh content call `clear()` first.
 #[derive(Debug)]
 pub(crate) struct EntriesArena {
-    text: String,
+    /// Concatenated term bytes (decoded from blocks, so not re-validated as
+    /// UTF-8: see `crate::packed_automaton::decoded_term`).
+    text: Vec<u8>,
     /// End offsets into `text`, one per ID; an empty arena needs no allocation.
     offsets: Vec<u32>,
     ids: Vec<TermId>,
@@ -31,7 +33,7 @@ impl Default for EntriesArena {
 impl EntriesArena {
     pub(crate) fn new() -> Self {
         EntriesArena {
-            text: String::new(),
+            text: Vec::new(),
             offsets: Vec::new(),
             ids: Vec::new(),
         }
@@ -48,7 +50,7 @@ impl EntriesArena {
         self.ids.len()
     }
 
-    pub(crate) fn term_at(&self, i: usize) -> &str {
+    pub(crate) fn term_at(&self, i: usize) -> &[u8] {
         let start = if i == 0 {
             0
         } else {
@@ -64,8 +66,8 @@ impl EntriesArena {
     }
 
     /// Appends one entry to the end.
-    pub(crate) fn push(&mut self, term: &str, id: TermId) {
-        self.text.push_str(term);
+    pub(crate) fn push(&mut self, term: &[u8], id: TermId) {
+        self.text.extend_from_slice(term);
         self.offsets
             .push(u32::try_from(self.text.len()).expect("scratch arena exceeds 32-bit offsets"));
         self.ids.push(id);
@@ -73,7 +75,7 @@ impl EntriesArena {
 
     /// The terms of entries `range`, for building a block from part of a
     /// decoded one.
-    pub(crate) fn terms(&self, range: std::ops::Range<usize>) -> impl ExactSizeIterator<Item = &str> {
+    pub(crate) fn terms(&self, range: std::ops::Range<usize>) -> impl ExactSizeIterator<Item = &[u8]> {
         range.map(move |i| self.term_at(i))
     }
 
@@ -90,69 +92,69 @@ mod tests {
     #[test]
     fn taken_arena_leaves_allocation_free_default_and_retains_empty_unicode_terms() {
         let mut arena = EntriesArena::new();
-        arena.push("", TermId(0));
-        arena.push("é中", TermId(1));
-        arena.push("", TermId(2));
+        arena.push("".as_bytes(), TermId(0));
+        arena.push("é中".as_bytes(), TermId(1));
+        arena.push("".as_bytes(), TermId(2));
         let mut taken = std::mem::take(&mut arena);
         assert_eq!(arena.text.capacity(), 0);
         assert_eq!(arena.offsets.capacity(), 0);
         assert_eq!(arena.ids.capacity(), 0);
-        assert_eq!(taken.term_at(0), "");
-        assert_eq!(taken.term_at(1), "é中");
-        assert_eq!(taken.term_at(2), "");
+        assert_eq!(taken.term_at(0), "".as_bytes());
+        assert_eq!(taken.term_at(1), "é中".as_bytes());
+        assert_eq!(taken.term_at(2), "".as_bytes());
         let capacity = taken.text.capacity();
         taken.clear();
-        taken.push("中", TermId(3));
-        assert_eq!(taken.term_at(0), "中");
+        taken.push("中".as_bytes(), TermId(3));
+        assert_eq!(taken.term_at(0), "中".as_bytes());
         assert_eq!(taken.text.capacity(), capacity);
     }
 
     #[test]
     fn push_and_read_back() {
         let mut arena = EntriesArena::new();
-        arena.push("a", TermId(0));
-        arena.push("ab", TermId(1));
-        arena.push("abc", TermId(2));
+        arena.push("a".as_bytes(), TermId(0));
+        arena.push("ab".as_bytes(), TermId(1));
+        arena.push("abc".as_bytes(), TermId(2));
         assert_eq!(arena.len(), 3);
-        assert_eq!(arena.term_at(0), "a");
-        assert_eq!(arena.term_at(1), "ab");
-        assert_eq!(arena.term_at(2), "abc");
+        assert_eq!(arena.term_at(0), "a".as_bytes());
+        assert_eq!(arena.term_at(1), "ab".as_bytes());
+        assert_eq!(arena.term_at(2), "abc".as_bytes());
         assert_eq!(arena.id_at(1), TermId(1));
-        assert_eq!(arena.terms(0..3).collect::<Vec<_>>(), ["a", "ab", "abc"]);
+        assert_eq!(arena.terms(0..3).collect::<Vec<_>>(), [b"a" as &[u8], b"ab", b"abc"]);
         assert_eq!(arena.ids(0..3), [TermId(0), TermId(1), TermId(2)]);
     }
 
     #[test]
     fn clear_resets_end_offsets() {
         let mut arena = EntriesArena::new();
-        arena.push("x", TermId(0));
+        arena.push("x".as_bytes(), TermId(0));
         arena.clear();
         assert_eq!(arena.len(), 0);
-        arena.push("y", TermId(1));
-        assert_eq!(arena.term_at(0), "y");
+        arena.push("y".as_bytes(), TermId(1));
+        assert_eq!(arena.term_at(0), "y".as_bytes());
     }
 
     #[test]
     fn range_slices_correctly() {
         let mut arena = EntriesArena::new();
         for i in 0..5 {
-            arena.push(&i.to_string(), TermId(i));
+            arena.push(i.to_string().as_bytes(), TermId(i));
         }
-        assert_eq!(arena.terms(1..4).collect::<Vec<_>>(), ["1", "2", "3"]);
+        assert_eq!(arena.terms(1..4).collect::<Vec<_>>(), [b"1" as &[u8], b"2", b"3"]);
         assert_eq!(arena.ids(1..4), [TermId(1), TermId(2), TermId(3)]);
     }
 
     #[test]
     fn append_without_clear_concatenates() {
         let mut a = EntriesArena::new();
-        a.push("a", TermId(0));
+        a.push("a".as_bytes(), TermId(0));
         let mut b = EntriesArena::new();
-        b.push("b", TermId(1));
+        b.push("b".as_bytes(), TermId(1));
         // Simulate decoding two blocks back-to-back into one arena.
         a.push(b.term_at(0), b.id_at(0));
         assert_eq!(a.len(), 2);
-        assert_eq!(a.term_at(0), "a");
-        assert_eq!(a.term_at(1), "b");
+        assert_eq!(a.term_at(0), "a".as_bytes());
+        assert_eq!(a.term_at(1), "b".as_bytes());
     }
 
 }

@@ -14,7 +14,7 @@
 use crate::TermId;
 use crate::block_ids::BlockIds;
 use crate::entries_arena::EntriesArena;
-use crate::packed_automaton::{self, PackedAutomaton};
+use crate::packed_automaton::{self, PackedAutomaton, decoded_term};
 
 /// `merge_into` compacts a block (`PackedAutomaton::compact`) once its
 /// bytes per term exceed this multiple of the value right after its last
@@ -75,7 +75,7 @@ impl PackedAutomatonBlock {
     /// Builds a block from sorted, deduplicated `terms` and their `ids`
     /// (same length, same order).
     pub(crate) fn build<'a>(
-        terms: impl ExactSizeIterator<Item = &'a str>,
+        terms: impl ExactSizeIterator<Item = &'a [u8]>,
         ids: &[TermId],
         ws: &mut packed_automaton::Workspace,
     ) -> PackedAutomatonBlock {
@@ -127,9 +127,13 @@ impl PackedAutomatonBlock {
     }
 
     pub(crate) fn term_at(&self, local_rank: usize) -> String {
+        decoded_term(self.term_bytes(local_rank))
+    }
+
+    pub(crate) fn term_bytes(&self, local_rank: usize) -> Vec<u8> {
         let mut buf = Vec::new();
         self.term_at_into(local_rank, &mut buf);
-        String::from_utf8(buf).expect("keys were inserted as valid UTF-8 str bytes")
+        buf
     }
 
     /// Appends every id in rank order to `out`.
@@ -161,18 +165,16 @@ impl PackedAutomatonBlock {
         let mut stream = self.packed.stream();
         let mut rank = 0usize;
         while let Some(term) = stream.next() {
-            out.push(std::str::from_utf8(term).expect("keys were inserted as valid UTF-8 str bytes"), ids[rank]);
+            out.push(term, ids[rank]);
             rank += 1;
         }
     }
 
-    /// Decodes `positions` (`(output position, local rank)`, any order)
+    /// Decodes `targets` (`(output position, local rank)`, sorted by rank)
     /// into `out[position]`, via `PackedAutomaton::decode_ranks_into`: one
     /// descent visiting each state on some requested path once.
-    pub(crate) fn decode_sorted_ranks_into(&self, positions: &[(usize, u16)], out: &mut [Option<String>]) {
-        let mut targets: Vec<(usize, u32)> = positions.iter().map(|&(pos, rank)| (pos, u32::from(rank))).collect();
-        targets.sort_unstable_by_key(|&(_, rank)| rank);
-        self.packed.decode_ranks_into(&targets, out);
+    pub(crate) fn decode_sorted_ranks_into(&self, targets: &[(usize, u32)], out: &mut [Option<String>]) {
+        self.packed.decode_ranks_into(targets, out);
     }
 
     /// Merges `incoming` (sorted, deduplicated) into this block: existing
@@ -182,11 +184,12 @@ impl PackedAutomatonBlock {
     /// per term for small runs); then only the new terms are inserted.
     pub(crate) fn merge_into(
         &mut self,
-        incoming: &[&str],
+        incoming: &[&[u8]],
         alloc_id: impl FnMut() -> TermId,
         resolved: impl FnMut(TermId),
         ws: &mut Workspace,
     ) -> MergeOutcome {
+        debug_assert!(incoming.windows(2).all(|w| w[0] < w[1]), "incoming must be sorted and distinct");
         if incoming.is_empty() {
             return MergeOutcome {
                 added: 0,
@@ -223,7 +226,7 @@ impl PackedAutomatonBlock {
     /// returns the first new term's rank, if any.
     fn assign_by_descent(
         &self,
-        incoming: &[&str],
+        incoming: &[&[u8]],
         mut alloc_id: impl FnMut() -> TermId,
         mut resolved: impl FnMut(TermId),
         ws: &mut Workspace,
@@ -260,7 +263,7 @@ impl PackedAutomatonBlock {
     /// of the block's terms (`PackedAutomaton::stream`) against `incoming`.
     fn assign_by_stream(
         &self,
-        incoming: &[&str],
+        incoming: &[&[u8]],
         mut alloc_id: impl FnMut() -> TermId,
         mut resolved: impl FnMut(TermId),
         ws: &mut Workspace,
@@ -274,7 +277,7 @@ impl PackedAutomatonBlock {
             // New terms sorting before `old_term` (all remaining ones once
             // the block is exhausted).
             while let Some(&term) = incoming.get(next)
-                && old_term.is_none_or(|old| term.as_bytes() < old)
+                && old_term.is_none_or(|old| term < old)
             {
                 first_new.get_or_insert(ws.new_ids.len());
                 let id = alloc_id();
@@ -286,7 +289,7 @@ impl PackedAutomatonBlock {
             let Some(old_term) = old_term else { break };
             let id = ws.old_ids[old_rank];
             ws.new_ids.push(id);
-            if incoming.get(next).is_some_and(|t| t.as_bytes() == old_term) {
+            if incoming.get(next).is_some_and(|&t| t == old_term) {
                 resolved(id);
                 next += 1;
             }
@@ -344,7 +347,7 @@ mod tests {
     /// A block over `terms` with ids `0..len`.
     fn build(terms: &[String], ws: &mut Workspace) -> PackedAutomatonBlock {
         let ids: Vec<TermId> = (0..terms.len() as u32).map(TermId).collect();
-        PackedAutomatonBlock::build(terms.iter().map(String::as_str), &ids, &mut ws.automaton)
+        PackedAutomatonBlock::build(terms.iter().map(String::as_bytes), &ids, &mut ws.automaton)
     }
 
     #[test]
@@ -364,7 +367,7 @@ mod tests {
         block.decode_into(&mut arena, &mut ids);
         assert_eq!(arena.len(), terms.len());
         for (i, term) in terms.iter().enumerate() {
-            assert_eq!(arena.term_at(i), term.as_str());
+            assert_eq!(arena.term_at(i), term.as_bytes());
             assert_eq!(arena.id_at(i), TermId(i as u32));
         }
     }
@@ -384,7 +387,7 @@ mod tests {
             incoming.push("~".repeat(3)); // sorts last: past every old term
             incoming.sort_unstable();
             incoming.dedup();
-            let refs: Vec<&str> = incoming.iter().map(String::as_str).collect();
+            let refs: Vec<&[u8]> = incoming.iter().map(String::as_bytes).collect();
             let mut next_id = 100_000u32;
             let mut resolved = Vec::new();
             let outcome = block.merge_into(

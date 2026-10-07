@@ -4880,3 +4880,48 @@ reference). The integration tests check against a plain model instead
 against a brute-force Myhill-Nerode count rather than the slab automaton.
 Sections above that cite those types, files or `perf_probe_*` tests
 describe the code as it was; it is in the git history.
+
+## premises, not re-checks
+
+Following each value back to where it entered, several checks re-validated
+something construction already guarantees. Those are now premises, stated
+where they're relied on and checked with debug assertions; checks whose
+outcome depends on input stay real checks.
+
+- **Term bytes are UTF-8.** Terms only enter as `&str` (`insert`,
+  `insert_batch`, `TermBatch::push`), and every byte string a block yields
+  is one of them (construction, mutation, compaction and chaining preserve
+  the language; FSST labels decode exactly). Batch text, the radix sort,
+  the directory keys, merge runs and the split/merge arena now hold bytes,
+  which removes the per-term `from_utf8` on every split decode and the
+  char-boundary checks of slicing a `String` by its own offsets (once per
+  record per radix pass). The two places the API must return a `String`
+  (`get_term`, `get_terms_seeked_into`) go through `decoded_term`:
+  `debug_assert!` that the bytes are UTF-8, then `from_utf8_unchecked` --
+  the crate's only `unsafe`, with the premise as its SAFETY argument.
+- **Sorted, distinct input** to `build_sorted`, `insert_sorted`,
+  `lower_bounds_sorted`, `merge_into` and `decode_ranks_into` (from
+  `BatchOrder` groups, block order, or a sort just done by the caller) was
+  never checked at all; a violation would corrupt silently. Now
+  debug-asserted. `decode_sorted_ranks_into` no longer copies and re-sorts
+  ranks `get_terms_seeked_into` has just sorted.
+- **`reverse`**: after `id_to_block` resolves an id, the slot is live and
+  its block holds the id; three `?`s turned a broken invariant into a
+  silent `None`. A dead slot now panics (`block`), the rank is
+  debug-asserted, ranks stay `u32` (no `u16` narrowing premise), and the
+  `NonZeroU32` block-id wrapper -- re-checked on every lookup, returned by
+  no public API -- is gone (plain slots).
+- Smaller: registry buckets are stored as arrays (no slice-to-array
+  `expect`), FSST loads 8 query bytes with `first_chunk`, `BlockIds::new`
+  folds min/max without `Option`s.
+
+The opposite case also showed up: record addresses were `bytes.len() as
+u32`, wrapping silently if one block's records exceed 4 GiB (a huge term,
+or a huge batch run before its split). That depends on input, so it is now
+a real check (`next_address`).
+
+10M-line sequential insertion, four interleaved rounds: 13.9s mean vs 14.7s
+before (lookups, size and peak RSS unchanged). A release build with
+`-C debug-assertions -C overflow-checks` ran a 3M-line real-data prefix
+(load, 200K lookups, 2K single-term mutations; sequential and 2 writer
+shards) without a failed premise.

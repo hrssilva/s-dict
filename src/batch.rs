@@ -70,9 +70,9 @@ impl BatchOrder {
     /// ns/term (154 with records holding term slices, at twice the memory),
     /// against 215 for a comparison sort plus a grouping pass;
     /// what remains is mostly cache misses fetching term bytes.
-    pub(crate) fn prepare<'a>(&mut self, len: usize, term: impl Fn(usize) -> &'a str) {
+    pub(crate) fn prepare<'a>(&mut self, len: usize, term: impl Fn(usize) -> &'a [u8]) {
         let len32 = u32::try_from(len).expect("batch length fits u32");
-        let term = |r: &Record| term(r.index as usize).as_bytes();
+        let term = |r: &Record| term(r.index as usize);
         let mut records: Vec<Record> = (0..len32).map(|index| Record { key: 0, index }).collect();
         self.starts.clear();
         self.work.clear();
@@ -153,7 +153,9 @@ impl BatchOrder {
 /// run on parser workers; moving the batch does not invalidate any references.
 #[derive(Debug, Default)]
 pub struct TermBatch {
-    text: String,
+    /// Concatenated term bytes; kept as bytes (each term was a `&str`, so
+    /// slicing by its own offsets needs no char-boundary checks).
+    text: Vec<u8>,
     /// `(start, end)` of each term in `text`.
     terms: Vec<(u32, u32)>,
     pub(crate) order: BatchOrder,
@@ -168,7 +170,7 @@ impl TermBatch {
     /// Appends `term`. Panics if the batch's text would exceed 4 GiB.
     pub fn push(&mut self, term: &str) {
         let start = self.text.len();
-        self.text.push_str(term);
+        self.text.extend_from_slice(term.as_bytes());
         let end = u32::try_from(self.text.len()).expect("TermBatch text fits u32 offsets");
         self.terms.push((start as u32, end));
         self.prepared = false;
@@ -193,7 +195,8 @@ impl TermBatch {
         self.text.len()
     }
 
-    pub(crate) fn term(&self, index: usize) -> &str {
+    /// The bytes of the term pushed `index`-th.
+    pub(crate) fn term(&self, index: usize) -> &[u8] {
         let (start, end) = self.terms[index];
         &self.text[start as usize..end as usize]
     }
@@ -272,12 +275,12 @@ mod tests {
             terms.push(base);
         }
         let mut order = BatchOrder::default();
-        order.prepare(terms.len(), |i| &terms[i]);
+        order.prepare(terms.len(), |i| terms[i].as_bytes());
         assert_eq!(order.len(), terms.len());
         assert_eq!(groups(&order, &terms), reference(&terms));
         // Reuse, including small and empty batches.
         for n in [0, 1, 2, 30] {
-            order.prepare(n, |i| &terms[i]);
+            order.prepare(n, |i| terms[i].as_bytes());
             assert_eq!(groups(&order, &terms[..n]), reference(&terms[..n]));
         }
     }
@@ -289,7 +292,7 @@ mod tests {
         let long = "q".repeat(2_000_000);
         let terms = vec![long.clone(), format!("{long}r"), long.clone(), "a".to_string()];
         let mut order = BatchOrder::default();
-        order.prepare(terms.len(), |i| &terms[i]);
+        order.prepare(terms.len(), |i| terms[i].as_bytes());
         assert_eq!(groups(&order, &terms), reference(&terms));
     }
 }

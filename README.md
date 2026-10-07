@@ -54,7 +54,7 @@ either direction, ~24 us per single-term insert or remove.
 s-dict = { path = "../s-dict" }  # or a git dependency, once published
 ```
 
-No dependencies.
+No dependencies. One `unsafe` block: decoded terms become `String`s without re-validating UTF-8, a premise checked in debug builds (`decoded_term`; DESIGN.md's "premises, not re-checks").
 
 ## Quick start
 
