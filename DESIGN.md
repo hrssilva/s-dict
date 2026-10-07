@@ -4704,3 +4704,46 @@ Retained allocation is 7% above logical size now (36.27 vs 33.90 MiB),
 up from 2-4%: not yet investigated. Open: a chain-aware mutation path
 (avoiding `unchain` on the first change to a chained block), and the
 global run -> block map that would replace `SlotMap`.
+
+## chain-aware mutation and the global run -> block map
+
+**Chain-aware mutation.** After `shrink_to_fit` chains a block, the first
+mutation used to expand every chain in it (`unchain`, O(block)). Now
+`open_frame` -- which every mutation uses to open the states on its path
+-- expands only a chain it enters (`expand_chain`: the chain's states as
+single-transition records, O(chain length)); other chains stay. Two flags
+replace `chained`: `has_chains` (chain records may exist; reads handle them
+anywhere) and `pristine` (nothing mutated since `compact_and_chain`).
+`compact` fully expands remaining chains before its per-byte minimization.
+10M lines: single-term insert 95 -> 53 us.
+
+**Global run -> block map.** `SlotMap` (per-64-id chunks of slot indices,
+0.59 bytes/term) is replaced by `RangeMap` (`src/range_map.rs`): one
+breakpoint `(first id, block slot)` per run of consecutive ids in one block,
+with explicit "none" breakpoints, equal neighbors merged. Splits, neighbor
+merges and removals edit ranges in the middle, so breakpoints live in
+leaves of at most 512 (a two-level sorted structure: edits move at most one
+leaf, lookups are two binary searches) -- a flat sorted array would have
+memmoved ~800 KB per edit. 10M lines: 32.84 -> 30.05 MiB (-0.47
+bytes/term).
+
+**Construction state boxed.** A finished block is 200 bytes inline, 136 of
+them `PackedAutomaton`, ~90 of which (registry, scratch buffers) are only
+used during construction. They now live in one `Option<Box<Construction>>`
+created on demand: retained allocation over logical size 7% -> 5% at 10M
+lines.
+
+Full file (36.2M triples, 6.88M terms):
+
+| | packed before | packed after | `Dictionary` (fst) |
+|---|---|---|---|
+| logical size, sequential | 33.90 MiB | **30.79 MiB (4.69 B/term)** | 79.41 MiB |
+| logical size, 7 parsers + 5 writers | 32.93 MiB | **29.91 MiB** | 78.53 MiB |
+| insertion, sequential | 33.7s | 35.3s | 79.7s |
+| wall time, 7 + 5 | 14.3s | 14.6s | 28.7s |
+| get_term / get_id, sequential | 1,284 / 1,279 ns | 1,224 / 1,283 ns | 1,490 / 1,616 ns |
+| single-term insert / remove | 88 / 49 us | **52 / 48 us** | 279-302 / 239-257 us |
+| peak RSS, sequential | 103 MiB | 94 MiB | 141 MiB |
+
+Retained allocation is 5.5% above logical sequentially (32.49 vs 30.79
+MiB) and 9% with 160 shards (per-shard fixed overhead).

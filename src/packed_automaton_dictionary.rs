@@ -32,7 +32,7 @@ use std::num::NonZeroU32;
 use crate::batch::{BatchOrder, PreparedBatch};
 use crate::entries_arena::EntriesArena;
 use crate::packed_automaton_block::PackedAutomatonBlock;
-use crate::slot_map::SlotMap;
+use crate::range_map::RangeMap;
 use crate::{TermDictionary, TermId};
 
 /// A stable handle for a block: an index into `PackedAutomatonDictionary`'s
@@ -82,9 +82,10 @@ pub struct PackedAutomatonDictionary {
     blocks: Vec<Option<PackedAutomatonBlock>>,
     free_block_slots: Vec<u32>,
     directory: Vec<(Box<str>, PackedAutomatonBlockId)>,
-    /// `TermId -> block slot` only; ranks come from the block itself
-    /// (`PackedAutomatonBlock::rank_of_id`). See `SlotMap`.
-    id_to_block: SlotMap,
+    /// `TermId -> block slot` as ranges of consecutive ids; ranks come
+    /// from the block itself (`PackedAutomatonBlock::rank_of_id`). See
+    /// `RangeMap`.
+    id_to_block: RangeMap,
     free_term_ids: Vec<u32>,
     next_term_id: u32,
     block_min: usize,
@@ -122,7 +123,7 @@ impl PackedAutomatonDictionary {
             blocks: Vec::new(),
             free_block_slots: Vec::new(),
             directory: Vec::new(),
-            id_to_block: SlotMap::new(),
+            id_to_block: RangeMap::new(),
             free_term_ids: Vec::new(),
             next_term_id: 0,
             block_min,

@@ -1524,23 +1524,18 @@ pub(crate) struct PackedAutomaton {
     /// stored anywhere: every other state's count is derived top-down
     /// while descending (see `StagingFrame::children`).
     term_count: u32,
-    /// Construction-time dedup cache only -- never read by any query.
-    /// `None` after [`Self::release_construction_state`]; recreated on
-    /// demand by [`Self::registry`] the next time a record is written.
-    /// Long-lived holders (`PackedAutomatonBlock`) release it between
-    /// mutations: kept resident, its fixed-size table plus each cell's
-    /// own transitions `Vec` measured ~5x the automaton's `bytes` on
-    /// real RDF (DESIGN.md's "releasing PackedAutomaton's registry
-    /// between mutations").
-    register: Option<PackedRegistry>,
-    /// Reusable buffers for construction (released with the registry):
-    /// a per-confirm child list and a pool of frame child lists, so the
-    /// per-state work of `insert_sorted`/`build_sorted`/`compact` doesn't
-    /// allocate -- malloc/free was ~10% of a bulk load's profile.
-    scratch: Scratch,
-    /// `compact` left chain records (path compression, see
-    /// `append_chain`); mutation expands them first (`unchain`).
-    chained: bool,
+    /// Construction-only state -- the dedup registry and reusable
+    /// buffers -- boxed so a finished block (which has none) pays one
+    /// pointer instead of ~90 inline bytes; see `Construction`. `None`
+    /// after [`Self::release_construction_state`] or `compact`; recreated
+    /// on demand ([`Self::cons`]).
+    construction: Option<Box<Construction>>,
+    /// Chain records may exist (path compression, see `append_chain`).
+    /// Reads handle them anywhere; mutation expands just the chains on its
+    /// path (`open_frame` -> `expand_chain`).
+    has_chains: bool,
+    /// Exactly as `compact_and_chain` left it: no mutation since.
+    pristine: bool,
     /// Symbol table for chain labels (`crate::fsst`), shared by every
     /// block of a dictionary; set by the dictionary once trained.
     symbols: Option<std::sync::Arc<crate::fsst::SymbolTable>>,
@@ -1556,6 +1551,21 @@ struct Chain {
     len: usize,
     target: u32,
     coded: bool,
+}
+
+/// What only construction needs (`PackedAutomaton::construction`): the
+/// dedup registry (`registry`; never read by any query -- long-lived
+/// holders release it between mutations: kept resident, its fixed-size
+/// table plus each cell's transitions `Vec` measured ~5x the automaton's
+/// `bytes` on real RDF, DESIGN.md's "releasing PackedAutomaton's registry
+/// between mutations"), and reusable buffers -- a per-confirm
+/// child list and a pool of frame child lists, so the per-state work of
+/// `insert_sorted`/`build_sorted`/`compact` doesn't allocate (malloc/free
+/// was ~10% of a bulk load's profile).
+#[derive(Clone, Debug, Default)]
+struct Construction {
+    register: Option<PackedRegistry>,
+    scratch: Scratch,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -1588,9 +1598,12 @@ impl PackedAutomaton {
             bytes: Vec::new(),
             root: 0,
             term_count: automaton.len() as u32,
-            register: Some(PackedRegistry::with_capacity_hint(automaton.len())),
-            scratch: Scratch::default(),
-            chained: false,
+            construction: Some(Box::new(Construction {
+                register: Some(PackedRegistry::with_capacity_hint(automaton.len())),
+                scratch: Scratch::default(),
+            })),
+            has_chains: false,
+            pristine: false,
             symbols: None,
             chains_coded: false,
         };
@@ -1657,9 +1670,12 @@ impl PackedAutomaton {
             bytes: Vec::new(),
             root: 0,
             term_count: 0,
-            register: Some(PackedRegistry::with_capacity_hint(capacity_hint)),
-            scratch: Scratch::default(),
-            chained: false,
+            construction: Some(Box::new(Construction {
+                register: Some(PackedRegistry::with_capacity_hint(capacity_hint)),
+                scratch: Scratch::default(),
+            })),
+            has_chains: false,
+            pristine: false,
             symbols: None,
             chains_coded: false,
         };
@@ -1765,7 +1781,7 @@ impl PackedAutomaton {
     /// sorted-merge walk) don't need this to report it back, so unlike
     /// the slab's own `insert_sorted` this returns nothing.
     pub(crate) fn insert_sorted<'a>(&mut self, terms: impl Iterator<Item = &'a str>) {
-        self.unchain();
+        self.pristine = false;
         let mut frames: Vec<StagingFrame> = vec![self.open_frame(self.root, self.term_count)];
         let mut path_bytes: Vec<u8> = Vec::new();
         let mut last_word: Vec<u8> = Vec::new();
@@ -1830,7 +1846,7 @@ impl PackedAutomaton {
     /// reference-counting or redirect-into-an-existing-record step at
     /// all, unlike the mutable slab design's own `insert`.
     pub(crate) fn insert(&mut self, term: &str) {
-        self.unchain();
+        self.pristine = false;
         let word = term.as_bytes();
 
         // Walk existing transitions as far as they match, "opening" every
@@ -1897,7 +1913,7 @@ impl PackedAutomaton {
     /// path bottom-up. Superseded records become dead bytes, reclaimed by
     /// [`Self::compact`] like `insert`'s.
     pub(crate) fn remove(&mut self, term: &str) -> bool {
-        self.unchain();
+        self.pristine = false;
         let word = term.as_bytes();
         let mut staging: Vec<StagingFrame> = vec![self.open_frame(self.root, self.term_count)];
         for &byte in word {
@@ -1999,14 +2015,14 @@ impl PackedAutomaton {
     /// register) the confirmed record. Returns `(address, subtree_count)`.
     fn confirm_frame(&mut self, frame: &StagingFrame) -> (u32, u32) {
         let mut running = u32::from(frame.is_final);
-        let mut children = std::mem::take(&mut self.scratch.children);
+        let mut children = std::mem::take(&mut self.cons().scratch.children);
         children.clear();
         for &(b, child_count, target) in &frame.children {
             children.push((b, running, target));
             running += child_count;
         }
         let pos = self.write_confirmed_state(frame.is_final, &children);
-        self.scratch.children = children;
+        self.cons().scratch.children = children;
         (pos, running)
     }
 
@@ -2014,7 +2030,12 @@ impl PackedAutomaton {
     /// editable frame. Child counts are the differences between
     /// consecutive outputs; the last child gets the rest of `count`.
     fn open_frame(&mut self, pos: u32, count: u32) -> StagingFrame {
-        let mut children = self.scratch.frames.pop().unwrap_or_default();
+        // A mutation path entering a chain expands just that chain.
+        let pos = match self.chain_at(pos) {
+            Some(chain) => self.expand_chain(chain),
+            None => pos,
+        };
+        let mut children = self.cons().scratch.frames.pop().unwrap_or_default();
         children.clear();
         let (is_final, n, mode, mut cursor) = self.header(pos);
         for i in 0..n {
@@ -2031,9 +2052,30 @@ impl PackedAutomaton {
         StagingFrame { is_final, children }
     }
 
+    /// Writes `chain`'s states as single-transition records (last state
+    /// first, so each points at the record just below it: NEXT) and
+    /// returns the first one's address. The chain record itself becomes
+    /// dead bytes, reclaimed by the next compaction. O(chain length): the
+    /// per-chain alternative to expanding the whole block (`unchain`).
+    fn expand_chain(&mut self, chain: Chain) -> u32 {
+        let mut label = Vec::new();
+        self.chain_label(chain, &mut label);
+        let mut next = chain.target;
+        for &b in label.iter().rev() {
+            next = self.append_record(false, &[(b, 0, next)]);
+        }
+        next
+    }
+
+    /// Construction state, created on first use.
+    #[inline]
+    fn cons(&mut self) -> &mut Construction {
+        self.construction.get_or_insert_with(Default::default)
+    }
+
     /// An empty frame whose child list comes from the scratch pool.
     fn new_frame(&mut self) -> StagingFrame {
-        let mut children = self.scratch.frames.pop().unwrap_or_default();
+        let mut children = self.cons().scratch.frames.pop().unwrap_or_default();
         children.clear();
         StagingFrame {
             is_final: false,
@@ -2043,7 +2085,7 @@ impl PackedAutomaton {
 
     /// Returns a confirmed frame's child list to the scratch pool.
     fn recycle_frame(&mut self, frame: StagingFrame) {
-        self.scratch.frames.push(frame.children);
+        self.cons().scratch.frames.push(frame.children);
     }
 
     /// `get`/`insert` take `children` by reference, so unlike the prior
@@ -2069,10 +2111,12 @@ impl PackedAutomaton {
     /// same kind of lost sharing the bounded LRU's eviction already
     /// accepts (measured: +4% `bytes` on real RDF, DESIGN.md).
     fn registry(&mut self) -> &mut PackedRegistry {
-        if self.register.is_none() {
-            self.register = Some(PackedRegistry::with_capacity_hint(self.term_count as usize));
+        let hint = self.term_count as usize;
+        let construction = self.cons();
+        if construction.register.is_none() {
+            construction.register = Some(PackedRegistry::with_capacity_hint(hint));
         }
-        self.register.as_mut().expect("just ensured")
+        construction.register.as_mut().expect("just ensured")
     }
 
     /// Recreates a released registry sized for a mutation touching
@@ -2083,8 +2127,9 @@ impl PackedAutomaton {
     /// cost in a 1024-term block (DESIGN.md's "incremental single-term
     /// mutation").
     pub(crate) fn reserve_registry(&mut self, terms: usize) {
-        if self.register.is_none() {
-            self.register = Some(PackedRegistry::with_capacity_hint(terms));
+        let construction = self.cons();
+        if construction.register.is_none() {
+            construction.register = Some(PackedRegistry::with_capacity_hint(terms));
         }
     }
 
@@ -2093,8 +2138,7 @@ impl PackedAutomaton {
     /// heap matches `size_bytes`. Further `insert`/`insert_sorted` calls
     /// remain valid (see [`Self::registry`]).
     pub(crate) fn release_construction_state(&mut self) {
-        self.register = None;
-        self.scratch = Scratch::default();
+        self.construction = None;
         self.bytes.shrink_to_fit();
     }
 
@@ -2111,25 +2155,25 @@ impl PackedAutomaton {
     /// Records are re-emitted in postorder, children in byte order, as
     /// `build_sorted` writes them, so NEXT targets apply.
     pub(crate) fn compact(&mut self) {
-        if self.chained {
-            // Already compacted, and nothing mutated since (mutation
-            // unchains first).
+        if self.pristine {
+            // Already compacted, and nothing mutated since.
             return;
         }
+        // Minimization runs on per-byte states: expand remaining chains.
+        self.unchain();
         let old = PackedAutomaton {
             bytes: std::mem::take(&mut self.bytes),
             root: self.root,
             term_count: self.term_count,
-            register: None,
-            scratch: Scratch::default(),
-            chained: false,
+            construction: None,
+            has_chains: false,
+            pristine: false,
             symbols: self.symbols.clone(),
             chains_coded: false,
         };
-        self.register = None;
         let mut moved = vec![u32::MAX; old.bytes.len()];
         let mut canonical = DedupTable::new();
-        let mut pool = std::mem::take(&mut self.scratch.frames);
+        let mut pool = self.construction.take().map(|c| c.scratch.frames).unwrap_or_default();
         let read = |pool: &mut Vec<Vec<(u8, u32, u32)>>, pos: u32| {
             let mut v = pool.pop().unwrap_or_default();
             v.clear();
@@ -2169,7 +2213,7 @@ impl PackedAutomaton {
         }
         self.root = moved[old.root as usize];
         self.bytes.shrink_to_fit();
-        self.scratch = Scratch::default();
+        self.construction = None;
     }
 
     /// `compact`, then path compression (`chain_up`) for read speed. Meant
@@ -2178,11 +2222,12 @@ impl PackedAutomaton {
     /// growth-triggered compaction -- would only churn (measured: +20%
     /// insertion at 10M lines).
     pub(crate) fn compact_and_chain(&mut self) {
-        if self.chained && (self.chains_coded || self.symbols.is_none()) {
+        if self.pristine && (self.chains_coded || self.symbols.is_none()) {
             return;
         }
-        // Chained before a symbol table existed: re-chain with it.
-        self.unchain();
+        // Not pristine, or chained before a symbol table existed: minimize
+        // per-byte again, then chain (with the table).
+        self.pristine = false;
         self.compact();
         self.chain_up();
         self.bytes.shrink_to_fit();
@@ -2246,9 +2291,9 @@ impl PackedAutomaton {
             bytes: std::mem::take(&mut self.bytes),
             root: self.root,
             term_count: self.term_count,
-            register: None,
-            scratch: Scratch::default(),
-            chained: false,
+            construction: None,
+            has_chains: false,
+            pristine: false,
             symbols: self.symbols.clone(),
             chains_coded: false,
         };
@@ -2315,24 +2360,25 @@ impl PackedAutomaton {
             }
         });
         self.root = moved[old.root as usize];
-        self.chained = true;
+        self.has_chains = true;
+        self.pristine = true;
         self.chains_coded = symbols.is_some();
     }
 
-    /// Expands chain records back into single-transition records, so the
-    /// per-byte mutation machinery (`open_frame`, frames, registry) can
-    /// run. O(records); a no-op unless `compact` chained this automaton.
+    /// Expands every chain record back into single-transition records,
+    /// for compaction's per-byte minimization. O(records); a no-op when no
+    /// chain records exist.
     fn unchain(&mut self) {
-        if !self.chained {
+        if !self.has_chains {
             return;
         }
         let old = PackedAutomaton {
             bytes: std::mem::take(&mut self.bytes),
             root: self.root,
             term_count: self.term_count,
-            register: None,
-            scratch: Scratch::default(),
-            chained: false,
+            construction: None,
+            has_chains: false,
+            pristine: false,
             symbols: self.symbols.clone(),
             chains_coded: false,
         };
@@ -2358,7 +2404,8 @@ impl PackedAutomaton {
             moved[pos as usize] = new_pos;
         });
         self.root = moved[old.root as usize];
-        self.chained = false;
+        self.has_chains = false;
+        self.pristine = false;
     }
 
     /// `read_children`, into a caller-provided buffer.
@@ -2457,7 +2504,10 @@ impl PackedAutomaton {
     /// `reachable_state_count` stays flat.
     #[cfg(test)]
     pub(crate) fn register_len(&self) -> usize {
-        self.register.as_ref().map_or(0, PackedRegistry::len)
+        self.construction
+            .as_ref()
+            .and_then(|c| c.register.as_ref())
+            .map_or(0, PackedRegistry::len)
     }
 
     /// The number of *reachable* records -- `Automaton::
