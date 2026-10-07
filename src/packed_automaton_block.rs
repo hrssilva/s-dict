@@ -134,6 +134,11 @@ impl PackedAutomatonBlock {
     /// `Block::payload_bytes`'s analog -- see `PackedAutomaton::size_bytes`'s
     /// own doc comment for exactly what's included (and, under sustained
     /// inserts, what dead-record bloat this can carry -- see DESIGN.md).
+    /// The local rank of `id`, if this block holds it (`BlockIds::rank_of`).
+    pub(crate) fn rank_of_id(&self, id: TermId) -> Option<usize> {
+        self.ids.rank_of(id)
+    }
+
     /// Logical size of the compressed `rank -> TermId` array.
     pub(crate) fn ids_bytes(&self) -> usize {
         self.ids.size_bytes()

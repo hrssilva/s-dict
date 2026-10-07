@@ -34,6 +34,7 @@ mod packed_automaton_dictionary;
 mod plain;
 mod reverse_map;
 mod sharded;
+mod slot_map;
 
 pub use automaton_dictionary::{AutomatonBlockId, AutomatonDictionary};
 pub use batch::{PreparedBatch, TermBatch};

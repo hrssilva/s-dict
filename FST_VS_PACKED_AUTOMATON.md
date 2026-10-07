@@ -32,8 +32,8 @@ survey) and `DESIGN.md` (every measurement, in full, with methodology).
 | Memory at scale (hashlike, 300K terms) | ~29.8 bytes/term, flat | ~104-109 bytes/term, flat (was ~104-132, growing, before the dedup-structure fix) |
 | Dead/unreachable state reclamation | n/a -- always freshly rebuilt | `compact`: copy reachable records with exact dedup (yields the *minimal* automaton); on growth >2x per merge, and for every block in `shrink_to_fit` |
 | Real RDF, 6.3M terms, each at its default blocks: logical size | 88.7 MiB (64..=256) | **77.0 MiB** (256..=1024, 90% split fill, folded labels; 322.6 before the record format, compaction, reverse-map packing, block and label changes) |
-| Real RDF, full file (6.88M terms): logical size | 79.4 MiB (compressed reverse map) | **46.4 MiB** (compressed block ids and reverse map) |
-| Real RDF, full file: insertion, 1 writer / wall time, 4 parsers + 8 writers | 81.5s / 25.5s | **35.1s / 15.9s** |
+| Real RDF, full file (6.88M terms): logical size | 79.4 MiB (compressed reverse map) | **44.0 MiB** (compressed block ids with id -> rank inverse; slot-only reverse map) |
+| Real RDF, full file: insertion, 1 writer / wall time, 4 parsers + 8 writers | 79.7s / 26.3s | **33.1s / 14.0s** |
 | Real RDF, 6.3M terms: insertion (prepared batches, 1 writer) | 47.7s | **22.2s** (incl. final compaction) |
 | Real RDF, 6.3M terms: get_term / get_id (dictionary level) | 1,550 / 1,703 ns | **1,116-1,156 / 1,138-1,195 ns** |
 | Real RDF, 6.3M terms: peak RSS (1 writer) | 134 MiB | **131 MiB** |

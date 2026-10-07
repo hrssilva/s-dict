@@ -4521,3 +4521,64 @@ re-encodes ~21 chunks (writer time +25% sharded, sequential insertion
 +3.6s, single-term mutations +~23 us); lookups ~+5%. (One 4 + 8 run read
 the file with a cold page cache: 30.3s wall, parsers' summed time 94.9s
 instead of ~43s, writers unchanged; the warm rerun is reported.)
+
+## static FST reference
+
+To see what a static structure would cost, `s-bench`'s `static_fst_bench`
+loads the full private real-RDF corpus into a `Dictionary`, reads every
+term back, and builds single `fst` structures over all 6.88M terms with the
+same vendored crate. A `fst::Map` from each term to the dictionary's own
+(arbitrary) `TermId` takes 8.75 bytes/term and answers only term -> id; it
+is immutable. Packed, with the same kind of ids, is now 7.07 bytes/term
+while also answering id -> term and supporting insert and remove. The
+same map with *sorted ranks* as values takes 4.22 bytes/term (an
+`fst::Set`, 3.79): values that follow key order keep states shareable,
+while arbitrary values, pushed toward the root, block suffix sharing.
+That is the split packed already makes: its automata carry only local
+rank outputs (~4.3 bytes/term, close to the rank-valued map), and the
+arbitrary ids live beside them in `BlockIds` and the reverse map, encoded
+from their run structure.
+
+## ranks out of the reverse map
+
+Ranks shift on every merge, but the block an id lives in changes only for
+new ids, splits and neighbor merges. Storing ranks in the reverse map
+meant rewriting them on every merge (51,876 calls, 1.11M chunk rewrites in
+the full load). Packed now splits the two: `SlotMap` (`src/slot_map.rs`)
+stores only `id -> block slot`, in the same 64-id chunk layout, written
+only when an id changes block; `BlockIds::rank_of` answers `id -> rank`
+from an inverse rebuilt whenever the block re-encodes its ids (every merge
+already did). The inverse, per kind: `Implicit` `id - base`; `Runs` -- runs
+relabelled in base order, binary search over the bases, then a rank sample
+every 16 entries plus bit-packed deltas; `For` -- ranks in id order,
+binary-searched. `Dictionary` (fst) keeps the rank-storing `ReverseMap`:
+its blocks have no `BlockIds`.
+
+Measured first (full private real-RDF corpus): slot-only map 0.49
+bytes/term; per-run ranks as FOR per run 1.28, deltas + sample every 16
+0.69, Elias-Fano 0.57 (select scan). Chosen: deltas + samples, ~1.2 total
+vs 1.66 before.
+
+Two things found on the way. The full-file sequential load briefly holds
+a whole batch run in one block before splitting it, so a run can exceed
+65,535 entries: the first descriptor layout (16-bit run length) panicked;
+it is now 26 bits (`runs_longer_than_u16` covers it). And `get_term` got
+~30% slower: the sample interval barely mattered (every 4/8/16: 1,392 /
+1,398 / 1,437-1,456 ns at 10M lines), the extra dependent heap objects
+did -- `BlockIds` had four boxed sections; putting them in one allocation
+recovered ~5% (1,366-1,371 ns). The rest is inherent to computing the
+rank: one more cache miss into the block's id data plus the search.
+
+Full file (36.2M triples, 6.88M terms), packed before -> now (`Dictionary`
+unchanged):
+
+| | packed before | packed now | `Dictionary` (fst) |
+|---|---|---|---|
+| logical size, sequential | 46.38 MiB | **44.01 MiB (6.71 B/term)** | 79.41 MiB |
+| logical size, 4 + 8 | 48.50 MiB | **46.62 MiB** | 80.16 MiB |
+| insertion, sequential | 35.1s | **33.1s** | 79.7s |
+| wall time, 4 + 8 | 15.9s | **14.0s** | 26.3s |
+| single-term insert / remove | 52 / 50 us | **35 / 33 us** | 302 / 239 us |
+| get_term, sequential / 4 + 8 | 1,034 / 1,097 ns | 1,299 / 1,438 ns | 1,490 / 1,596 ns |
+| get_id, sequential / 4 + 8 | 1,125 / 1,272 ns | 1,199 / 1,301 ns | 1,616 / 2,051 ns |
+| peak RSS, 4 + 8 | 441 MiB | 387 MiB | 461 MiB |

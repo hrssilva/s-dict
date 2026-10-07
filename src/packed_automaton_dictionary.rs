@@ -32,7 +32,7 @@ use std::num::NonZeroU32;
 use crate::batch::{BatchOrder, PreparedBatch};
 use crate::entries_arena::EntriesArena;
 use crate::packed_automaton_block::PackedAutomatonBlock;
-use crate::reverse_map::ReverseMap;
+use crate::slot_map::SlotMap;
 use crate::{TermDictionary, TermId};
 
 /// A stable handle for a block: an index into `PackedAutomatonDictionary`'s
@@ -77,7 +77,9 @@ pub struct PackedAutomatonDictionary {
     blocks: Vec<Option<PackedAutomatonBlock>>,
     free_block_slots: Vec<u32>,
     directory: Vec<(Box<str>, PackedAutomatonBlockId)>,
-    id_to_block: ReverseMap,
+    /// `TermId -> block slot` only; ranks come from the block itself
+    /// (`PackedAutomatonBlock::rank_of_id`). See `SlotMap`.
+    id_to_block: SlotMap,
     free_term_ids: Vec<u32>,
     next_term_id: u32,
     block_min: usize,
@@ -112,7 +114,7 @@ impl PackedAutomatonDictionary {
             blocks: Vec::new(),
             free_block_slots: Vec::new(),
             directory: Vec::new(),
-            id_to_block: ReverseMap::new(),
+            id_to_block: SlotMap::new(),
             free_term_ids: Vec::new(),
             next_term_id: 0,
             block_min,
@@ -265,32 +267,25 @@ impl PackedAutomatonDictionary {
         }
     }
 
-    fn set_id_to_block(&mut self, id: TermId, block_id: PackedAutomatonBlockId, local_rank: usize) {
-        self.id_to_block.set(id.0, block_id.slot(), local_rank);
-    }
-
-    /// `(block, local rank)` for a live id. Ranks of a settled dictionary
-    /// are `< block_max <= u16::MAX`.
+    /// `(block, local rank)` for a live id: the slot from `id_to_block`,
+    /// the rank from the block's own id inverse. Ranks of a settled
+    /// dictionary are `< block_max <= u16::MAX`.
     #[inline]
     fn reverse(&self, id: TermId) -> Option<(PackedAutomatonBlockId, u16)> {
-        self.id_to_block
-            .get(id.0)
-            .map(|(slot, rank)| (PackedAutomatonBlockId::from_slot(slot), rank as u16))
+        let slot = self.id_to_block.get(id.0)?;
+        let rank = self.blocks.get(slot as usize)?.as_ref()?.rank_of_id(id)?;
+        Some((PackedAutomatonBlockId::from_slot(slot), rank as u16))
     }
 
-    fn assign_ranks(&mut self, block_id: PackedAutomatonBlockId, skip: usize) {
-        // A block over `block_max` is always about to be split by
-        // `split_while_oversized`, which assigns every chunk from rank 0 --
-        // assigning it here would be wasted work.
-        if self.block(block_id).len() > self.block_max {
-            return;
-        }
+    /// Points every id of `block_id` at it -- after the block was built
+    /// from ids that lived elsewhere (split chunks, neighbor merges). Rank
+    /// changes need nothing here: ranks live in the block.
+    fn assign_slots(&mut self, block_id: PackedAutomatonBlockId) {
         let block = self.blocks[block_id.slot() as usize]
             .as_ref()
             .expect("PackedAutomatonBlockId must reference a live block");
-        let len = block.len();
         self.id_to_block
-            .assign(block_id.slot(), (skip..len).map(|rank| (block.id_at(rank).0, rank)));
+            .assign(block_id.slot(), (0..block.len()).map(|rank| block.id_at(rank).0));
     }
 
     fn refresh_directory_key(
@@ -349,7 +344,7 @@ impl PackedAutomatonDictionary {
                 new_directory.push((min_key, id));
                 id
             };
-            self.assign_ranks(chunk_id, 0);
+            self.assign_slots(chunk_id);
             start = end;
         }
         self.scratch = arena;
@@ -384,7 +379,7 @@ impl PackedAutomatonDictionary {
 
         let rebuilt = PackedAutomatonBlock::build(arena.iter());
         *self.block_mut(keep_block_id) = rebuilt;
-        self.assign_ranks(keep_block_id, 0);
+        self.assign_slots(keep_block_id);
 
         self.scratch = arena;
 
@@ -425,8 +420,7 @@ impl PackedAutomatonDictionary {
                 PackedAutomatonBlock::build((start..end).map(term).zip(chunk_ids.iter().copied()));
             let min_key: Box<str> = block.min_key().into();
             let block_id = self.alloc_block(block);
-            self.id_to_block
-                .assign(block_id.slot(), chunk_ids.iter().enumerate().map(|(rank, id)| (id.0, rank)));
+            self.id_to_block.assign(block_id.slot(), chunk_ids.iter().map(|id| id.0));
             self.directory.push((min_key, block_id));
             self.len += end - start;
             start = end;
@@ -461,6 +455,7 @@ impl PackedAutomatonDictionary {
             let block_id = self.directory[dir_idx].1;
 
             let mut k = u;
+            let mut added_ids: Vec<u32> = Vec::new();
             let free_term_ids = &mut self.free_term_ids;
             let next_term_id = &mut self.next_term_id;
             let block_ref = self.blocks[block_id.slot() as usize]
@@ -468,13 +463,17 @@ impl PackedAutomatonDictionary {
                 .expect("PackedAutomatonBlockId must reference a live block");
             let outcome = block_ref.merge_into(
                 (u..run_end).map(&term),
-                || match free_term_ids.pop() {
-                    Some(slot) => TermId(slot),
-                    None => {
-                        let id = TermId(*next_term_id);
-                        *next_term_id += 1;
-                        id
-                    }
+                || {
+                    let id = match free_term_ids.pop() {
+                        Some(slot) => TermId(slot),
+                        None => {
+                            let id = TermId(*next_term_id);
+                            *next_term_id += 1;
+                            id
+                        }
+                    };
+                    added_ids.push(id.0);
+                    id
                 },
                 |id| {
                     for &pos in order.positions(k) {
@@ -487,7 +486,9 @@ impl PackedAutomatonDictionary {
             if outcome.added > 0 {
                 self.len += outcome.added;
                 self.refresh_directory_key(dir_idx, block_id, outcome.unchanged_prefix);
-                self.assign_ranks(block_id, outcome.unchanged_prefix);
+                // Only the new ids changed block; existing ones' ranks
+                // shifted, which the block's own inverse already reflects.
+                self.id_to_block.assign(block_id.slot(), added_ids.into_iter());
                 if self.block(block_id).len() > self.block_max {
                     self.split_while_oversized(dir_idx);
                 }
@@ -517,7 +518,7 @@ impl TermDictionary for PackedAutomatonDictionary {
             let block = PackedAutomatonBlock::build(std::iter::once((term, id)));
             let block_id = self.alloc_block(block);
             self.directory.push((term.into(), block_id));
-            self.set_id_to_block(id, block_id, 0);
+            self.id_to_block.set(id.0, block_id.slot());
             self.len += 1;
             return id;
         }
@@ -535,7 +536,7 @@ impl TermDictionary for PackedAutomatonDictionary {
 
         self.len += 1;
         self.refresh_directory_key(dir_idx, block_id, outcome.unchanged_prefix);
-        self.assign_ranks(block_id, outcome.unchanged_prefix);
+        self.id_to_block.set(id.0, block_id.slot());
 
         if self.block(block_id).len() > self.block_max {
             self.split_while_oversized(dir_idx);
@@ -564,7 +565,6 @@ impl TermDictionary for PackedAutomatonDictionary {
             self.remove_empty_block(dir_idx);
         } else {
             self.refresh_directory_key(dir_idx, block_id, unchanged_prefix);
-            self.assign_ranks(block_id, unchanged_prefix);
             if remaining < self.block_min {
                 self.merge_with_neighbor(dir_idx);
             }
