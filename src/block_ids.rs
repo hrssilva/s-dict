@@ -325,7 +325,7 @@ impl BlockIds {
         for w in first..word {
             r += self.data[words_at + w].count_ones() as usize;
         }
-        if i % 64 != 0 {
+        if !i.is_multiple_of(64) {
             r += (self.data[words_at + word] & ((1u64 << (i % 64)) - 1)).count_ones() as usize;
         }
         r

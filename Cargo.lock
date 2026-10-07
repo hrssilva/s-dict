@@ -3,12 +3,5 @@
 version = 4
 
 [[package]]
-name = "fst"
-version = "0.4.7"
-
-[[package]]
 name = "s-dict"
 version = "0.1.0"
-dependencies = [
- "fst",
-]

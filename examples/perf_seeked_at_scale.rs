@@ -1,20 +1,11 @@
-//! Measures `get_terms_seeked_into` end to end, at real corpus scale --
-//! `AutomatonDictionary` vs `PackedAutomatonDictionary`, built the same
-//! way `examples/perf_scale_memory.rs` builds one (same term generators,
-//! same default scale), then queried with a "seeked" workload: scattered
-//! clusters of consecutive-rank ids, each cluster likely (not
-//! guaranteed -- a cluster straddling a block boundary is a realistic
-//! possibility, not filtered out) landing in one block, the shape
-//! `get_terms_seeked_into` exists for (`micro_fst.rs`'s own
-//! `perf_probe_decode_ranks_cost_*` probes already measured the bare
-//! `decode_ranks_into`/`get_terms_seeked_into` primitive in isolation --
-//! this measures the same operation through the full router/block
-//! machinery, at real scale, the thing `perf_scale_memory.rs` already
-//! did for insert/memory).
+//! Measures `PackedAutomatonDictionary::get_terms_seeked_into` end to end
+//! on a synthetic corpus (the generators `perf_scale_memory.rs` uses),
+//! queried with scattered clusters of consecutive-rank ids -- the shape the
+//! batched decode exists for.
 //!
-//! Usage: `cargo run --release --example perf_seeked_at_scale -- automaton|packed [clustered|hashlike] [total] [num_clusters] [cluster_size]`
+//! Usage: `cargo run --release --example perf_seeked_at_scale -- [clustered|hashlike] [total] [num_clusters] [cluster_size]`
 
-use s_dict::{AutomatonDictionary, PackedAutomatonDictionary, TermDictionary, TermId};
+use s_dict::{PackedAutomatonDictionary, TermDictionary, TermId};
 
 fn namespace_clustered_terms_range(start: u32, count: u32) -> Vec<String> {
     (start..start + count)
@@ -83,7 +74,6 @@ const QUERY_REPEATS: usize = 10;
 
 fn main() {
     let mut args = std::env::args().skip(1);
-    let kind = args.next().expect("first arg: automaton or packed");
     let generator = args.next().unwrap_or_else(|| "clustered".to_string());
     let total: u32 = args.next().and_then(|s| s.parse().ok()).unwrap_or(300_000);
     let num_clusters: usize = args.next().and_then(|s| s.parse().ok()).unwrap_or(2000);
@@ -100,63 +90,30 @@ fn main() {
     let terms = gen_range(0, total_groups);
     let refs: Vec<&str> = terms.iter().map(String::as_str).collect();
 
-    match kind.as_str() {
-        "automaton" => {
-            let mut dict = AutomatonDictionary::new();
-            let build_start = std::time::Instant::now();
-            let ids = dict.insert_batch(&refs);
-            let build_elapsed = build_start.elapsed();
+    let mut dict = PackedAutomatonDictionary::new();
+    let build_start = std::time::Instant::now();
+    let ids = dict.insert_batch(&refs);
+    let build_elapsed = build_start.elapsed();
 
-            let mut sorted: Vec<(&str, TermId)> = refs.iter().copied().zip(ids).collect();
-            sorted.sort_unstable_by_key(|&(t, _)| t);
-            let sorted_ids: Vec<TermId> = sorted.iter().map(|&(_, id)| id).collect();
-            let query = build_query(&sorted_ids, num_clusters, cluster_size);
+    let mut sorted: Vec<(&str, TermId)> = refs.iter().copied().zip(ids).collect();
+    sorted.sort_unstable_by_key(|&(t, _)| t);
+    let sorted_ids: Vec<TermId> = sorted.iter().map(|&(_, id)| id).collect();
+    let query = build_query(&sorted_ids, num_clusters, cluster_size);
 
-            let mut out = Vec::new();
-            let start = std::time::Instant::now();
-            for _ in 0..QUERY_REPEATS {
-                dict.get_terms_seeked_into(&query, &mut out);
-                std::hint::black_box(&out);
-            }
-            let elapsed = start.elapsed();
-            eprintln!(
-                "AutomatonDictionary: {} terms, {} blocks, build={build_elapsed:?}\n\
-                 get_terms_seeked_into: {} ids ({num_clusters} clusters x {cluster_size}) x {QUERY_REPEATS} repeats: \
-                 {elapsed:?} ({:?}/op)",
-                dict.len(),
-                dict.block_count(),
-                query.len(),
-                elapsed / (QUERY_REPEATS * query.len()) as u32,
-            );
-        }
-        "packed" => {
-            let mut dict = PackedAutomatonDictionary::new();
-            let build_start = std::time::Instant::now();
-            let ids = dict.insert_batch(&refs);
-            let build_elapsed = build_start.elapsed();
-
-            let mut sorted: Vec<(&str, TermId)> = refs.iter().copied().zip(ids).collect();
-            sorted.sort_unstable_by_key(|&(t, _)| t);
-            let sorted_ids: Vec<TermId> = sorted.iter().map(|&(_, id)| id).collect();
-            let query = build_query(&sorted_ids, num_clusters, cluster_size);
-
-            let mut out = Vec::new();
-            let start = std::time::Instant::now();
-            for _ in 0..QUERY_REPEATS {
-                dict.get_terms_seeked_into(&query, &mut out);
-                std::hint::black_box(&out);
-            }
-            let elapsed = start.elapsed();
-            eprintln!(
-                "PackedAutomatonDictionary: {} terms, {} blocks, build={build_elapsed:?}\n\
-                 get_terms_seeked_into: {} ids ({num_clusters} clusters x {cluster_size}) x {QUERY_REPEATS} repeats: \
-                 {elapsed:?} ({:?}/op)",
-                dict.len(),
-                dict.block_count(),
-                query.len(),
-                elapsed / (QUERY_REPEATS * query.len()) as u32,
-            );
-        }
-        other => panic!("unknown kind {other:?}; expected automaton or packed"),
+    let mut out = Vec::new();
+    let start = std::time::Instant::now();
+    for _ in 0..QUERY_REPEATS {
+        dict.get_terms_seeked_into(&query, &mut out);
+        std::hint::black_box(&out);
     }
+    let elapsed = start.elapsed();
+    eprintln!(
+        "PackedAutomatonDictionary: {} terms, {} blocks, build={build_elapsed:?}\n\
+         get_terms_seeked_into: {} ids ({num_clusters} clusters x {cluster_size}) x {QUERY_REPEATS} repeats: \
+         {elapsed:?} ({:?}/op)",
+        dict.len(),
+        dict.block_count(),
+        query.len(),
+        elapsed / (QUERY_REPEATS * query.len()) as u32,
+    );
 }

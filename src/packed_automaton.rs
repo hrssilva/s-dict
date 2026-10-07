@@ -188,6 +188,9 @@ impl PackedRegistry {
 /// state already was in the mutable slab design; kept in memory only for
 /// the duration of one `insert` call, never itself part of the
 /// persistent structure.
+/// A record's transitions as `(byte, output, target)`.
+type Edges = Vec<(u8, u32, u32)>;
+
 #[derive(Debug)]
 struct StagingFrame {
     is_final: bool,
@@ -876,7 +879,7 @@ impl PackedAutomaton {
         };
         // (old address, its children, next child to visit)
         let root_children = read(pool, old.root);
-        let mut stack: Vec<(u32, Vec<(u8, u32, u32)>, usize)> = vec![(old.root, root_children, 0)];
+        let mut stack: Vec<(u32, Edges, usize)> = vec![(old.root, root_children, 0)];
         while let Some((pos, children, next)) = stack.last_mut() {
             if let Some(&(_, _, child)) = children.get(*next) {
                 *next += 1;
@@ -955,7 +958,7 @@ impl PackedAutomaton {
             v
         };
         let root_edges = edges(&mut pool, self.root);
-        let mut stack: Vec<(u32, Vec<(u8, u32, u32)>, usize)> = vec![(self.root, root_edges, 0)];
+        let mut stack: Vec<(u32, Edges, usize)> = vec![(self.root, root_edges, 0)];
         while let Some((pos, children, next)) = stack.last_mut() {
             if let Some(&(_, _, child)) = children.get(*next) {
                 *next += 1;
@@ -2207,7 +2210,7 @@ mod tests {
             state ^= state >> 17;
             state ^= state << 5;
             let term = &pool[state as usize % pool.len()];
-            if state % 3 == 0 {
+            if state.is_multiple_of(3) {
                 let expected = model.range::<String, _>(..term.clone()).count() as u32;
                 let removed = packed.remove(term, &mut ws);
                 assert_eq!(removed, model.remove(term).then_some(expected), "step {step} remove {term}");
