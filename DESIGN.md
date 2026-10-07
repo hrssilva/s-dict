@@ -4747,3 +4747,42 @@ Full file (36.2M triples, 6.88M terms):
 
 Retained allocation is 5.5% above logical sequentially (32.49 vs 30.79
 MiB) and 9% with 160 shards (per-shard fixed overhead).
+
+## profiling the insertion slowdown
+
+After the run -> block map, sequential insertion had crept to ~22.9s at 10M
+lines. Flat `perf` profiles at a fixed rate (499 Hz, so sample counts
+compare across runs; unchanged functions such as the batch sort and the
+N-Triples scanner stayed within ~5%) against two earlier profiles:
+
+| function (samples) | before target 2 | target 2 | before this fix | after |
+|---|---|---|---|---|
+| `lower_bound` | 981 | 975 | 1,504-1,612 | 1,047-1,086 |
+| `BlockIds::new` + `to_vec` | 340 | 1,124 | 1,208 | ~1,200 |
+| `registry` + `open_frame` + `recycle_frame` | inlined | 101 | 364 | ~260 |
+| `resolve_chains` | -- | -- | 101-119 | 0 |
+
+- **Rare features inside hot loops.** Adding chain handling to
+  `lower_bound`'s loop made it 54% slower *during loads*, when no block has
+  chains. Guarding the check with `has_chains` did not help (first
+  hypothesis, wrong); an A/B swapping in the pre-chains loop did (1,612 ->
+  1,006 samples), and the annotation showed why: the extra live values
+  made the compiler spill `value`/`count` to the stack inside the loop.
+  Fix: `lower_bound`, `rank` and `term_at_into` check `has_chains` once and
+  run either the original tight loop or a separate `_chained` version;
+  the term stream calls `resolve_chains` only when chains exist; chain
+  steps in the `_chained` loops go through out-of-line helpers
+  (`chain_step`, `push_chain_label`). Lookups after a load (chained) are
+  memory-bound and did not move.
+- **Boxed construction state** (`Option<Box<Construction>>`) turned inline
+  field accesses into calls; `#[inline]` on the small accessors recovered
+  part of it (`registry` stays out of line).
+
+Insertion at 10M lines: 22.9 -> 21.2s (two runs: 21.21 / 21.17s); lookups,
+mutations and size unchanged.
+
+Remaining structural costs, for later: `confirm_frame` (~19% of samples:
+one registry-hashed record per term-suffix byte -- building chains during
+construction, not only at the end, would cut that by the chain length);
+`BlockIds` rebuild per merge (~11%: incremental wavelet-matrix insertion
+instead of decode + re-encode); the batch sort on parser threads (~15%).

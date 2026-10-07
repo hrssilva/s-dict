@@ -1543,6 +1543,16 @@ pub(crate) struct PackedAutomaton {
     chains_coded: bool,
 }
 
+/// `PackedAutomaton::chain_step`'s outcome.
+enum ChainStep {
+    /// The label matched `len` query bytes; continue at the target.
+    Through(usize, u32),
+    /// The query sorts below every term through the chain.
+    Below,
+    /// The query sorts above every term through the chain.
+    Above,
+}
+
 /// A non-empty chain record: label bytes at `start..start + len` (coded
 /// with the automaton's symbol table if `coded`), then `target`.
 #[derive(Clone, Copy)]
@@ -1959,23 +1969,90 @@ impl PackedAutomaton {
     /// one descent, with each state's subtree count derived top-down from
     /// `term_count` and the outputs, as in `open_frame`.
     pub(crate) fn lower_bound(&self, term: &str) -> (u32, bool) {
+        // Chains are rare (only after `compact_and_chain`), so they get
+        // their own loop: handling them inline made the compiler spill
+        // `value`/`count` in this hot loop (+60% of its time during loads).
+        if self.has_chains {
+            return self.lower_bound_chained(term);
+        }
+        let mut pos = self.root;
+        let mut count = self.term_count;
+        let mut value = 0u32;
+        for &byte in term.as_bytes() {
+            let (is_final, n, next, mut cursor) = self.header(pos);
+            // (output, target) of the matching transition, and the output
+            // of the first transition after it (its subtree's end).
+            let mut matched: Option<(u32, u32)> = None;
+            let mut end = count;
+            for i in 0..n {
+                let (b, out, target, after) = self.read_transition_at(cursor, i == 0, is_final, next);
+                cursor = after;
+                if let Some((_, _)) = matched {
+                    end = out;
+                    break;
+                }
+                if b == byte {
+                    matched = Some((out, target));
+                } else if b > byte {
+                    return (value + out, false);
+                }
+            }
+            let Some((out, target)) = matched else {
+                return (value + count, false);
+            };
+            value += out;
+            count = end - out;
+            pos = target;
+        }
+        (value, self.is_final(pos))
+    }
+
+    /// A chain step against `query`, out of line so the per-byte loops
+    /// that call it stay tight (see `lower_bound`): `None` if `pos` is not
+    /// a non-empty chain; `Through` if the whole label prefixes `query`;
+    /// otherwise whether `query` sorts below or above every term through
+    /// the chain.
+    #[cold]
+    #[inline(never)]
+    fn chain_step(&self, pos: u32, query: &[u8]) -> Option<ChainStep> {
+        let chain = self.chain_at(pos)?;
+        Some(match self.chain_match(chain, query) {
+            Ok(len) => ChainStep::Through(len, chain.target),
+            Err((m, Some(label_byte))) if query[m] > label_byte => ChainStep::Above,
+            Err(_) => ChainStep::Below,
+        })
+    }
+
+    /// Appends a chain's label to `buf` and returns its target, or `None`
+    /// if `pos` is not a non-empty chain. Out of line, as `chain_step`.
+    #[cold]
+    #[inline(never)]
+    fn push_chain_label(&self, pos: u32, buf: &mut Vec<u8>) -> Option<u32> {
+        let chain = self.chain_at(pos)?;
+        self.chain_label(chain, buf);
+        Some(chain.target)
+    }
+
+    #[inline(never)]
+    fn lower_bound_chained(&self, term: &str) -> (u32, bool) {
         let t = term.as_bytes();
         let mut pos = self.root;
         let mut count = self.term_count;
         let mut value = 0u32;
         let mut at = 0usize;
         loop {
-            if let Some(chain) = self.chain_at(pos) {
+            if self.bytes[pos as usize] == 0 {
                 // A chain's states are non-final with one child each: the
                 // whole label either matches or decides the comparison.
-                match self.chain_match(chain, &t[at..]) {
-                    Ok(len) => {
+                match self.chain_step(pos, &t[at..]) {
+                    Some(ChainStep::Through(len, target)) => {
                         at += len;
-                        pos = chain.target;
+                        pos = target;
                         continue;
                     }
-                    Err((m, Some(label_byte))) if t[at + m] > label_byte => return (value + count, false),
-                    Err(_) => return (value, false),
+                    Some(ChainStep::Above) => return (value + count, false),
+                    Some(ChainStep::Below) => return (value, false),
+                    None => {}
                 }
             }
             let Some(&byte) = t.get(at) else {
@@ -2074,6 +2151,7 @@ impl PackedAutomaton {
     }
 
     /// An empty frame whose child list comes from the scratch pool.
+    #[inline]
     fn new_frame(&mut self) -> StagingFrame {
         let mut children = self.cons().scratch.frames.pop().unwrap_or_default();
         children.clear();
@@ -2084,6 +2162,7 @@ impl PackedAutomaton {
     }
 
     /// Returns a confirmed frame's child list to the scratch pool.
+    #[inline]
     fn recycle_frame(&mut self, frame: StagingFrame) {
         self.cons().scratch.frames.push(frame.children);
     }
@@ -2110,6 +2189,7 @@ impl PackedAutomaton {
     /// written before the release can't be deduplicated against -- the
     /// same kind of lost sharing the bounded LRU's eviction already
     /// accepts (measured: +4% `bytes` on real RDF, DESIGN.md).
+    #[inline]
     fn registry(&mut self) -> &mut PackedRegistry {
         let hint = self.term_count as usize;
         let construction = self.cons();
@@ -2166,7 +2246,8 @@ impl PackedAutomaton {
             root: self.root,
             term_count: self.term_count,
             construction: None,
-            has_chains: false,
+            // A read-only copy of `self`'s records: same chain state.
+            has_chains: self.has_chains,
             pristine: false,
             symbols: self.symbols.clone(),
             chains_coded: false,
@@ -2292,7 +2373,8 @@ impl PackedAutomaton {
             root: self.root,
             term_count: self.term_count,
             construction: None,
-            has_chains: false,
+            // A read-only copy of `self`'s records: same chain state.
+            has_chains: self.has_chains,
             pristine: false,
             symbols: self.symbols.clone(),
             chains_coded: false,
@@ -2377,7 +2459,8 @@ impl PackedAutomaton {
             root: self.root,
             term_count: self.term_count,
             construction: None,
-            has_chains: false,
+            // A read-only copy of `self`'s records: same chain state.
+            has_chains: self.has_chains,
             pristine: false,
             symbols: self.symbols.clone(),
             chains_coded: false,
@@ -2545,15 +2628,36 @@ impl PackedAutomaton {
 
     /// Mirrors `Automaton::rank`'s contract exactly.
     pub(crate) fn rank(&self, term: &str) -> Option<u32> {
+        if self.has_chains {
+            return self.rank_chained(term);
+        }
+        let mut pos = self.root;
+        let mut value = 0u32;
+        for &b in term.as_bytes() {
+            let (output, target) = self.get(pos, b)?;
+            value += output;
+            pos = target;
+        }
+        self.is_final(pos).then_some(value)
+    }
+
+    #[inline(never)]
+    fn rank_chained(&self, term: &str) -> Option<u32> {
         let t = term.as_bytes();
         let mut pos = self.root;
         let mut value = 0u32;
         let mut at = 0usize;
         loop {
-            if let Some(chain) = self.chain_at(pos) {
-                at += self.chain_match(chain, &t[at..]).ok()?;
-                pos = chain.target;
-                continue;
+            if self.bytes[pos as usize] == 0 {
+                match self.chain_step(pos, &t[at..]) {
+                    Some(ChainStep::Through(len, target)) => {
+                        at += len;
+                        pos = target;
+                        continue;
+                    }
+                    Some(_) => return None,
+                    None => {}
+                }
             }
             let Some(&b) = t.get(at) else {
                 return self.is_final(pos).then_some(value);
@@ -2567,13 +2671,33 @@ impl PackedAutomaton {
 
     /// Mirrors `Automaton::term_at_into`'s contract exactly.
     pub(crate) fn term_at_into(&self, rank: u32, buf: &mut Vec<u8>) {
+        if self.has_chains {
+            return self.term_at_chained(rank, buf);
+        }
         buf.clear();
         let mut value = rank;
         let mut pos = self.root;
         loop {
-            if let Some(chain) = self.chain_at(pos) {
-                self.chain_label(chain, buf);
-                pos = chain.target;
+            if value == 0 && self.is_final(pos) {
+                return;
+            }
+            let (b, out, target) = self.last_output_at_most(pos, value);
+            value -= out;
+            buf.push(b);
+            pos = target;
+        }
+    }
+
+    #[inline(never)]
+    fn term_at_chained(&self, rank: u32, buf: &mut Vec<u8>) {
+        buf.clear();
+        let mut value = rank;
+        let mut pos = self.root;
+        loop {
+            if self.bytes[pos as usize] == 0
+                && let Some(target) = self.push_chain_label(pos, buf)
+            {
+                pos = target;
                 continue;
             }
             if value == 0 && self.is_final(pos) {
@@ -2697,10 +2821,13 @@ impl PackedAutomaton {
         (self.bytes.len() - 1) as u32
     }
 
-    /// The chain record at `pos`, if it is a non-empty one.
-    #[inline]
+    /// The chain record at `pos`, if it is a non-empty one. Checks
+    /// `has_chains` first: no automaton has chains during a load (only
+    /// `compact_and_chain` creates them), and an unguarded check on every
+    /// step of `lower_bound` measured as +54% of its time.
+    #[inline(always)]
     fn chain_at(&self, pos: u32) -> Option<Chain> {
-        if self.bytes[pos as usize] != 0 {
+        if !self.has_chains || self.bytes[pos as usize] != 0 {
             return None;
         }
         let (packed_len, start) = read_leb128_rev(&self.bytes, pos as usize - 1);
@@ -3303,7 +3430,11 @@ impl<'a> PackedTermsStream<'a> {
             frame.remaining -= 1;
             frame.cursor = next_cursor;
             self.buf.push(b);
-            let (target, chained) = self.packed.resolve_chains(target, &mut self.buf);
+            let (target, chained) = if self.packed.has_chains {
+                self.packed.resolve_chains(target, &mut self.buf)
+            } else {
+                (target, 0)
+            };
             let (child_is_final, child_count, child_next, child_cursor) = self.packed.header(target);
             self.stack.push(PackedStreamFrame {
                 pushed: 1 + chained,
