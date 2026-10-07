@@ -100,11 +100,10 @@ impl RangeMap {
         }
     }
 
-    /// Records `slot` for every id in `ids`, one range per run of
-    /// consecutive ids.
-    pub(crate) fn assign(&mut self, slot: u32, ids: impl Iterator<Item = u32>) {
+    /// Records `slot` for every id in `ids` (any order; sorted and
+    /// deduplicated in place), one range per run of consecutive ids.
+    pub(crate) fn assign(&mut self, slot: u32, ids: &mut Vec<u32>) {
         debug_assert!(slot != NONE);
-        let mut ids: Vec<u32> = ids.collect();
         ids.sort_unstable();
         ids.dedup();
         let mut start = 0;
@@ -118,6 +117,7 @@ impl RangeMap {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn set(&mut self, id: u32, slot: u32) {
         self.set_range(id, id + 1, slot);
     }
@@ -166,11 +166,11 @@ mod tests {
                 0 | 1 => {
                     let slot = next() % 50;
                     let start = next() % 30_000;
-                    let ids: Vec<u32> = (0..1 + next() % 300).map(|k| start + k * (1 + u32::from(next() % 7 == 0))).collect();
+                    let mut ids: Vec<u32> = (0..1 + next() % 300).map(|k| start + k * (1 + u32::from(next() % 7 == 0))).collect();
                     for &id in &ids {
                         model.insert(id, slot);
                     }
-                    map.assign(slot, ids.into_iter());
+                    map.assign(slot, &mut ids);
                 }
                 2 => {
                     let (id, slot) = (next() % 31_000, next() % 50);

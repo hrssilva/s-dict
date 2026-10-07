@@ -83,6 +83,17 @@ impl EntriesArena {
     ) -> impl ExactSizeIterator<Item = (&str, TermId)> {
         (start..end).map(move |i| (self.term_at(i), self.id_at(i)))
     }
+
+    /// The terms of entries `range`, for building a block from part of a
+    /// decoded one.
+    pub(crate) fn terms(&self, range: std::ops::Range<usize>) -> impl ExactSizeIterator<Item = &str> {
+        range.map(move |i| self.term_at(i))
+    }
+
+    /// The ids of entries `range`.
+    pub(crate) fn ids(&self, range: std::ops::Range<usize>) -> &[TermId] {
+        &self.ids[range]
+    }
 }
 
 /// Merges `old` (already sorted) with `new` (sorted, disjoint from `old`)

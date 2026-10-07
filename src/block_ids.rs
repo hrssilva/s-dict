@@ -301,10 +301,6 @@ impl BlockIds {
         self.len as usize
     }
 
-    pub(crate) fn is_empty(&self) -> bool {
-        self.len == 0
-    }
-
     #[inline]
     fn u32_at(&self, section: u32, index: usize) -> u32 {
         (self.data[section as usize + index / 2] >> (32 * (index % 2))) as u32
@@ -448,14 +444,15 @@ impl BlockIds {
         }
     }
 
-    /// All ids in rank order. `Wavelet` decodes in bulk -- per-rank `get`
+    /// Appends all ids in rank order to `out`. `Wavelet` decodes in bulk -- per-rank `get`
     /// would cost a `rank` query per level per entry, and merges call this
     /// on every block they touch: start from the bottom level (labels
     /// sorted, each contiguous), undo each level's stable partition
     /// bottom-up, then hand out each run's consecutive ids in rank order.
-    pub(crate) fn to_vec(&self) -> Vec<TermId> {
+    pub(crate) fn decode_into(&self, out: &mut Vec<TermId>) {
         if self.kind != Kind::Wavelet {
-            return (0..self.len()).map(|r| self.get(r)).collect();
+            out.extend((0..self.len()).map(|r| self.get(r)));
+            return;
         }
         let (n, k, levels) = (self.len(), self.base as usize, self.width as usize);
         let mut by_start: Vec<usize> = (0..k).collect();
@@ -481,13 +478,18 @@ impl BlockIds {
             std::mem::swap(&mut cur, &mut prev);
         }
         let mut next: Vec<u32> = (0..k).map(|c| self.data[c] as u32).collect();
-        cur.iter()
-            .map(|&c| {
-                let id = next[c as usize];
-                next[c as usize] += 1;
-                TermId(id)
-            })
-            .collect()
+        out.extend(cur.iter().map(|&c| {
+            let id = next[c as usize];
+            next[c as usize] += 1;
+            TermId(id)
+        }));
+    }
+
+    #[cfg(test)]
+    fn to_vec(&self) -> Vec<TermId> {
+        let mut out = Vec::new();
+        self.decode_into(&mut out);
+        out
     }
 
     /// Logical size: the single data allocation.

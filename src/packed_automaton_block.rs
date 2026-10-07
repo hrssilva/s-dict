@@ -1,40 +1,20 @@
-//! `PackedAutomatonBlock`: `AutomatonBlock`'s exact role (`automaton_block.rs`),
-//! `micro_fst::PackedAutomaton` in place of `micro_fst::Automaton` -- the
-//! piece that lets the byte-packed representation be measured end to end,
-//! at real corpus scale, through the same block/dictionary macro structure
-//! every other implementation in this crate shares, instead of only in
-//! isolated decode/insert microbenchmarks (`micro_fst.rs`'s own
-//! `perf_probe_*` tests) or the hand-computed examples worked through in
-//! conversation. This is exactly the kind of comparison
-//! `examples/perf_scale_memory.rs` already ran for `AutomatonDictionary`
-//! against `Dictionary` and found the original memory-scaling problem
-//! with -- wiring `PackedAutomaton` in the same way lets that same
-//! benchmark answer whether the byte-packed representation's measured
-//! decode parity and insert-memory bloat (DESIGN.md's "the mutable
-//! unrolled-block version" and its follow-on corrections) hold up in a
-//! real, mutating, splitting/merging dictionary, not just an isolated
-//! automaton in a test.
+//! `PackedAutomatonBlock`: one lexical block of `PackedAutomatonDictionary`
+//! -- a [`PackedAutomaton`] over the block's sorted terms (term <-> local
+//! rank) beside a [`BlockIds`] (local rank <-> `TermId`).
 //!
-//! Deliberately smaller in scope than `AutomatonBlock` itself, which is
-//! already smaller in scope than `Block` -- `PackedAutomaton` has no
-//! incremental `remove`, so `remove` rebuilds the whole block from
-//! scratch over its remaining terms, the same full-rebuild shape
-//! `Block`'s own fst-backed `remove` already has, not a regression
-//! introduced here. `decode_into`/`merge_into`'s existing-content walk
-//! uses `PackedAutomaton::stream` (an incremental walk: a common prefix's
-//! traversal cost is shared between consecutive entries instead of one
-//! independent root descent per rank), and `merge_into`'s own mutation
-//! uses `PackedAutomaton::insert_sorted` (a persistent-path batch insert,
-//! `Automaton::insert_sorted`'s own technique targeting the packed
-//! representation) rather than a loop of single-term `insert` calls --
-//! see both methods' own doc comments and DESIGN.md's dictionary-level
-//! insert-speed sections for the shapes these replaced and the real,
-//! measured costs they were.
+//! Mutations are incremental: a merge walks the block's existing terms
+//! (streamed, or one `lower_bound` descent per incoming term for small
+//! runs) to assign ids, then inserts only the new terms
+//! (`PackedAutomaton::insert_sorted`); a removal rewrites only the removed
+//! term's path. Dead records left behind are reclaimed by a compaction
+//! once a block's bytes per term double (`COMPACT_GROWTH_RATIO`).
+//! Construction state and scratch buffers live in a caller-owned
+//! [`Workspace`], shared by every block of a dictionary.
 
 use crate::TermId;
-use crate::entries_arena::EntriesArena;
 use crate::block_ids::BlockIds;
-use crate::packed_automaton::PackedAutomaton;
+use crate::entries_arena::EntriesArena;
+use crate::packed_automaton::{self, PackedAutomaton};
 
 /// `merge_into` compacts a block (`PackedAutomaton::compact`) once its
 /// bytes per term exceed this multiple of the value right after its last
@@ -50,8 +30,19 @@ const COMPACT_GROWTH_RATIO: f32 = 2.0;
 /// single-term mutation" for the measurement behind it.
 const SMALL_RUN_FACTOR: usize = 2;
 
-fn bytes_per_term(packed: &PackedAutomaton, terms: usize) -> f32 {
-    packed.size_bytes() as f32 / terms.max(1) as f32
+/// Scratch shared by every block of one dictionary (one writer): the
+/// automaton's construction workspace, id buffers for re-encoding a
+/// block's `BlockIds`, and the decoded-entries arena splits and neighbor
+/// merges rebuild from.
+#[derive(Debug, Default)]
+pub(crate) struct Workspace {
+    pub(crate) automaton: packed_automaton::Workspace,
+    pub(crate) entries: EntriesArena,
+    pub(crate) ids: Vec<TermId>,
+    old_ids: Vec<TermId>,
+    new_ids: Vec<TermId>,
+    /// Indices (into a merge's incoming run) of the terms not yet present.
+    new_terms: Vec<u32>,
 }
 
 #[derive(Debug)]
@@ -60,59 +51,50 @@ pub(crate) struct PackedAutomatonBlock {
     /// Bytes per term right after the last fresh build or compaction --
     /// the baseline `merge_into` compares growth against.
     compact_bytes_per_term: f32,
-    /// `rank -> TermId`, compressed (`BlockIds`: run table / FOR).
+    /// `rank -> TermId`, compressed.
     ids: BlockIds,
-    min_key: Box<str>,
 }
 
-/// See [`crate::automaton_block::AutomatonMergeOutcome`], which this
-/// mirrors exactly.
+/// What a `merge_into` changed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct PackedMergeOutcome {
+pub(crate) struct MergeOutcome {
+    /// Terms that were not already present.
     pub(crate) added: usize,
+    /// Leading ranks unchanged by the merge; 0 means the block's smallest
+    /// term changed.
     pub(crate) unchanged_prefix: usize,
 }
 
+fn bytes_per_term(packed: &PackedAutomaton, terms: usize) -> f32 {
+    packed.size_bytes() as f32 / terms.max(1) as f32
+}
+
 impl PackedAutomatonBlock {
-    /// Builds an immutable block from an already sorted, deduplicated,
-    /// exact-size sequence of `(term, id)` pairs -- same contract as
-    /// `Block::build`/`AutomatonBlock::build`. Via `PackedAutomaton::
-    /// build_sorted`, the direct confirm-on-divergence build targeting
-    /// the packed representation itself -- no intermediate `Automaton`
-    /// slab constructed and discarded (see `PackedAutomaton::build_sorted`'s
-    /// own doc comment for why that used to be real, measured waste).
+    /// Builds a block from sorted, deduplicated `terms` and their `ids`
+    /// (same length, same order).
     pub(crate) fn build<'a>(
-        entries: impl ExactSizeIterator<Item = (&'a str, TermId)>,
+        terms: impl ExactSizeIterator<Item = &'a str>,
+        ids: &[TermId],
+        ws: &mut packed_automaton::Workspace,
     ) -> PackedAutomatonBlock {
-        let pairs: Vec<(&'a str, TermId)> = entries.collect();
-        let min_key: Box<str> = pairs.first().map_or_else(Box::default, |&(t, _)| t.into());
-        let ids = BlockIds::new(&pairs.iter().map(|&(_, id)| id).collect::<Vec<_>>());
-        let mut packed = PackedAutomaton::build_sorted(pairs.iter().map(|&(t, _)| t));
-        // Blocks are long-lived: keep only what queries need.
-        packed.release_construction_state();
+        debug_assert_eq!(terms.len(), ids.len());
+        let mut packed = PackedAutomaton::build_sorted(terms, ws);
+        packed.shrink_to_fit();
         PackedAutomatonBlock {
             compact_bytes_per_term: bytes_per_term(&packed, ids.len()),
             packed,
-            ids,
-            min_key,
+            ids: BlockIds::new(ids),
         }
     }
 
-    /// Drops dead records and minimizes (`PackedAutomaton::compact`),
-    /// resetting the growth baseline `merge_into` compares against.
-    pub(crate) fn compact(&mut self) {
-        self.packed.compact();
-        self.compact_bytes_per_term = bytes_per_term(&self.packed, self.ids.len());
-    }
-
-    /// End of a load: `compact` plus path compression for faster reads
+    /// End of a load: compaction plus path compression for faster reads
     /// (`PackedAutomaton::compact_and_chain`), coding chain labels with
     /// `symbols` when given.
-    pub(crate) fn finish(&mut self, symbols: Option<&std::sync::Arc<crate::fsst::SymbolTable>>) {
+    pub(crate) fn finish(&mut self, symbols: Option<&std::sync::Arc<crate::fsst::SymbolTable>>, ws: &mut Workspace) {
         if let Some(table) = symbols {
             self.packed.set_symbols(Some(table.clone()));
         }
-        self.packed.compact_and_chain();
+        self.packed.compact_and_chain(&mut ws.automaton);
         self.compact_bytes_per_term = bytes_per_term(&self.packed, self.ids.len());
     }
 
@@ -125,16 +107,17 @@ impl PackedAutomatonBlock {
         self.ids.len()
     }
 
-    pub(crate) fn min_key(&self) -> &str {
-        &self.min_key
-    }
-
     pub(crate) fn rank(&self, term: &str) -> Option<usize> {
         self.packed.rank(term).map(|r| r as usize)
     }
 
     pub(crate) fn id_at(&self, local_rank: usize) -> TermId {
         self.ids.get(local_rank)
+    }
+
+    /// The local rank of `id`, if this block holds it.
+    pub(crate) fn rank_of_id(&self, id: TermId) -> Option<usize> {
+        self.ids.rank_of(id)
     }
 
     pub(crate) fn term_at_into(&self, local_rank: usize, buf: &mut Vec<u8>) {
@@ -147,260 +130,195 @@ impl PackedAutomatonBlock {
         String::from_utf8(buf).expect("keys were inserted as valid UTF-8 str bytes")
     }
 
-    /// `Block::payload_bytes`'s analog -- see `PackedAutomaton::size_bytes`'s
-    /// own doc comment for exactly what's included (and, under sustained
-    /// inserts, what dead-record bloat this can carry -- see DESIGN.md).
-    /// The local rank of `id`, if this block holds it (`BlockIds::rank_of`).
-    pub(crate) fn rank_of_id(&self, id: TermId) -> Option<usize> {
-        self.ids.rank_of(id)
+    /// Appends every id in rank order to `out`.
+    pub(crate) fn ids_into(&self, out: &mut Vec<TermId>) {
+        self.ids.decode_into(out);
     }
 
-    /// All ids in rank order (`BlockIds::to_vec`, a bulk decode).
-    pub(crate) fn ids(&self) -> Vec<TermId> {
-        self.ids.to_vec()
-    }
-
-    /// Logical size of the compressed `rank -> TermId` array.
-    pub(crate) fn ids_bytes(&self) -> usize {
-        self.ids.size_bytes()
-    }
-
+    /// Logical size of the automaton's records (including dead records
+    /// not yet compacted away).
     pub(crate) fn payload_bytes(&self) -> usize {
         self.packed.size_bytes()
     }
 
-    /// See `PackedAutomaton::reachable_state_count` -- a measurement
-    /// only, for the states-per-term investigation (DESIGN.md).
+    /// Logical size of the compressed `rank -> TermId` mapping.
+    pub(crate) fn ids_bytes(&self) -> usize {
+        self.ids.size_bytes()
+    }
+
+    /// See `PackedAutomaton::reachable_state_count`.
     pub(crate) fn reachable_state_count(&self) -> usize {
         self.packed.reachable_state_count()
     }
 
-    /// Appends every `(term, id)` pair in sorted order onto `out` --
-    /// `Block::decode_into`'s contract, via `PackedAutomaton::stream`
-    /// (a single incremental walk, sharing common-prefix traversal cost
-    /// between consecutive entries) rather than one `term_at_into` call
-    /// per rank.
-    pub(crate) fn decode_into(&self, out: &mut EntriesArena) {
-        let ids = self.ids.to_vec();
+    /// Appends every `(term, id)` pair in sorted order onto `out`, via one
+    /// incremental walk (`PackedAutomaton::stream`); `ids` is scratch.
+    pub(crate) fn decode_into(&self, out: &mut EntriesArena, ids: &mut Vec<TermId>) {
+        ids.clear();
+        self.ids.decode_into(ids);
         let mut stream = self.packed.stream();
         let mut rank = 0usize;
-        while let Some(term_bytes) = stream.next() {
-            let term = std::str::from_utf8(term_bytes)
-                .expect("keys were inserted as valid UTF-8 str bytes");
-            out.push(term, ids[rank]);
+        while let Some(term) = stream.next() {
+            out.push(std::str::from_utf8(term).expect("keys were inserted as valid UTF-8 str bytes"), ids[rank]);
             rank += 1;
         }
     }
 
-    /// Decodes a *sorted* (ascending; may repeat) set of `(output
-    /// position, local_rank)` pairs directly into `out[position]`, via
-    /// `PackedAutomaton::decode_ranks_into` -- one recursive descent that
-    /// visits each state on some target's path once, however many
-    /// targets share it, instead of one independent root-to-leaf
-    /// `term_at_into` call per rank. `positions` need not be sorted (the
-    /// widening below sorts a small owned copy); mirrors
-    /// `AutomatonBlock::decode_sorted_ranks_into` exactly.
-    pub(crate) fn decode_sorted_ranks_into(
-        &self,
-        positions: &[(usize, u16)],
-        out: &mut [Option<String>],
-    ) {
-        let mut targets: Vec<(usize, u32)> = positions
-            .iter()
-            .map(|&(pos, rank)| (pos, rank as u32))
-            .collect();
+    /// Decodes `positions` (`(output position, local rank)`, any order)
+    /// into `out[position]`, via `PackedAutomaton::decode_ranks_into`: one
+    /// descent visiting each state on some requested path once.
+    pub(crate) fn decode_sorted_ranks_into(&self, positions: &[(usize, u16)], out: &mut [Option<String>]) {
+        let mut targets: Vec<(usize, u32)> = positions.iter().map(|&(pos, rank)| (pos, u32::from(rank))).collect();
         targets.sort_unstable_by_key(|&(_, rank)| rank);
         self.packed.decode_ranks_into(&targets, out);
     }
 
-    /// Merges `incoming` (already sorted) into this block: existing terms
-    /// keep their id, new ones get one from `alloc_id`; `resolved` is
-    /// called once per incoming term, in order, with its final id -- same
-    /// contract as `AutomatonBlock::merge_into`, and now the same
-    /// algorithm too: a single sorted-merge walk of this block's existing
-    /// content via `PackedAutomaton::stream` (run against the
-    /// *pre-mutation* automaton, so it must finish before `insert_sorted`
-    /// below, which mutates in place) against `incoming`, followed by one
-    /// `PackedAutomaton::insert_sorted` call over the whole batch --
-    /// not a loop of single-term `insert` calls, which has no memory
-    /// between terms and so re-walks/re-confirms a shared prefix once
-    /// per term instead of once per batch (a real, measured regression
-    /// for exactly the redundant content this representation should
-    /// benefit most from -- see DESIGN.md's "the real cause" section).
-    pub(crate) fn merge_into<'a>(
+    /// Merges `incoming` (sorted, deduplicated) into this block: existing
+    /// terms keep their id, new ones get one from `alloc_id`; `resolved` is
+    /// called once per incoming term, in order, with its final id. Ids are
+    /// assigned by walking the existing terms (a stream, or a `lower_bound`
+    /// per term for small runs); then only the new terms are inserted.
+    pub(crate) fn merge_into(
         &mut self,
-        incoming: impl Iterator<Item = &'a str>,
-        mut alloc_id: impl FnMut() -> TermId,
-        mut resolved: impl FnMut(TermId),
-    ) -> PackedMergeOutcome {
-        let incoming: Vec<&'a str> = incoming.collect();
+        incoming: &[&str],
+        alloc_id: impl FnMut() -> TermId,
+        resolved: impl FnMut(TermId),
+        ws: &mut Workspace,
+    ) -> MergeOutcome {
         if incoming.is_empty() {
-            return PackedMergeOutcome {
+            return MergeOutcome {
                 added: 0,
                 unchanged_prefix: self.ids.len(),
             };
         }
-
-        if incoming.len() * SMALL_RUN_FACTOR <= self.ids.len() {
-            return self.merge_small_run(&incoming, alloc_id, resolved);
-        }
-
-        let old_ids = self.ids.to_vec();
-        let mut new_ids = Vec::with_capacity(old_ids.len() + incoming.len());
-        let mut unchanged_prefix = None;
-        let mut added = 0usize;
-        let mut inc = incoming.iter().copied().peekable();
-        let mut stream = self.packed.stream();
-        let mut old_rank = 0usize;
-        while let Some(old_term_bytes) = stream.next() {
-            let old_term = std::str::from_utf8(old_term_bytes)
-                .expect("keys were inserted as valid UTF-8 str bytes");
-            while let Some(&next) = inc.peek() {
-                if next < old_term {
-                    unchanged_prefix.get_or_insert(new_ids.len());
-                    let id = alloc_id();
-                    added += 1;
-                    new_ids.push(id);
-                    resolved(id);
-                    inc.next();
-                } else {
-                    break;
-                }
-            }
-            let matched = inc.peek() == Some(&old_term);
-            let id = old_ids[old_rank];
-            new_ids.push(id);
-            if matched {
-                inc.next();
-                resolved(id);
-            }
-            old_rank += 1;
-        }
-        for _ in inc {
-            unchanged_prefix.get_or_insert(new_ids.len());
-            let id = alloc_id();
-            added += 1;
-            new_ids.push(id);
-            resolved(id);
-        }
-        let unchanged_prefix = unchanged_prefix.unwrap_or(new_ids.len());
+        ws.old_ids.clear();
+        self.ids.decode_into(&mut ws.old_ids);
+        ws.new_ids.clear();
+        ws.new_terms.clear();
+        let first_new = if incoming.len() * SMALL_RUN_FACTOR <= self.ids.len() {
+            self.assign_by_descent(incoming, alloc_id, resolved, ws)
+        } else {
+            self.assign_by_stream(incoming, alloc_id, resolved, ws)
+        };
+        let added = ws.new_terms.len();
         if added > 0 {
-            self.apply_merge(&incoming, new_ids, unchanged_prefix);
+            let terms = ws.new_terms.iter().map(|&i| incoming[i as usize]);
+            self.packed.insert_sorted(terms, &mut ws.automaton);
+            self.ids = BlockIds::new(&ws.new_ids);
+            self.settle(ws);
         }
-        PackedMergeOutcome {
+        MergeOutcome {
             added,
-            unchanged_prefix,
+            unchanged_prefix: first_new.unwrap_or(self.ids.len()),
         }
     }
 
-    /// `merge_into` for a run much smaller than the block: one
-    /// `PackedAutomaton::lower_bound` descent per incoming term finds its
-    /// old rank, instead of streaming every term in the block -- the
-    /// single-term insert and typical bulk-load case (a batch spread over
-    /// thousands of blocks lands a few terms in each).
-    fn merge_small_run(
-        &mut self,
+    /// `merge_into`'s id assignment for a run much smaller than the block:
+    /// one `lower_bound` descent per incoming term finds its old rank,
+    /// instead of streaming every term in the block -- the single-term
+    /// insert and typical bulk-load case (a batch spread over thousands of
+    /// blocks lands a few terms in each). Fills `new_ids`/`new_terms`;
+    /// returns the first new term's rank, if any.
+    fn assign_by_descent(
+        &self,
         incoming: &[&str],
         mut alloc_id: impl FnMut() -> TermId,
         mut resolved: impl FnMut(TermId),
-    ) -> PackedMergeOutcome {
-        let old_ids = self.ids.to_vec();
-        let mut new_ids = Vec::with_capacity(old_ids.len() + incoming.len());
-        let mut new_terms: Vec<&str> = Vec::new();
-        let mut unchanged_prefix = None;
+        ws: &mut Workspace,
+    ) -> Option<usize> {
+        let mut first_new = None;
         let mut copied = 0usize;
-        for &term in incoming {
+        for (i, &term) in incoming.iter().enumerate() {
             let (rank, found) = self.packed.lower_bound(term);
             let rank = rank as usize;
-            new_ids.extend_from_slice(&old_ids[copied..rank]);
+            ws.new_ids.extend_from_slice(&ws.old_ids[copied..rank]);
             copied = rank;
             if found {
                 // Copied with the rest of the old ids at its own position.
-                resolved(old_ids[rank]);
+                resolved(ws.old_ids[rank]);
             } else {
-                unchanged_prefix.get_or_insert(new_ids.len());
+                first_new.get_or_insert(ws.new_ids.len());
                 let id = alloc_id();
-                new_ids.push(id);
-                new_terms.push(term);
+                ws.new_ids.push(id);
+                ws.new_terms.push(i as u32);
                 resolved(id);
             }
         }
-        new_ids.extend_from_slice(&old_ids[copied..]);
-        let added = new_terms.len();
-        let unchanged_prefix = unchanged_prefix.unwrap_or(new_ids.len());
-        if added > 0 {
-            self.apply_merge(&new_terms, new_ids, unchanged_prefix);
-        }
-        PackedMergeOutcome {
-            added,
-            unchanged_prefix,
-        }
+        ws.new_ids.extend_from_slice(&ws.old_ids[copied..]);
+        first_new
     }
 
-    /// Inserts `terms` (sorted; already-present ones are no-ops) and
-    /// installs the merged id order.
-    fn apply_merge(&mut self, terms: &[&str], new_ids: Vec<TermId>, unchanged_prefix: usize) {
-        self.packed.reserve_registry(terms.len());
-        self.packed.insert_sorted(terms.iter().copied());
-        self.packed.release_construction_state();
-        self.ids = BlockIds::new(&new_ids);
-        self.compact_if_grown();
-        if unchanged_prefix == 0 {
-            self.min_key = self.term_at(0).into_boxed_str();
+    /// `merge_into`'s id assignment for a large run: one sorted-merge walk
+    /// of the block's terms (`PackedAutomaton::stream`) against `incoming`.
+    fn assign_by_stream(
+        &self,
+        incoming: &[&str],
+        mut alloc_id: impl FnMut() -> TermId,
+        mut resolved: impl FnMut(TermId),
+        ws: &mut Workspace,
+    ) -> Option<usize> {
+        let mut first_new = None;
+        let mut next = 0usize;
+        let mut stream = self.packed.stream();
+        let mut old_rank = 0usize;
+        loop {
+            let old_term = stream.next();
+            // New terms sorting before `old_term` (all remaining ones once
+            // the block is exhausted).
+            while let Some(&term) = incoming.get(next)
+                && old_term.is_none_or(|old| term.as_bytes() < old)
+            {
+                first_new.get_or_insert(ws.new_ids.len());
+                let id = alloc_id();
+                ws.new_ids.push(id);
+                ws.new_terms.push(next as u32);
+                resolved(id);
+                next += 1;
+            }
+            let Some(old_term) = old_term else { break };
+            let id = ws.old_ids[old_rank];
+            ws.new_ids.push(id);
+            if incoming.get(next).is_some_and(|t| t.as_bytes() == old_term) {
+                resolved(id);
+                next += 1;
+            }
+            old_rank += 1;
         }
+        first_new
     }
 
-    /// Compacts once bytes/term exceed `COMPACT_GROWTH_RATIO` times the
-    /// value right after the last fresh build or compaction.
-    fn compact_if_grown(&mut self) {
-        if bytes_per_term(&self.packed, self.ids.len())
-            > COMPACT_GROWTH_RATIO * self.compact_bytes_per_term
-        {
-            self.compact();
-        }
+    /// Removes `term` if present, returning its former id and rank (the
+    /// count of leading entries left unchanged). Incremental: only the
+    /// term's path is rewritten (`PackedAutomaton::remove`).
+    pub(crate) fn remove(&mut self, term: &str, ws: &mut Workspace) -> Option<(TermId, usize)> {
+        let rank = self.packed.remove(term, &mut ws.automaton)? as usize;
+        ws.new_ids.clear();
+        self.ids.decode_into(&mut ws.new_ids);
+        let removed_id = ws.new_ids.remove(rank);
+        self.ids = BlockIds::new(&ws.new_ids);
+        self.settle(ws);
+        Some((removed_id, rank))
     }
 
-    /// Removes `term` if present, returning its former id and the count
-    /// of leading entries left unchanged (== the removed term's old rank,
-    /// same reasoning as `AutomatonBlock::remove`). Unlike
-    /// `AutomatonBlock::remove` (an O(1) `Vec::remove`, no decode),
-    /// Removes `term` if present, returning its former id and the count
-    /// of leading entries left unchanged (== the removed term's old rank,
-    /// same reasoning as `AutomatonBlock::remove`). Incremental:
-    /// `PackedAutomaton::lower_bound` finds the rank and
-    /// `PackedAutomaton::remove` rewrites only the term's path; dead
-    /// records are reclaimed by the usual growth-triggered compaction.
-    pub(crate) fn remove(&mut self, term: &str) -> Option<(TermId, usize)> {
-        let (rank, found) = self.packed.lower_bound(term);
-        if !found {
-            return None;
+    /// After a mutation: compact once bytes per term exceed
+    /// `COMPACT_GROWTH_RATIO` times the value right after the last fresh
+    /// build or compaction; otherwise trim the records' growth capacity.
+    fn settle(&mut self, ws: &mut Workspace) {
+        if bytes_per_term(&self.packed, self.ids.len()) > COMPACT_GROWTH_RATIO * self.compact_bytes_per_term {
+            self.packed.compact(&mut ws.automaton);
+            self.compact_bytes_per_term = bytes_per_term(&self.packed, self.ids.len());
+        } else {
+            self.packed.shrink_to_fit();
         }
-        let old_rank = rank as usize;
-        let mut ids = self.ids.to_vec();
-        let removed_id = ids.remove(old_rank);
-        self.ids = BlockIds::new(&ids);
-        self.packed.reserve_registry(1);
-        self.packed.remove(term);
-        self.packed.release_construction_state();
-        self.compact_if_grown();
-
-        if self.ids.is_empty() {
-            self.min_key = Box::default();
-        } else if old_rank == 0 {
-            self.min_key = self.term_at(0).into_boxed_str();
-        }
-
-        Some((removed_id, old_rank))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::block::Block;
 
-    fn namespace_clustered_terms(n: u32) -> Vec<String> {
-        (0..n)
+    fn namespace_clustered_terms(start: u32, count: u32) -> Vec<String> {
+        let mut terms: Vec<String> = (start..start + count)
             .flat_map(|i| {
                 [
                     format!("http://dbpedia.org/resource/Entity_{i}"),
@@ -409,176 +327,97 @@ mod tests {
                     format!("_:b{i:x}"),
                 ]
             })
-            .collect()
-    }
-
-    fn build_both(mut terms: Vec<String>) -> (PackedAutomatonBlock, Block, Vec<String>) {
+            .collect();
         terms.sort_unstable();
         terms.dedup();
-        let entries: Vec<(&str, TermId)> = terms
-            .iter()
-            .enumerate()
-            .map(|(i, t)| (t.as_str(), TermId(i as u32)))
-            .collect();
-        let packed_block = PackedAutomatonBlock::build(entries.iter().copied());
-        let block = Block::build(entries.into_iter());
-        (packed_block, block, terms)
+        terms
+    }
+
+    /// A block over `terms` with ids `0..len`.
+    fn build(terms: &[String], ws: &mut Workspace) -> PackedAutomatonBlock {
+        let ids: Vec<TermId> = (0..terms.len() as u32).map(TermId).collect();
+        PackedAutomatonBlock::build(terms.iter().map(String::as_str), &ids, &mut ws.automaton)
     }
 
     #[test]
-    fn matches_block_on_build_rank_and_unrank() {
-        let (pb, block, terms) = build_both(namespace_clustered_terms(500));
-        assert_eq!(pb.len(), block.len());
-        assert_eq!(pb.min_key(), block.min_key());
+    fn build_rank_unrank_and_decode() {
+        let mut ws = Workspace::default();
+        let terms = namespace_clustered_terms(0, 300);
+        let block = build(&terms, &mut ws);
+        assert_eq!(block.len(), terms.len());
         for (rank, term) in terms.iter().enumerate() {
-            assert_eq!(pb.rank(term), Some(rank));
-            assert_eq!(pb.rank(term), block.rank(term));
-            assert_eq!(pb.id_at(rank), block.id_at(rank));
-            assert_eq!(pb.term_at(rank), *term);
-            assert_eq!(pb.term_at(rank), block.term_at(rank));
+            assert_eq!(block.rank(term), Some(rank));
+            assert_eq!(block.id_at(rank), TermId(rank as u32));
+            assert_eq!(block.rank_of_id(TermId(rank as u32)), Some(rank));
+            assert_eq!(block.term_at(rank), *term);
         }
-        assert_eq!(pb.rank("not-present-at-all"), None);
-    }
-
-    #[test]
-    fn decode_into_matches_original_content() {
-        let (pb, _block, terms) = build_both(namespace_clustered_terms(300));
-        let mut arena = EntriesArena::new();
-        pb.decode_into(&mut arena);
+        assert_eq!(block.rank("not-present-at-all"), None);
+        let (mut arena, mut ids) = (EntriesArena::new(), Vec::new());
+        block.decode_into(&mut arena, &mut ids);
         assert_eq!(arena.len(), terms.len());
         for (i, term) in terms.iter().enumerate() {
             assert_eq!(arena.term_at(i), term.as_str());
-            assert_eq!(arena.id_at(i), pb.id_at(i));
+            assert_eq!(arena.id_at(i), TermId(i as u32));
         }
     }
 
+    /// Both id-assignment paths (descent for small runs, stream for large
+    /// ones): existing terms keep their id, new ones get fresh ids, and
+    /// `resolved` reports every incoming term in order.
     #[test]
-    fn merge_into_existing_terms_keep_their_id_new_ones_get_fresh_ids() {
-        let (mut pb, _block, terms) = build_both(namespace_clustered_terms(200));
-        let old_ids: Vec<TermId> = (0..pb.len()).map(|r| pb.id_at(r)).collect();
-
-        let mut next_id = 100_000u32;
-        let mut resolved_ids = Vec::new();
-        let mut incoming: Vec<String> = terms.iter().step_by(7).cloned().collect(); // duplicates
-        incoming.push("http://example.org/brand-new-1".to_string());
-        incoming.push("http://example.org/brand-new-2".to_string());
-        incoming.sort_unstable();
-        incoming.dedup();
-
-        let outcome = pb.merge_into(
-            incoming.iter().map(String::as_str),
-            || {
-                let id = TermId(next_id);
-                next_id += 1;
-                id
-            },
-            |id| resolved_ids.push(id),
-        );
-        assert_eq!(outcome.added, 2);
-        assert!(outcome.unchanged_prefix <= terms.len());
-        assert_eq!(resolved_ids.len(), incoming.len());
-
-        for (term, &old_id) in terms.iter().zip(&old_ids) {
-            assert_eq!(pb.rank(term).map(|r| pb.id_at(r)), Some(old_id));
-        }
-        for term in [
-            "http://example.org/brand-new-1",
-            "http://example.org/brand-new-2",
-        ] {
-            let rank = pb.rank(term).expect("just inserted");
-            assert!(pb.id_at(rank).0 >= 100_000);
-        }
-        assert_eq!(pb.len(), terms.len() + 2);
-    }
-
-    #[test]
-    fn remove_drops_the_term_and_keeps_everything_else_correct() {
-        let (mut pb, _block, terms) = build_both(namespace_clustered_terms(150));
-        let target = terms[terms.len() / 2].clone();
-        let target_rank = pb.rank(&target).unwrap();
-        let target_id = pb.id_at(target_rank);
-
-        let removed = pb.remove(&target);
-        assert_eq!(removed, Some((target_id, target_rank)));
-        assert_eq!(pb.rank(&target), None);
-        assert_eq!(pb.len(), terms.len() - 1);
-        assert_eq!(pb.remove(&target), None);
-
-        for term in &terms {
-            if term != &target {
-                assert!(pb.rank(term).is_some(), "{term} should still be present");
+    fn merge_into_keeps_existing_ids_on_both_paths() {
+        let terms = namespace_clustered_terms(0, 200);
+        for step in [97, 2] {
+            let mut ws = Workspace::default();
+            let mut block = build(&terms, &mut ws);
+            let mut incoming: Vec<String> = terms.iter().step_by(step).cloned().collect();
+            incoming.extend(namespace_clustered_terms(10_000, 200 / step as u32 + 1));
+            incoming.push(String::new()); // sorts first: a new smallest term
+            incoming.push("~".repeat(3)); // sorts last: past every old term
+            incoming.sort_unstable();
+            incoming.dedup();
+            let refs: Vec<&str> = incoming.iter().map(String::as_str).collect();
+            let mut next_id = 100_000u32;
+            let mut resolved = Vec::new();
+            let outcome = block.merge_into(
+                &refs,
+                || {
+                    next_id += 1;
+                    TermId(next_id)
+                },
+                |id| resolved.push(id),
+                &mut ws,
+            );
+            assert_eq!(outcome.unchanged_prefix, 0, "the empty term is the new minimum");
+            assert_eq!(resolved.len(), incoming.len());
+            let new = incoming.iter().filter(|t| terms.binary_search(t).is_err()).count();
+            assert_eq!(outcome.added, new);
+            assert_eq!(block.len(), terms.len() + new);
+            for (term, &id) in incoming.iter().zip(&resolved) {
+                let rank = block.rank(term).expect("merged");
+                assert_eq!(block.id_at(rank), id);
+                match terms.binary_search(term) {
+                    Ok(old) => assert_eq!(id, TermId(old as u32)),
+                    Err(_) => assert!(id.0 > 100_000),
+                }
             }
         }
     }
 
-    fn namespace_clustered_terms_range(start: u32, count: u32) -> Vec<String> {
-        (start..start + count)
-            .flat_map(|i| {
-                [
-                    format!("http://dbpedia.org/resource/Entity_{i}"),
-                    format!("http://xmlns.com/foaf/0.1/property{i}"),
-                    format!("urn:isbn:{i:013}"),
-                    format!("_:b{i:x}"),
-                ]
-            })
-            .collect()
-    }
-
-    /// `automaton_block::tests::perf_probe_merge_into_single_term_automaton_vs_block`'s
-    /// exact shape, `PackedAutomatonBlock` added as a third column --
-    /// isolates `merge_into` itself (block-level only, no dictionary
-    /// resync), decoupled from bootstrap/split noise, to directly
-    /// attribute what `PackedAutomaton::stream` did and didn't close
-    /// (DESIGN.md's dictionary-level insert-speed section).
     #[test]
-    #[ignore]
-    fn perf_probe_merge_into_single_term_packed_vs_automaton_vs_block() {
-        let preload = namespace_clustered_terms(64); // ~256 terms, block-sized
-        let (mut pb, block, _terms) = build_both(preload);
-
-        let incoming = namespace_clustered_terms_range(1_000_000, 500);
-        let mut next_id = 10_000_000u32;
-
-        let start = std::time::Instant::now();
-        for t in &incoming {
-            pb.merge_into(
-                std::iter::once(t.as_str()),
-                || {
-                    let id = TermId(next_id);
-                    next_id += 1;
-                    id
-                },
-                |_| {},
-            );
+    fn remove_drops_the_term_and_keeps_everything_else() {
+        let mut ws = Workspace::default();
+        let terms = namespace_clustered_terms(0, 150);
+        let mut block = build(&terms, &mut ws);
+        let target = &terms[terms.len() / 2];
+        let rank = block.rank(target).unwrap();
+        assert_eq!(block.remove(target, &mut ws), Some((TermId(rank as u32), rank)));
+        assert_eq!(block.rank(target), None);
+        assert_eq!(block.remove(target, &mut ws), None);
+        assert_eq!(block.len(), terms.len() - 1);
+        for (old_rank, term) in terms.iter().enumerate().filter(|(_, t)| *t != target) {
+            let rank = block.rank(term).expect("still present");
+            assert_eq!(block.id_at(rank), TermId(old_rank as u32));
         }
-        let packed_elapsed = start.elapsed();
-
-        let mut arena = EntriesArena::new();
-        let mut next_id = 20_000_000u32;
-        let start = std::time::Instant::now();
-        for t in &incoming {
-            arena.clear();
-            block.merge_into(
-                std::iter::once(t.as_str()),
-                &mut arena,
-                || {
-                    let id = TermId(next_id);
-                    next_id += 1;
-                    id
-                },
-                |_| {},
-            );
-        }
-        let block_elapsed = start.elapsed();
-
-        eprintln!(
-            "merge_into single term (block-level only, no dictionary resync), {} ops:\n\
-             PackedAutomatonBlock: {packed_elapsed:?} ({:?}/op)\n\
-             Block:                {block_elapsed:?} ({:?}/op)",
-            incoming.len(),
-            packed_elapsed / incoming.len() as u32,
-            block_elapsed / incoming.len() as u32,
-        );
     }
 }
-

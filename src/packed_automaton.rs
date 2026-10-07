@@ -102,11 +102,11 @@ impl Hasher for FxHasher {
 /// heap `Vec` per cell and a dependent cache miss per probe. Buckets are a
 /// power of two, so the bucket index is a mask, not a division (a 64-bit
 /// `div` was a quarter of `confirm_frame`'s time).
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 struct PackedRegistry {
-    /// `buckets * REGISTRY_WAYS` cells, most recently used first within a
-    /// bucket; never resized.
-    cells: Box<[RegistryCell]>,
+    /// At least `(mask + 1) * REGISTRY_WAYS` cells (only that prefix is in
+    /// use), most recently used first within a bucket.
+    cells: Vec<RegistryCell>,
     /// `buckets - 1`.
     mask: usize,
 }
@@ -118,21 +118,27 @@ const REGISTRY_WAYS: usize = 2;
 struct RegistryCell {
     /// High half of the signature hash (the low bits pick the bucket).
     tag: u32,
-    /// Record address + 1; 0 marks an empty cell, so a fresh table is all
-    /// zeros (`alloc_zeroed`).
+    /// Record address + 1; 0 marks an empty cell.
     target_plus_one: u32,
 }
 
 impl PackedRegistry {
-    /// Sized from the number of terms a construction will confirm:
-    /// `Block::build`'s `fst` sizing (`4 x terms` rows, at least 64),
-    /// rounded up to a power of two, capped at 16,384 rows (256 KiB).
-    fn with_capacity_hint(terms: usize) -> PackedRegistry {
+    /// Empties the registry and sizes it for an operation confirming about
+    /// `terms` terms: `Block::build`'s `fst` sizing (`4 x terms` rows, at
+    /// least 64), rounded up to a power of two, at most 16,384 rows (256
+    /// KiB). A recreated registry can only dedup records written during
+    /// the operation, so sizing it to the whole automaton just zeroes cells
+    /// nothing will use (DESIGN.md's "incremental single-term mutation").
+    /// Reuses the allocation; only grows.
+    fn reset(&mut self, terms: usize) {
         let buckets = terms.saturating_mul(4).clamp(64, 1 << 14).next_power_of_two();
-        PackedRegistry {
-            cells: vec![RegistryCell::default(); buckets * REGISTRY_WAYS].into_boxed_slice(),
-            mask: buckets - 1,
+        let cells = buckets * REGISTRY_WAYS;
+        if self.cells.len() < cells {
+            self.cells = vec![RegistryCell::default(); cells];
+        } else {
+            self.cells[..cells].fill(RegistryCell::default());
         }
+        self.mask = buckets - 1;
     }
 
     #[inline]
@@ -170,7 +176,8 @@ impl PackedRegistry {
     /// `PackedAutomaton::register_len`.
     #[cfg(test)]
     fn len(&self) -> usize {
-        self.cells.iter().filter(|c| c.target_plus_one != 0).count()
+        let used = (self.mask + 1) * REGISTRY_WAYS;
+        self.cells[..used.min(self.cells.len())].iter().filter(|c| c.target_plus_one != 0).count()
     }
 }
 
@@ -181,6 +188,7 @@ impl PackedRegistry {
 /// state already was in the mutable slab design; kept in memory only for
 /// the duration of one `insert` call, never itself part of the
 /// persistent structure.
+#[derive(Debug)]
 struct StagingFrame {
     is_final: bool,
     /// `(byte, child_subtree_count, target)`, kept sorted by byte
@@ -278,12 +286,6 @@ pub(crate) struct PackedAutomaton {
     /// stored anywhere: every other state's count is derived top-down
     /// while descending (see `StagingFrame::children`).
     term_count: u32,
-    /// Construction-only state -- the dedup registry and reusable
-    /// buffers -- boxed so a finished block (which has none) pays one
-    /// pointer instead of ~90 inline bytes; see `Construction`. `None`
-    /// after [`Self::release_construction_state`] or `compact`; recreated
-    /// on demand ([`Self::cons`]).
-    construction: Option<Box<Construction>>,
     /// Chain records may exist (path compression, see `append_chain`).
     /// Reads handle them anywhere; mutation expands just the chains on its
     /// path (`open_frame` -> `expand_chain`).
@@ -317,331 +319,258 @@ struct Chain {
     coded: bool,
 }
 
-/// What only construction needs (`PackedAutomaton::construction`): the
-/// dedup registry (`registry`; never read by any query -- long-lived
-/// holders release it between mutations: kept resident, its fixed-size
-/// table plus each cell's transitions `Vec` measured ~5x the automaton's
-/// `bytes` on real RDF, DESIGN.md's "releasing PackedAutomaton's registry
-/// between mutations"), and reusable buffers -- a per-confirm
-/// child list and a pool of frame child lists, so the per-state work of
-/// `insert_sorted`/`build_sorted`/`compact` doesn't allocate (malloc/free
-/// was ~10% of a bulk load's profile).
-#[derive(Clone, Debug, Default)]
-struct Construction {
-    register: Option<PackedRegistry>,
-    scratch: Scratch,
+/// Reusable construction state for [`PackedAutomaton`]: the dedup
+/// registry and every scratch buffer a build, mutation or compaction
+/// needs. Any number of automata can share one (each operation resets the
+/// registry for the automaton it works on), so a dictionary keeps a single
+/// workspace: nothing construction-only stays resident per block, and
+/// nothing is reallocated per mutation (DESIGN.md's "one construction
+/// workspace").
+#[derive(Debug, Default)]
+pub(crate) struct Workspace {
+    confirm: Confirmer,
+    /// The rightmost path being built: one frame per state, root first.
+    path: Vec<StagingFrame>,
+    /// `path_bytes[i]` is the byte reaching `path[i + 1]`.
+    path_bytes: Vec<u8>,
+    last_word: Vec<u8>,
+    /// `compact`'s old address -> new address map.
+    moved: Vec<u32>,
+    dedup: DedupTable,
 }
 
-#[derive(Clone, Debug, Default)]
-struct Scratch {
+/// The part of [`Workspace`] that confirming and opening frames needs, kept
+/// separate so it can be borrowed alongside the path.
+#[derive(Debug, Default)]
+struct Confirmer {
+    registry: PackedRegistry,
+    /// Child lists for frames, reused instead of allocated per frame.
+    frame_pool: Vec<Vec<(u8, u32, u32)>>,
+    /// The record being confirmed, with outputs instead of child counts.
     children: Vec<(u8, u32, u32)>,
-    frames: Vec<Vec<(u8, u32, u32)>>,
+    /// A chain label being expanded.
+    label: Vec<u8>,
 }
 
-#[allow(dead_code)]
+impl Confirmer {
+    /// An empty frame whose child list comes from the pool.
+    #[inline]
+    fn new_frame(&mut self) -> StagingFrame {
+        let mut children = self.frame_pool.pop().unwrap_or_default();
+        children.clear();
+        StagingFrame {
+            is_final: false,
+            children,
+        }
+    }
+
+    /// Returns a frame's child list to the pool (up to `RETAINED_FRAMES`).
+    #[inline]
+    fn recycle(&mut self, frame: StagingFrame) {
+        if self.frame_pool.len() < RETAINED_FRAMES {
+            self.frame_pool.push(frame.children);
+        }
+    }
+}
+
+/// Pooled frames kept between operations: a path holds one frame per term
+/// byte, so the pool would otherwise grow to the longest term ever seen.
+const RETAINED_FRAMES: usize = 4096;
+
+/// Entries a workspace buffer keeps across operations; anything larger
+/// (a very long term's path, a transiently oversized block's compaction
+/// tables) is released once the operation ends.
+const RETAINED_ENTRIES: usize = 1 << 16;
+
+fn trim<T>(v: &mut Vec<T>) {
+    if v.capacity() > RETAINED_ENTRIES {
+        v.clear();
+        v.shrink_to(RETAINED_ENTRIES);
+    }
+}
+
+impl Workspace {
+    /// Releases buffer capacity beyond what typical operations need.
+    fn trim(&mut self) {
+        trim(&mut self.path);
+        trim(&mut self.path_bytes);
+        trim(&mut self.last_word);
+        trim(&mut self.confirm.label);
+        trim(&mut self.moved);
+        trim(&mut self.dedup.slots);
+        trim(&mut self.dedup.spare);
+    }
+}
+
 impl PackedAutomaton {
-    /// Builds a minimal packed automaton directly from an already sorted,
-    /// deduplicated sequence of terms -- `Automaton::build_sorted`'s exact
-    /// algorithm (Daciuk/Mihov/Watson/Watson 2000's sorted-input
-    /// specialization: track the rightmost path as a stack of unconfirmed
-    /// frames, confirm everything deeper than the common-prefix length
-    /// whenever it's known a word won't extend that far again), targeting
-    /// this byte-packed representation instead of the `State`/`Transitions`
-    /// slab. Not a wrapper around `compile(&Automaton::build_sorted(..))`:
-    /// that route pays for a full slab construction (every `State`,
-    /// `TransitionChunk`, the slab's own register) purely to throw it away
-    /// once compiled, real, measured waste for a structure never queried
-    /// in slab form at all. This confirms and writes packed records
-    /// directly, reusing the exact same per-frame machinery `insert` already
-    /// has (`StagingFrame`, `confirm_frame`, `write_confirmed_state`) --
-    /// sorted construction only changes *how* frames are opened and closed,
-    /// never how a single frame gets confirmed once ready.
-    ///
-    /// One simplification sorted input allows that `insert`'s general
-    /// `StagingFrame::children` splicing can't: a diverging byte at any
-    /// depth is always lexicographically greater than every sibling
-    /// already recorded there (the same guarantee `Automaton::
-    /// build_sorted`'s own `link_new_appending` relies on, vs. `insert`'s
-    /// `binary_search_by_key`), so a new child is always a plain `push`,
-    /// never a sorted insert.
-    pub(crate) fn build_sorted<'a>(
-        terms: impl ExactSizeIterator<Item = &'a str>,
-    ) -> PackedAutomaton {
-        // See `compile`'s own comment on this capacity hint.
-        let capacity_hint = terms.len();
-        let mut result = PackedAutomaton {
+    fn empty() -> PackedAutomaton {
+        PackedAutomaton {
             bytes: Vec::new(),
             root: 0,
             term_count: 0,
-            construction: Some(Box::new(Construction {
-                register: Some(PackedRegistry::with_capacity_hint(capacity_hint)),
-                scratch: Scratch::default(),
-            })),
             has_chains: false,
             pristine: false,
             symbols: None,
             chains_coded: false,
-        };
-        // frames[i] is the state reached after `path_bytes[..i]` of
-        // `last_word`; frames[0] (root) has no incoming byte, so
-        // `path_bytes[i - 1]` is the byte that reaches `frames[i]`.
-        let mut frames: Vec<StagingFrame> = vec![StagingFrame {
-            is_final: false,
-            children: Vec::new(),
-        }];
-        let mut path_bytes: Vec<u8> = Vec::new();
-        let mut last_word: Vec<u8> = Vec::new();
+        }
+    }
 
+    /// Moves the records out into a read-only automaton (same root, chain
+    /// state and symbols), leaving `bytes` empty for a rewrite pass.
+    fn take_records(&mut self) -> PackedAutomaton {
+        PackedAutomaton {
+            bytes: std::mem::take(&mut self.bytes),
+            symbols: self.symbols.clone(),
+            chains_coded: false,
+            pristine: false,
+            ..*self
+        }
+    }
+
+    /// Builds the automaton of an already sorted, deduplicated sequence of
+    /// terms (Daciuk, Mihov, Watson, Watson 2000, sorted input): the
+    /// rightmost path is a stack of unconfirmed frames, and everything
+    /// deeper than the next term's common prefix is confirmed bottom-up
+    /// (written, or deduplicated through the registry) before the path is
+    /// extended. Shares its loop with `insert_sorted` (`merge_sorted`),
+    /// starting from an empty root instead of an opened one.
+    pub(crate) fn build_sorted<'a>(
+        terms: impl ExactSizeIterator<Item = &'a str>,
+        ws: &mut Workspace,
+    ) -> PackedAutomaton {
+        let mut automaton = PackedAutomaton::empty();
+        let root = ws.confirm.new_frame();
+        automaton.merge_sorted(root, terms, ws);
+        automaton
+    }
+
+    /// Inserts an already sorted, deduplicated sequence of terms (already
+    /// present ones are no-ops). The rightmost path persists across the
+    /// whole sequence, so a prefix shared by consecutive terms is opened
+    /// and re-confirmed once per call, not once per term (DESIGN.md's "the
+    /// real cause"). Frames are private copies of the records they open
+    /// (`open_frame`), and records are append-only, so nothing needs
+    /// clone-if-shared bookkeeping: superseded records are just dead bytes
+    /// until the next `compact`.
+    pub(crate) fn insert_sorted<'a>(&mut self, terms: impl ExactSizeIterator<Item = &'a str>, ws: &mut Workspace) {
+        self.pristine = false;
+        let root = self.open_frame(&mut ws.confirm, self.root, self.term_count);
+        self.merge_sorted(root, terms, ws);
+    }
+
+    /// Inserts `term` if not already present: `insert_sorted` of one term.
+    #[cfg(test)]
+    pub(crate) fn insert(&mut self, term: &str, ws: &mut Workspace) {
+        self.insert_sorted(std::iter::once(term), ws);
+    }
+
+    /// The sorted-merge loop behind `build_sorted` and `insert_sorted`, from
+    /// an already opened `root` frame. For each term: confirm the path
+    /// below its common prefix with the previous term, follow existing
+    /// transitions as far as they match (opening each state reached), then
+    /// extend with new frames for the rest.
+    fn merge_sorted<'a>(&mut self, root: StagingFrame, terms: impl ExactSizeIterator<Item = &'a str>, ws: &mut Workspace) {
+        let Workspace {
+            confirm,
+            path,
+            path_bytes,
+            last_word,
+            ..
+        } = ws;
+        confirm.registry.reset(terms.len());
+        path.clear();
+        path_bytes.clear();
+        last_word.clear();
+        path.push(root);
         for term in terms {
             let word = term.as_bytes();
-            let common = common_prefix_len(&last_word, word);
+            let common = common_prefix_len(last_word, word);
+            self.confirm_down_to(confirm, path, path_bytes, common + 1);
 
-            Self::confirm_down_to(&mut result, &mut frames, &mut path_bytes, common + 1);
-
-            for &b in &word[common..] {
-                frames.push(result.new_frame());
+            // The frame at the end of the path reflects this call's current
+            // view (freshly opened, or updated by an earlier confirmation).
+            let mut matched = common;
+            while let Some(&byte) = word.get(matched) {
+                let cur = path.last().expect("the path always holds the root");
+                let Ok(idx) = cur.children.binary_search_by_key(&byte, |&(b, _, _)| b) else {
+                    break;
+                };
+                let (_, child_count, target) = cur.children[idx];
+                let frame = self.open_frame(confirm, target, child_count);
+                path.push(frame);
+                path_bytes.push(byte);
+                matched += 1;
+            }
+            for &b in &word[matched..] {
+                path.push(confirm.new_frame());
                 path_bytes.push(b);
             }
-            frames
-                .last_mut()
-                .expect("at least the root frame is present")
-                .is_final = true;
+            path.last_mut().expect("the path always holds the root").is_final = true;
 
             last_word.clear();
             last_word.extend_from_slice(word);
         }
-
-        Self::confirm_down_to(&mut result, &mut frames, &mut path_bytes, 0);
-        result
+        self.confirm_down_to(confirm, path, path_bytes, 0);
+        ws.trim();
     }
 
-    /// Pops and confirms every frame deeper than `keep_from` (i.e. until
-    /// `frames.len() == keep_from.max(1)`), splicing each one's resolved
-    /// `(byte, _, pos)` into its parent -- `Automaton::confirm_path`'s
-    /// exact shape, over `StagingFrame`s instead of slab `State`s.
-    /// `keep_from == 0` additionally confirms the root frame itself
-    /// (which has no parent to splice into) and sets `result.root`.
-    ///
-    /// Splices via `binary_search_by_key` (update-in-place on a hit,
-    /// sorted insert on a miss) rather than a plain `push`: safe for both
-    /// callers. `build_sorted`'s own frames are always freshly created,
-    /// so a diverging byte there is always greater than every sibling
-    /// already recorded (a `push` would've been equivalent, just without
-    /// the search) -- but `insert_sorted` (below) reuses this same
-    /// helper to re-confirm frames *opened from pre-existing structure*,
-    /// where the byte being spliced back may already have an entry (an
-    /// existing transition whose target changed, not a new one), and a
-    /// blind `push` there would silently create a duplicate.
-    fn confirm_down_to(
-        result: &mut PackedAutomaton,
-        frames: &mut Vec<StagingFrame>,
-        path_bytes: &mut Vec<u8>,
-        keep_from: usize,
-    ) {
-        while frames.len() > keep_from.max(1) {
-            let frame = frames.pop().expect("loop guard ensures at least one entry");
+    /// Pops and confirms every frame deeper than `keep_from` (down to
+    /// `keep_from.max(1)` frames), splicing each one's `(byte, count,
+    /// address)` into its parent; `keep_from == 0` also confirms the root
+    /// and makes it this automaton's root. The splice is a sorted insert
+    /// or an in-place update: an opened frame may already hold the byte
+    /// (an existing transition whose target changed).
+    fn confirm_down_to(&mut self, confirm: &mut Confirmer, path: &mut Vec<StagingFrame>, path_bytes: &mut Vec<u8>, keep_from: usize) {
+        while path.len() > keep_from.max(1) {
+            let frame = path.pop().expect("loop guard");
             let byte = path_bytes.pop().expect("one byte per non-root frame");
-            let (pos, count) = result.confirm_frame(&frame);
-            result.recycle_frame(frame);
-
-            let parent = frames
-                .last_mut()
-                .expect("path always has at least the root");
+            let (pos, count) = self.confirm_frame(confirm, &frame);
+            confirm.recycle(frame);
+            let parent = path.last_mut().expect("the path always holds the root");
             match parent.children.binary_search_by_key(&byte, |&(b, _, _)| b) {
                 Ok(idx) => parent.children[idx] = (byte, count, pos),
                 Err(idx) => parent.children.insert(idx, (byte, count, pos)),
             }
         }
         if keep_from == 0 {
-            let root_frame = frames.pop().expect("root frame always present");
-            (result.root, result.term_count) = result.confirm_frame(&root_frame);
-            result.recycle_frame(root_frame);
+            let root = path.pop().expect("the path always holds the root");
+            (self.root, self.term_count) = self.confirm_frame(confirm, &root);
+            confirm.recycle(root);
         }
     }
 
-    /// Incrementally inserts an already sorted, deduplicated sequence of
-    /// terms into this (already populated) automaton -- `Automaton::
-    /// insert_sorted`'s exact algorithm (a persistent rightmost-path
-    /// stack, carried *across* the whole batch; between consecutive
-    /// terms, only the frames deeper than their shared prefix get
-    /// re-walked and re-confirmed) targeting the packed representation,
-    /// the same way `build_sorted` targets it for from-scratch
-    /// construction. This is the fix for a real, measured problem: the
-    /// naive alternative -- calling `insert` once per incoming term --
-    /// has no memory between calls, so it re-walks and re-confirms a
-    /// shared prefix once *per term* instead of once *per batch*,
-    /// exactly backwards for redundant content (see DESIGN.md's
-    /// "the real cause" section: this is why more register hits made
-    /// that naive loop *worse*, not better).
-    ///
-    /// No clone-if-shared/generation bookkeeping is needed here, unlike
-    /// `Automaton::insert_sorted`'s own: every frame on the persistent
-    /// path is already a private, in-memory `StagingFrame` (opened via
-    /// `read_children`, or freshly pushed), never a live reference into
-    /// `bytes` that other content could alias -- the same reason
-    /// `insert` above needs none either. Callers that already know which
-    /// terms are new (e.g. `PackedAutomatonBlock::merge_into`'s own
-    /// sorted-merge walk) don't need this to report it back, so unlike
-    /// the slab's own `insert_sorted` this returns nothing.
-    pub(crate) fn insert_sorted<'a>(&mut self, terms: impl Iterator<Item = &'a str>) {
+    /// Removes `term` if present, returning its former rank: open the
+    /// path's frames (counts derived top-down), clear the final flag, prune
+    /// states left with no terms, and re-confirm the path bottom-up.
+    /// Superseded records become dead bytes, reclaimed by [`Self::compact`].
+    pub(crate) fn remove(&mut self, term: &str, ws: &mut Workspace) -> Option<u32> {
+        let (rank, found) = self.lower_bound(term);
+        if !found {
+            return None;
+        }
         self.pristine = false;
-        let mut frames: Vec<StagingFrame> = vec![self.open_frame(self.root, self.term_count)];
-        let mut path_bytes: Vec<u8> = Vec::new();
-        let mut last_word: Vec<u8> = Vec::new();
-
-        for term in terms {
-            let word = term.as_bytes();
-            let common = common_prefix_len(&last_word, word);
-
-            Self::confirm_down_to(self, &mut frames, &mut path_bytes, common + 1);
-
-            // Continue matching from where the shared-prefix-with-the-
-            // previous-word left off: does more of `word` already exist
-            // as a transition at the current (possibly just-truncated)
-            // frame? `frames.last()`'s children always reflect this
-            // batch's current view (either freshly read, or already
-            // updated by an earlier iteration's `confirm_down_to`).
-            let mut matched = common;
-            while matched < word.len() {
-                let byte = word[matched];
-                let cur = frames.last().expect("frames always has at least the root");
-                match cur.children.binary_search_by_key(&byte, |&(b, _, _)| b) {
-                    Ok(idx) => {
-                        let (_, child_count, target) = cur.children[idx];
-                        frames.push(self.open_frame(target, child_count));
-                        path_bytes.push(byte);
-                        matched += 1;
-                    }
-                    Err(_) => break,
-                }
-            }
-
-            let already_present = matched == word.len()
-                && frames
-                    .last()
-                    .expect("at least the root frame is present")
-                    .is_final;
-            if !already_present {
-                for &b in &word[matched..] {
-                    frames.push(self.new_frame());
-                    path_bytes.push(b);
-                }
-                frames
-                    .last_mut()
-                    .expect("at least one frame present")
-                    .is_final = true;
-            }
-
-            last_word.clear();
-            last_word.extend_from_slice(word);
-        }
-
-        Self::confirm_down_to(self, &mut frames, &mut path_bytes, 0);
-    }
-
-    /// Inserts `term` if not already present -- mirrors `Automaton::
-    /// insert`'s own algorithm (walk existing transitions as far as
-    /// possible, copy the matched-but-not-yet-reconfirmed states into an
-    /// editable form, extend with brand-new states for the remaining
-    /// suffix, then confirm everything bottom-up) but targets this
-    /// append-only block structure instead of a `states: Vec<State>`
-    /// slab -- see the struct doc comment for why that needs no
-    /// reference-counting or redirect-into-an-existing-record step at
-    /// all, unlike the mutable slab design's own `insert`.
-    pub(crate) fn insert(&mut self, term: &str) {
-        self.pristine = false;
-        let word = term.as_bytes();
-
-        // Walk existing transitions as far as they match, "opening" every
-        // matched state into an editable frame holding its existing
-        // children (read straight from its still-unmodified packed
-        // record) -- opened while descending, since each child's subtree
-        // count is derived from its parent's (`open_frame`).
-        let mut staging: Vec<StagingFrame> = vec![self.open_frame(self.root, self.term_count)];
-        let mut path_bytes: Vec<u8> = Vec::new();
-        let mut matched = 0usize;
-        while matched < word.len() {
-            let cur = staging.last().expect("staging always has at least the root");
-            match cur.children.binary_search_by_key(&word[matched], |&(b, _, _)| b) {
-                Ok(idx) => {
-                    let (_, child_count, target) = cur.children[idx];
-                    let frame = self.open_frame(target, child_count);
-                    staging.push(frame);
-                    path_bytes.push(word[matched]);
-                    matched += 1;
-                }
-                Err(_) => break,
-            }
-        }
-
-        if matched == word.len() && staging.last().expect("non-empty staging").is_final {
-            return; // already present
-        }
-
-        // Extend with brand-new states for the unmatched suffix.
-        for &b in &word[matched..] {
-            staging.push(StagingFrame {
-                is_final: false,
-                children: Vec::new(),
-            });
-            path_bytes.push(b);
-        }
-        staging
-            .last_mut()
-            .expect("at least the root frame is present")
-            .is_final = true;
-
-        // Confirm bottom-up: write each frame (or reuse an existing
-        // equivalent record via the register), then splice its resolved
-        // `(byte, count, pos)` into its parent's own children.
-        while staging.len() > 1 {
-            let frame = staging.pop().expect("staging.len() > 1 just checked");
-            let byte = path_bytes.pop().expect("one byte per non-root frame");
-            let (pos, count) = self.confirm_frame(&frame);
-
-            let parent = staging.last_mut().expect("staging.len() > 1 just checked");
-            match parent.children.binary_search_by_key(&byte, |&(b, _, _)| b) {
-                Ok(idx) => parent.children[idx] = (byte, count, pos),
-                Err(idx) => parent.children.insert(idx, (byte, count, pos)),
-            }
-        }
-
-        let root_frame = staging.pop().expect("root frame always present");
-        (self.root, self.term_count) = self.confirm_frame(&root_frame);
-    }
-
-    /// Removes `term` if present, returning whether it was -- `insert`'s
-    /// mirror: open the path's frames (counts derived top-down), clear the
-    /// final flag, prune states left with no terms, and re-confirm the
-    /// path bottom-up. Superseded records become dead bytes, reclaimed by
-    /// [`Self::compact`] like `insert`'s.
-    pub(crate) fn remove(&mut self, term: &str) -> bool {
-        self.pristine = false;
-        let word = term.as_bytes();
-        let mut staging: Vec<StagingFrame> = vec![self.open_frame(self.root, self.term_count)];
-        for &byte in word {
-            let cur = staging.last().expect("staging always has at least the root");
-            let Ok(idx) = cur.children.binary_search_by_key(&byte, |&(b, _, _)| b) else {
-                return false;
-            };
+        let Workspace { confirm, path, .. } = ws;
+        confirm.registry.reset(1);
+        path.clear();
+        let root = self.open_frame(confirm, self.root, self.term_count);
+        path.push(root);
+        for &byte in term.as_bytes() {
+            let cur = path.last().expect("the path always holds the root");
+            let idx = cur
+                .children
+                .binary_search_by_key(&byte, |&(b, _, _)| b)
+                .expect("lower_bound found the term");
             let (_, child_count, target) = cur.children[idx];
-            let frame = self.open_frame(target, child_count);
-            staging.push(frame);
+            let frame = self.open_frame(confirm, target, child_count);
+            path.push(frame);
         }
-        let last = staging.last_mut().expect("staging always has at least the root");
-        if !last.is_final {
-            return false;
-        }
-        last.is_final = false;
+        path.last_mut().expect("the path always holds the root").is_final = false;
 
-        for &byte in word.iter().rev() {
-            let frame = staging.pop().expect("one frame per byte plus the root");
-            let resolved = if !frame.is_final && frame.children.is_empty() {
-                None
-            } else {
-                Some(self.confirm_frame(&frame))
-            };
-            let parent = staging.last_mut().expect("the root is never popped here");
+        for &byte in term.as_bytes().iter().rev() {
+            let frame = path.pop().expect("one frame per byte plus the root");
+            let resolved = (frame.is_final || !frame.children.is_empty()).then(|| self.confirm_frame(confirm, &frame));
+            confirm.recycle(frame);
+            let parent = path.last_mut().expect("the root is never popped here");
             let idx = parent
                 .children
                 .binary_search_by_key(&byte, |&(b, _, _)| b)
@@ -653,9 +582,11 @@ impl PackedAutomaton {
                 }
             }
         }
-        let root_frame = staging.pop().expect("root frame always present");
-        (self.root, self.term_count) = self.confirm_frame(&root_frame);
-        true
+        let root = path.pop().expect("the path always holds the root");
+        (self.root, self.term_count) = self.confirm_frame(confirm, &root);
+        confirm.recycle(root);
+        ws.trim();
+        Some(rank)
     }
 
     /// `(number of terms sorting before term, whether term is present)` --
@@ -779,35 +710,34 @@ impl PackedAutomaton {
         }
     }
 
-    /// Computes `frame`'s outputs from its children's subtree counts
-    /// (the prefix-sum-of-sibling-subtree-counts technique
-    /// `finalize_outputs_and_count` uses) and writes (or reuses, via the
-    /// register) the confirmed record. Returns `(address, subtree_count)`.
-    fn confirm_frame(&mut self, frame: &StagingFrame) -> (u32, u32) {
+    /// Computes `frame`'s outputs from its children's subtree counts (each
+    /// output is the sum of the earlier siblings' counts, plus one if the
+    /// state is final) and writes, or reuses, the record. Returns
+    /// `(address, subtree count)`.
+    fn confirm_frame(&mut self, confirm: &mut Confirmer, frame: &StagingFrame) -> (u32, u32) {
         let mut running = u32::from(frame.is_final);
-        let mut children = std::mem::take(&mut self.cons().scratch.children);
-        children.clear();
+        confirm.children.clear();
         for &(b, child_count, target) in &frame.children {
-            children.push((b, running, target));
+            confirm.children.push((b, running, target));
             running += child_count;
         }
-        let pos = self.write_confirmed_state(frame.is_final, &children);
-        self.cons().scratch.children = children;
+        let pos = self.write_confirmed_state(&mut confirm.registry, frame.is_final, &confirm.children);
         (pos, running)
     }
 
     /// Opens the record at `pos` (whose subtree count is `count`) into an
     /// editable frame. Child counts are the differences between
     /// consecutive outputs; the last child gets the rest of `count`.
-    fn open_frame(&mut self, pos: u32, count: u32) -> StagingFrame {
+    fn open_frame(&mut self, confirm: &mut Confirmer, pos: u32, count: u32) -> StagingFrame {
         // A mutation path entering a chain expands just that chain.
         let pos = match self.chain_at(pos) {
-            Some(chain) => self.expand_chain(chain),
+            Some(chain) => self.expand_chain(&mut confirm.label, chain),
             None => pos,
         };
-        let mut children = self.cons().scratch.frames.pop().unwrap_or_default();
-        children.clear();
+        let mut frame = confirm.new_frame();
         let (is_final, n, mode, mut cursor) = self.header(pos);
+        frame.is_final = is_final;
+        let children = &mut frame.children;
         for i in 0..n {
             let (b, out, target, after) = self.read_transition_at(cursor, i == 0, is_final, mode);
             cursor = after;
@@ -819,7 +749,7 @@ impl PackedAutomaton {
             let end = if i + 1 < n { children[i + 1].1 } else { count };
             children[i].1 = end - children[i].1;
         }
-        StagingFrame { is_final, children }
+        frame
     }
 
     /// Writes `chain`'s states as single-transition records (last state
@@ -827,9 +757,9 @@ impl PackedAutomaton {
     /// returns the first one's address. The chain record itself becomes
     /// dead bytes, reclaimed by the next compaction. O(chain length): the
     /// per-chain alternative to expanding the whole block (`unchain`).
-    fn expand_chain(&mut self, chain: Chain) -> u32 {
-        let mut label = Vec::new();
-        self.chain_label(chain, &mut label);
+    fn expand_chain(&mut self, label: &mut Vec<u8>, chain: Chain) -> u32 {
+        label.clear();
+        self.chain_label(chain, label);
         let mut next = chain.target;
         for &b in label.iter().rev() {
             next = self.append_record(false, &[(b, 0, next)]);
@@ -837,120 +767,57 @@ impl PackedAutomaton {
         next
     }
 
-    /// Construction state, created on first use.
-    #[inline]
-    fn cons(&mut self) -> &mut Construction {
-        self.construction.get_or_insert_with(Default::default)
-    }
-
-    /// An empty frame whose child list comes from the scratch pool.
-    #[inline]
-    fn new_frame(&mut self) -> StagingFrame {
-        let mut children = self.cons().scratch.frames.pop().unwrap_or_default();
-        children.clear();
-        StagingFrame {
-            is_final: false,
-            children,
-        }
-    }
-
-    /// Returns a confirmed frame's child list to the scratch pool.
-    #[inline]
-    fn recycle_frame(&mut self, frame: StagingFrame) {
-        self.cons().scratch.frames.push(frame.children);
-    }
-
     /// Returns the address of a record with this signature: an equivalent
     /// one the registry remembers (confirmed against the written bytes),
     /// else a newly appended one.
-    fn write_confirmed_state(&mut self, is_final: bool, children: &[(u8, u32, u32)]) -> u32 {
+    fn write_confirmed_state(&mut self, registry: &mut PackedRegistry, is_final: bool, children: &[(u8, u32, u32)]) -> u32 {
         let hash = signature_hash(is_final, children);
-        let candidates = self.registry().candidates(hash);
-        for (way, candidate) in candidates.into_iter().enumerate() {
+        for (way, candidate) in registry.candidates(hash).into_iter().enumerate() {
             if let Some(pos) = candidate
                 && self.record_matches(pos, is_final, children)
             {
-                self.registry().promote(hash, way);
+                registry.promote(hash, way);
                 return pos;
             }
         }
         let pos = self.append_record(is_final, children);
-        self.registry().insert(hash, pos);
+        registry.insert(hash, pos);
         pos
     }
 
-    /// The live registry, recreating it if released. Sized from
-    /// `term_count`, the same hint
-    /// `build_sorted` uses. A recreated registry starts empty, so records
-    /// written before the release can't be deduplicated against -- the
-    /// same kind of lost sharing the bounded LRU's eviction already
-    /// accepts (measured: +4% `bytes` on real RDF, DESIGN.md).
-    #[inline]
-    fn registry(&mut self) -> &mut PackedRegistry {
-        let hint = self.term_count as usize;
-        let construction = self.cons();
-        if construction.register.is_none() {
-            construction.register = Some(PackedRegistry::with_capacity_hint(hint));
-        }
-        construction.register.as_mut().expect("just ensured")
-    }
-
-    /// Recreates a released registry sized for a mutation touching
-    /// `terms` terms, instead of `registry`'s whole-automaton default. A
-    /// recreated registry can only dedup records written during this
-    /// mutation, so sizing it to the automaton just allocates and zeroes
-    /// cells nothing will use -- measured as most of a single-term insert's
-    /// cost in a 1024-term block (DESIGN.md's "incremental single-term
-    /// mutation").
-    pub(crate) fn reserve_registry(&mut self, terms: usize) {
-        let construction = self.cons();
-        if construction.register.is_none() {
-            construction.register = Some(PackedRegistry::with_capacity_hint(terms));
-        }
-    }
-
-    /// Drops everything only construction needs: frees the registry and
-    /// trims `bytes`' spare growth capacity, so a resident automaton's
-    /// heap matches `size_bytes`. Further `insert`/`insert_sorted` calls
-    /// remain valid (see [`Self::registry`]).
-    pub(crate) fn release_construction_state(&mut self) {
-        self.construction = None;
+    /// Trims `bytes`' spare growth capacity, so a resident automaton's
+    /// heap matches `size_bytes`.
+    pub(crate) fn shrink_to_fit(&mut self) {
         self.bytes.shrink_to_fit();
     }
 
     /// Rewrites `bytes` to hold only reachable records, merging records
     /// that become identical once their children are rewritten. Dead
-    /// records (left behind by `insert`/`insert_sorted`, see the struct
-    /// doc comment) are dropped, and the exact dedup is bottom-up
-    /// minimization (Revuz 1992): outputs are a function of each state's
-    /// right language, so equivalent states have equal signatures once
-    /// their children are canonical, and the result is the minimal
-    /// automaton -- tighter than `build_sorted`'s bounded registry. The
-    /// dedup map is temporary; the registry is released, so this is
-    /// O(reachable records) time with no retained construction state.
-    /// Records are re-emitted in postorder, children in byte order, as
-    /// `build_sorted` writes them, so NEXT targets apply.
-    pub(crate) fn compact(&mut self) {
+    /// records (left behind by `insert_sorted`/`remove`) are dropped, and
+    /// the exact dedup is bottom-up minimization (Revuz 1992): outputs are
+    /// a function of each state's right language, so equivalent states
+    /// have equal signatures once their children are canonical, and the
+    /// result is the minimal automaton -- tighter than the bounded
+    /// registry. Records are re-emitted in postorder, children in byte
+    /// order, as `build_sorted` writes them, so NEXT targets apply.
+    pub(crate) fn compact(&mut self, ws: &mut Workspace) {
         if self.pristine {
             // Already compacted, and nothing mutated since.
             return;
         }
         // Minimization runs on per-byte states: expand remaining chains.
         self.unchain();
-        let old = PackedAutomaton {
-            bytes: std::mem::take(&mut self.bytes),
-            root: self.root,
-            term_count: self.term_count,
-            construction: None,
-            // A read-only copy of `self`'s records: same chain state.
-            has_chains: self.has_chains,
-            pristine: false,
-            symbols: self.symbols.clone(),
-            chains_coded: false,
-        };
-        let mut moved = vec![u32::MAX; old.bytes.len()];
-        let mut canonical = DedupTable::new();
-        let mut pool = self.construction.take().map(|c| c.scratch.frames).unwrap_or_default();
+        let old = self.take_records();
+        let Workspace {
+            confirm,
+            moved,
+            dedup,
+            ..
+        } = ws;
+        moved.clear();
+        moved.resize(old.bytes.len(), u32::MAX);
+        dedup.clear();
+        let pool = &mut confirm.frame_pool;
         let read = |pool: &mut Vec<Vec<(u8, u32, u32)>>, pos: u32| {
             let mut v = pool.pop().unwrap_or_default();
             v.clear();
@@ -958,13 +825,13 @@ impl PackedAutomaton {
             v
         };
         // (old address, its children, next child to visit)
-        let root_children = read(&mut pool, old.root);
+        let root_children = read(pool, old.root);
         let mut stack: Vec<(u32, Vec<(u8, u32, u32)>, usize)> = vec![(old.root, root_children, 0)];
         while let Some((pos, children, next)) = stack.last_mut() {
             if let Some(&(_, _, child)) = children.get(*next) {
                 *next += 1;
                 if moved[child as usize] == u32::MAX {
-                    let grandchildren = read(&mut pool, child);
+                    let grandchildren = read(pool, child);
                     stack.push((child, grandchildren, 0));
                 }
                 continue;
@@ -977,11 +844,11 @@ impl PackedAutomaton {
             }
             let is_final = old.is_final(pos);
             let hash = signature_hash(is_final, &children);
-            let new_pos = match canonical.find(hash, |candidate| self.record_matches(candidate, is_final, &children)) {
+            let new_pos = match dedup.find(hash, |candidate| self.record_matches(candidate, is_final, &children)) {
                 Some(existing) => existing,
                 None => {
                     let new_pos = self.append_record(is_final, &children);
-                    canonical.insert(hash, new_pos);
+                    dedup.insert(hash, new_pos);
                     new_pos
                 }
             };
@@ -990,22 +857,22 @@ impl PackedAutomaton {
         }
         self.root = moved[old.root as usize];
         self.bytes.shrink_to_fit();
-        self.construction = None;
+        ws.trim();
     }
 
     /// `compact`, then path compression (`chain_up`) for read speed. Meant
-    /// for the end of a load: the next mutation expands the chains again
-    /// (`unchain`), so chaining during a load -- e.g. on every
-    /// growth-triggered compaction -- would only churn (measured: +20%
-    /// insertion at 10M lines).
-    pub(crate) fn compact_and_chain(&mut self) {
+    /// for the end of a load: a later mutation expands the chains on its
+    /// path again (`expand_chain`), so chaining during a load -- e.g. on
+    /// every growth-triggered compaction -- would only churn (measured:
+    /// +20% insertion at 10M lines).
+    pub(crate) fn compact_and_chain(&mut self, ws: &mut Workspace) {
         if self.pristine && (self.chains_coded || self.symbols.is_none()) {
             return;
         }
         // Not pristine, or chained before a symbol table existed: minimize
         // per-byte again, then chain (with the table).
         self.pristine = false;
-        self.compact();
+        self.compact(ws);
         self.chain_up();
         self.bytes.shrink_to_fit();
     }
@@ -1064,17 +931,7 @@ impl PackedAutomaton {
     /// the automaton stays exactly as minimal as `compact`'s first pass
     /// left it -- `reachable_state_count` counts a chain's states.
     fn chain_up(&mut self) {
-        let old = PackedAutomaton {
-            bytes: std::mem::take(&mut self.bytes),
-            root: self.root,
-            term_count: self.term_count,
-            construction: None,
-            // A read-only copy of `self`'s records: same chain state.
-            has_chains: self.has_chains,
-            pristine: false,
-            symbols: self.symbols.clone(),
-            chains_coded: false,
-        };
+        let old = self.take_records();
         let n = old.bytes.len();
         let mut chain_like = vec![false; n];
         let mut indeg = vec![0u32; n];
@@ -1150,17 +1007,7 @@ impl PackedAutomaton {
         if !self.has_chains {
             return;
         }
-        let old = PackedAutomaton {
-            bytes: std::mem::take(&mut self.bytes),
-            root: self.root,
-            term_count: self.term_count,
-            construction: None,
-            // A read-only copy of `self`'s records: same chain state.
-            has_chains: self.has_chains,
-            pristine: false,
-            symbols: self.symbols.clone(),
-            chains_coded: false,
-        };
+        let old = self.take_records();
         let mut moved = vec![u32::MAX; old.bytes.len()];
         let mut mapped: Vec<(u8, u32, u32)> = Vec::new();
         old.postorder(|pos, edges| {
@@ -1271,22 +1118,11 @@ impl PackedAutomaton {
         self.bytes.len()
     }
 
-    /// The number of entries in `register` -- unlike `Automaton::
-    /// register_len`, this has no pruning mechanism to measure the
-    /// bound of: `write_confirmed_state` only ever inserts, never
-    /// removes, so this tracks every distinct signature ever confirmed
-    /// across this automaton's whole mutation history, live or dead.
-    /// Compare directly against `reachable_state_count`. Measured in
-    /// `measure_packed_automaton_register_growth_under_sustained_inserts`
-    /// (`DESIGN.md`'s "measuring the register-pruning gap directly") --
-    /// grows unboundedly (91 -> 62,632 over 2000 inserts) while
-    /// `reachable_state_count` stays flat.
+    /// Occupied registry cells after the last operation that used `ws`
+    /// (bounded by the registry's fixed size).
     #[cfg(test)]
-    pub(crate) fn register_len(&self) -> usize {
-        self.construction
-            .as_ref()
-            .and_then(|c| c.register.as_ref())
-            .map_or(0, PackedRegistry::len)
+    pub(crate) fn register_len(ws: &Workspace) -> usize {
+        ws.confirm.registry.len()
     }
 
     /// The number of *reachable* records -- `Automaton::
@@ -1406,92 +1242,68 @@ impl PackedAutomaton {
         }
     }
 
-    /// Mirrors `Automaton::decode_ranks_into`'s exact contract and
-    /// algorithm -- see its own doc comment for the full reasoning (one
-    /// recursive descent, partitioning the sorted target set against
-    /// each state's transitions, visiting a state only if some target
-    /// actually falls in its range). `targets` stays one contiguous
-    /// slice of the original input throughout, `value_offset` carried
-    /// alongside instead of shifting it -- identical to the slab
-    /// version's own approach, no per-call allocation.
+    /// Decodes `targets` (`(output position, rank)`, sorted by rank; ranks
+    /// may repeat) into `out[position]`. Iterative over an explicit path
+    /// (a per-byte recursion overflowed the stack on long terms): each
+    /// target pops back to the deepest state on the current path whose
+    /// rank range holds it, then descends from there, so consecutive
+    /// targets share their common prefix's walk.
     pub(crate) fn decode_ranks_into(&self, targets: &[(usize, u32)], out: &mut [Option<String>]) {
-        let mut buf = Vec::new();
-        self.decode_batch(self.root, targets, 0, &mut buf, out);
+        // (record, first rank of its subtree, end rank, buffer length on entry)
+        let mut path: Vec<(u32, u32, u32, usize)> = Vec::new();
+        let mut buf: Vec<u8> = Vec::new();
+        for &(position, rank) in targets {
+            while let Some(&(_, lo, hi, len)) = path.last()
+                && !(lo..hi).contains(&rank)
+            {
+                path.pop();
+                buf.truncate(len);
+            }
+            if path.is_empty() {
+                if rank >= self.term_count {
+                    continue; // Not a rank of this automaton.
+                }
+                path.push((self.root, 0, self.term_count, 0));
+            }
+            loop {
+                let &(pos, lo, hi, _) = path.last().expect("non-empty path");
+                if let Some(chain) = self.chain_at(pos) {
+                    let len = buf.len();
+                    self.chain_label(chain, &mut buf);
+                    path.push((chain.target, lo, hi, len));
+                    continue;
+                }
+                let value = rank - lo;
+                if value == 0 && self.is_final(pos) {
+                    let term = std::str::from_utf8(&buf).expect("keys were inserted as valid UTF-8 str bytes");
+                    out[position] = Some(term.to_owned());
+                    break;
+                }
+                let (byte, child_lo, child_hi, target) = self.child_holding(pos, value, hi - lo);
+                let len = buf.len();
+                buf.push(byte);
+                path.push((target, lo + child_lo, lo + child_hi, len));
+            }
+        }
     }
 
-    /// The one adaptation this needs that the slab version doesn't:
-    /// `Transitions::at(idx)` re-derives slot `idx` in O(1) (a small
-    /// typed array), cheap to call for both the "current" transition and
-    /// a one-ahead peek at "the next one" (for the boundary). A packed
-    /// record has no such re-entry point -- peeking transition `idx + 1`
-    /// means parsing forward from wherever `idx` ended, so `next` caches
-    /// that peek across loop iterations (parsed once, when it's peeked;
-    /// reused as `current` next iteration) instead of re-parsing it,
-    /// keeping this one sequential pass over the record either way, the
-    /// same reasoning `PackedTermsStream`'s own cursor caching uses.
-    fn decode_batch(
-        &self,
-        pos: u32,
-        targets: &[(usize, u32)],
-        value_offset: u32,
-        buf: &mut Vec<u8>,
-        out: &mut [Option<String>],
-    ) {
-        if targets.is_empty() {
-            return;
-        }
-        if let Some(chain) = self.chain_at(pos) {
-            let len = self.chain_label(chain, buf);
-            self.decode_batch(chain.target, targets, value_offset, buf, out);
-            buf.truncate(buf.len() - len);
-            return;
-        }
-        let (is_final, count, next_flag, mut cursor) = self.header(pos);
-        let mut remaining = targets;
-        if is_final {
-            // Every leading target still at value_offset (i.e. local
-            // value 0) is this state's own term -- sorted ascending, so
-            // these are always a prefix of `remaining`.
-            let split = remaining.partition_point(|&(_, v)| v == value_offset);
-            if split > 0 {
-                let term =
-                    std::str::from_utf8(buf).expect("keys were inserted as valid UTF-8 str bytes");
-                for &(p, _) in &remaining[..split] {
-                    out[p] = Some(term.to_string());
-                }
-                remaining = &remaining[split..];
+    /// The transition of the record at `pos` (subtree count `count`) whose
+    /// subtree holds local rank `value`: `(byte, first local rank, end,
+    /// target)`, the end being the next transition's output (or `count`).
+    fn child_holding(&self, pos: u32, value: u32, count: u32) -> (u8, u32, u32, u32) {
+        let (is_final, n, mode, mut cursor) = self.header(pos);
+        let mut best: Option<(u8, u32, u32)> = None;
+        for i in 0..n {
+            let (b, output, target, after) = self.read_transition_at(cursor, i == 0, is_final, mode);
+            cursor = after;
+            if output > value {
+                let (b0, o0, t0) = best.expect("value must be reachable via some transition at this state");
+                return (b0, o0, output, t0);
             }
+            best = Some((b, output, target));
         }
-
-        let mut idx = 0usize;
-        let mut next = (idx < count).then(|| {
-            let (b, o, t, next_cursor) = self.read_transition_at(cursor, idx == 0, is_final, next_flag);
-            cursor = next_cursor;
-            (b, o, t)
-        });
-        while !remaining.is_empty() {
-            let (byte, my_out, my_target) =
-                next.expect("value must be reachable via some transition at this state");
-            idx += 1;
-            next = (idx < count).then(|| {
-                let (b, o, t, next_cursor) = self.read_transition_at(cursor, idx == 0, is_final, next_flag);
-                cursor = next_cursor;
-                (b, o, t)
-            });
-            // Everything before the *next* transition's own output
-            // belongs to this one -- `u32::MAX` if there is no next
-            // transition, since the last one covers the rest by the
-            // same invariant `last_output_at_most` relies on.
-            let boundary = next.map_or(u32::MAX, |(_, next_out, _)| value_offset + next_out);
-            let split = remaining.partition_point(|&(_, v)| v < boundary);
-            let (mine, rest) = remaining.split_at(split);
-            if !mine.is_empty() {
-                buf.push(byte);
-                self.decode_batch(my_target, mine, value_offset + my_out, buf, out);
-                buf.pop();
-            }
-            remaining = rest;
-        }
+        let (b, output, target) = best.expect("value must be reachable via some transition at this state");
+        (b, output, count, target)
     }
 
     /// Appends a chain record: single-transition, non-final states in one
@@ -1836,19 +1648,27 @@ fn signature_hash(is_final: bool, children: &[(u8, u32, u32)]) -> u64 {
 /// record address)`. A probe hit is confirmed against the record already
 /// written (`record_matches`), so no signature is stored -- the previous
 /// `HashMap<(bool, Vec<..>), u32>` allocated a `Vec` key per record.
+#[derive(Debug, Default)]
 struct DedupTable {
+    /// The active table (a power of two, at least `MIN_SLOTS`); its
+    /// allocation is kept across `clear`s.
     slots: Vec<(u64, u32)>,
+    /// The previous table while growing, kept for its allocation.
+    spare: Vec<(u64, u32)>,
     len: usize,
 }
 
 impl DedupTable {
     const EMPTY: u32 = u32::MAX;
+    const MIN_SLOTS: usize = 256;
 
-    fn new() -> DedupTable {
-        DedupTable {
-            slots: vec![(0, Self::EMPTY); 256],
-            len: 0,
-        }
+    /// Empties the table back to `MIN_SLOTS` slots. Only the active slots
+    /// are reset: a compaction sized for one huge block must not make every
+    /// later one pay to clear its table.
+    fn clear(&mut self) {
+        self.slots.clear();
+        self.slots.resize(Self::MIN_SLOTS, (0, Self::EMPTY));
+        self.len = 0;
     }
 
     fn find(&self, hash: u64, mut matches: impl FnMut(u32) -> bool) -> Option<u32> {
@@ -1868,15 +1688,22 @@ impl DedupTable {
 
     fn insert(&mut self, hash: u64, pos: u32) {
         if (self.len + 1) * 2 > self.slots.len() {
-            let grown = vec![(0, Self::EMPTY); self.slots.len() * 2];
-            let old = std::mem::replace(&mut self.slots, grown);
+            let doubled = self.slots.len() * 2;
+            std::mem::swap(&mut self.slots, &mut self.spare);
+            self.slots.clear();
+            self.slots.resize(doubled, (0, Self::EMPTY));
             self.len = 0;
-            for (h, p) in old {
+            for i in 0..self.spare.len() {
+                let (h, p) = self.spare[i];
                 if p != Self::EMPTY {
-                    self.insert(h, p);
+                    self.place(h, p);
                 }
             }
         }
+        self.place(hash, pos);
+    }
+
+    fn place(&mut self, hash: u64, pos: u32) {
         let mask = self.slots.len() - 1;
         let mut i = hash as usize & mask;
         while self.slots[i].1 != Self::EMPTY {
@@ -2077,4 +1904,294 @@ impl<'a> PackedTermsStream<'a> {
 
 pub(crate) fn common_prefix_len(a: &[u8], b: &[u8]) -> usize {
     a.iter().zip(b).take_while(|(x, y)| x == y).count()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::{BTreeSet, HashSet};
+    use std::sync::Arc;
+
+    fn sorted(mut terms: Vec<String>) -> Vec<String> {
+        terms.sort_unstable();
+        terms.dedup();
+        terms
+    }
+
+    fn namespace_clustered_terms(start: u32, count: u32) -> Vec<String> {
+        (start..start + count)
+            .flat_map(|i| {
+                [
+                    format!("http://dbpedia.org/resource/Entity_{i}"),
+                    format!("http://xmlns.com/foaf/0.1/property{i}"),
+                    format!("urn:isbn:{i:013}"),
+                    format!("_:b{i:x}"),
+                ]
+            })
+            .collect()
+    }
+
+    /// Low-redundancy terms: hex digests behind a shared namespace.
+    fn hashlike_terms(n: u64) -> Vec<String> {
+        (0..n)
+            .map(|i| {
+                let mut x = i.wrapping_add(0x9E37_79B9_7F4A_7C15);
+                x = (x ^ (x >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+                x = (x ^ (x >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+                format!("http://example.org/h/{:016x}", x ^ (x >> 31))
+            })
+            .collect()
+    }
+
+    /// Prefix relationships in both directions, the empty term, and a
+    /// shared suffix across different stems.
+    fn branching_terms() -> Vec<String> {
+        ["", "a", "ab", "abc", "abd", "b", "ba", "xyz-tail", "uvw-tail", "zz", "z"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect()
+    }
+
+    fn build(terms: &[String], ws: &mut Workspace) -> PackedAutomaton {
+        PackedAutomaton::build_sorted(terms.iter().map(String::as_str), ws)
+    }
+
+    /// States of the minimal acyclic automaton of `terms` (Myhill-Nerode):
+    /// one per distinct right language `{s : p + s in terms}` over all
+    /// prefixes `p`. Outputs (ranks) are a function of the right language,
+    /// so this is also the minimal state count of the ranked automaton.
+    fn minimal_state_count(terms: &[String]) -> usize {
+        let set: BTreeSet<&[u8]> = terms.iter().map(|t| t.as_bytes()).collect();
+        let mut languages: HashSet<Vec<&[u8]>> = HashSet::new();
+        for t in &set {
+            for cut in 0..=t.len() {
+                let prefix = &t[..cut];
+                let language: Vec<&[u8]> = set
+                    .range(prefix..)
+                    .take_while(|s| s.starts_with(prefix))
+                    .map(|s| &s[cut..])
+                    .collect();
+                languages.insert(language);
+            }
+        }
+        languages.len().max(1)
+    }
+
+    /// Every query answer against the sorted `terms`: rank, term_at_into,
+    /// lower_bound (present and absent probes), the stream and a bulk
+    /// decode of every rank.
+    fn assert_answers(packed: &PackedAutomaton, terms: &[String]) {
+        let mut buf = Vec::new();
+        for (rank, term) in terms.iter().enumerate() {
+            assert_eq!(packed.rank(term), Some(rank as u32), "rank of {term:?}");
+            assert_eq!(packed.lower_bound(term), (rank as u32, true));
+            packed.term_at_into(rank as u32, &mut buf);
+            assert_eq!(buf, term.as_bytes(), "term_at_into({rank})");
+        }
+        let probes = terms.iter().map(|t| format!("{t}~")).chain(["", "0", "h", "zzzz", "\u{7f}"].map(String::from));
+        for probe in probes {
+            let below = terms.partition_point(|t| t.as_str() < probe.as_str()) as u32;
+            let present = terms.binary_search(&probe).is_ok();
+            assert_eq!(packed.lower_bound(&probe), (below, present), "lower_bound({probe:?})");
+            assert_eq!(packed.rank(&probe).is_some(), present);
+        }
+        let mut stream = packed.stream();
+        for term in terms {
+            assert_eq!(stream.next(), Some(term.as_bytes()));
+        }
+        assert_eq!(stream.next(), None);
+        // Reversed positions: outputs land by position, not by rank.
+        let targets: Vec<(usize, u32)> = (0..terms.len()).map(|r| (terms.len() - 1 - r, r as u32)).collect();
+        let mut out = vec![None; terms.len()];
+        packed.decode_ranks_into(&targets, &mut out);
+        for (r, term) in terms.iter().enumerate() {
+            assert_eq!(out[terms.len() - 1 - r].as_deref(), Some(term.as_str()));
+        }
+    }
+
+    #[test]
+    fn empty_and_single_term() {
+        let mut ws = Workspace::default();
+        let empty = build(&[], &mut ws);
+        assert_eq!(empty.rank(""), None);
+        assert_eq!(empty.lower_bound("a"), (0, false));
+        assert_eq!(empty.stream().next(), None);
+        let one = vec!["only".to_string()];
+        assert_answers(&build(&one, &mut ws), &one);
+        let blank = vec![String::new()];
+        assert_answers(&build(&blank, &mut ws), &blank);
+    }
+
+    #[test]
+    fn build_answers_queries_on_varied_term_shapes() {
+        let mut ws = Workspace::default();
+        for terms in [sorted(namespace_clustered_terms(0, 500)), sorted(hashlike_terms(2000)), sorted(branching_terms())] {
+            let packed = build(&terms, &mut ws);
+            assert_answers(&packed, &terms);
+        }
+    }
+
+    /// `PACKED_COUNT_ESCAPE` transitions, long unique tails (NEXT runs) and
+    /// targets far enough back to need multi-byte deltas, built every way:
+    /// at once, in two sorted batches, one term at a time (descending),
+    /// and compacted with raw and FSST-coded chains.
+    #[test]
+    fn wide_fanout_and_long_tails_every_construction_path() {
+        let mut terms: Vec<String> = (1u8..=250)
+            .map(|b| format!("{}{}", char::from_u32(u32::from(b)).unwrap_or('x'), "tail".repeat(usize::from(b % 40))))
+            .collect();
+        terms.extend((0..300).map(|i| format!("p/{i:05}/{}", "z".repeat(i % 97))));
+        let terms = sorted(terms);
+        let first: Vec<&str> = terms.iter().enumerate().filter(|(i, _)| i % 3 != 0).map(|(_, t)| t.as_str()).collect();
+        let second: Vec<&str> = terms.iter().enumerate().filter(|(i, _)| i % 3 == 0).map(|(_, t)| t.as_str()).collect();
+        let mut ws = Workspace::default();
+
+        let built = build(&terms, &mut ws);
+        let mut batched = PackedAutomaton::build_sorted(first.iter().copied(), &mut ws);
+        batched.insert_sorted(second.iter().copied(), &mut ws);
+        let mut single = build(&[], &mut ws);
+        for t in terms.iter().rev() {
+            single.insert(t, &mut ws);
+        }
+        let mut chained = built.clone();
+        chained.compact_and_chain(&mut ws);
+        let mut coded = built.clone();
+        let sample: Vec<&[u8]> = terms.iter().map(|t| t.as_bytes()).collect();
+        coded.set_symbols(Some(Arc::new(crate::fsst::SymbolTable::train(&sample))));
+        coded.compact_and_chain(&mut ws);
+        assert!(coded.chains_coded());
+        for packed in [&built, &batched, &single, &chained, &coded] {
+            assert_answers(packed, &terms);
+        }
+    }
+
+    /// Re-inserting present terms changes nothing observable.
+    #[test]
+    fn insert_sorted_is_idempotent_and_mixes_hits_with_new_terms() {
+        let mut ws = Workspace::default();
+        let base = sorted(namespace_clustered_terms(0, 80));
+        let mut packed = build(&base, &mut ws);
+        let mut incoming: Vec<String> = base.iter().step_by(3).cloned().collect();
+        incoming.extend((0..50).map(|i| format!("http://example.org/brand-new-{i:03}")));
+        let incoming = sorted(incoming);
+        packed.insert_sorted(incoming.iter().map(String::as_str), &mut ws);
+        packed.insert_sorted(incoming.iter().map(String::as_str), &mut ws);
+        let all = sorted(base.iter().chain(&incoming).cloned().collect());
+        assert_answers(&packed, &all);
+    }
+
+    /// `compact` after incremental merges, removals and chaining reaches
+    /// the exact minimal automaton (brute-force oracle), keeps every
+    /// answer, and leaves the automaton mutable.
+    #[test]
+    fn compact_is_exactly_minimal() {
+        let mut ws = Workspace::default();
+        let terms = sorted(
+            namespace_clustered_terms(0, 150)
+                .into_iter()
+                .chain((0..200).map(|i| format!("_:b{i}x{}", i * 7919 % 1000)))
+                .chain(branching_terms())
+                .collect(),
+        );
+        let fresh = build(&terms, &mut ws);
+        assert!(fresh.reachable_state_count() >= minimal_state_count(&terms));
+        let mut packed = build(&[], &mut ws);
+        for round in 0..12 {
+            let batch = terms.iter().enumerate().filter(|(i, _)| i % 12 == round).map(|(_, t)| t.as_str());
+            packed.insert_sorted(batch.collect::<Vec<_>>().into_iter(), &mut ws);
+        }
+        packed.insert("zzz-removed-again", &mut ws);
+        assert!(packed.remove("zzz-removed-again", &mut ws).is_some());
+        let before = packed.size_bytes();
+        packed.compact(&mut ws);
+        assert!(packed.size_bytes() < before);
+        assert!(packed.size_bytes() <= fresh.size_bytes());
+        assert_eq!(packed.reachable_state_count(), minimal_state_count(&terms));
+        // Chains hold one state per label byte: same count, same answers.
+        packed.compact_and_chain(&mut ws);
+        assert_eq!(packed.reachable_state_count(), minimal_state_count(&terms));
+        assert_answers(&packed, &terms);
+        packed.insert("zzz-after-compact", &mut ws);
+        assert_eq!(packed.rank("zzz-after-compact"), Some(terms.len() as u32));
+    }
+
+    /// Random inserts and removals against a `BTreeSet` model, with plain
+    /// and chaining compactions interleaved (mutations after a chaining
+    /// compaction expand the chains on their path).
+    #[test]
+    fn churn_matches_model() {
+        let pool: Vec<String> = (0..400)
+            .map(|i| match i % 4 {
+                0 => format!("http://ex.org/a/{}", i / 4),
+                1 => format!("http://ex.org/a/{}x", i / 8),
+                2 => format!("_:b{}", i % 37),
+                _ => format!("\"{}\"@en", i * 31 % 97),
+            })
+            .collect();
+        let mut ws = Workspace::default();
+        let mut model = BTreeSet::<String>::new();
+        let mut packed = build(&[], &mut ws);
+        let sample: Vec<&[u8]> = pool.iter().map(|t| t.as_bytes()).collect();
+        packed.set_symbols(Some(Arc::new(crate::fsst::SymbolTable::train(&sample))));
+        let mut state = 0x9E37_79B9_u32;
+        for step in 0..3000 {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            let term = &pool[state as usize % pool.len()];
+            if state % 3 == 0 {
+                let expected = model.range::<String, _>(..term.clone()).count() as u32;
+                let removed = packed.remove(term, &mut ws);
+                assert_eq!(removed, model.remove(term).then_some(expected), "step {step} remove {term}");
+            } else {
+                packed.insert(term, &mut ws);
+                model.insert(term.clone());
+            }
+            match step % 97 {
+                0 if step % 194 == 0 => packed.compact_and_chain(&mut ws),
+                0 => packed.compact(&mut ws),
+                _ => {}
+            }
+            if step % 100 == 0 || step == 2999 {
+                assert_answers(&packed, &model.iter().cloned().collect::<Vec<_>>());
+            }
+        }
+        packed.compact(&mut ws);
+        assert_eq!(packed.reachable_state_count(), minimal_state_count(&model.into_iter().collect::<Vec<_>>()));
+    }
+
+    /// One workspace serves many automata: the registry is reset per
+    /// operation, so nothing from one automaton leaks into another.
+    #[test]
+    fn shared_workspace_across_automata() {
+        let mut ws = Workspace::default();
+        let a_terms = sorted(namespace_clustered_terms(0, 300));
+        let b_terms = sorted(hashlike_terms(300));
+        let mut a = build(&a_terms, &mut ws);
+        let mut b = build(&b_terms, &mut ws);
+        let a_more = sorted(namespace_clustered_terms(300, 10));
+        let b_more = sorted(hashlike_terms(310)[300..].to_vec());
+        a.insert_sorted(a_more.iter().map(String::as_str), &mut ws);
+        b.insert_sorted(b_more.iter().map(String::as_str), &mut ws);
+        assert!(PackedAutomaton::register_len(&ws) <= 64 * REGISTRY_WAYS, "sized for a 10-term merge");
+        assert_answers(&a, &sorted(a_terms.into_iter().chain(a_more).collect()));
+        assert_answers(&b, &sorted(b_terms.into_iter().chain(b_more).collect()));
+    }
+
+    /// A term far longer than any stack frame budget: every path that
+    /// walks it (build, lookups, stream, bulk decode, mutation,
+    /// compaction, chaining) must be iterative, not recursive per byte.
+    #[test]
+    fn very_long_terms_do_not_recurse_per_byte() {
+        let long: String = (0..400_000).map(|i| char::from(b'a' + (i * 7 % 26) as u8)).collect();
+        let terms = sorted(vec![long.clone(), format!("{long}!"), "short".to_string()]);
+        let mut ws = Workspace::default();
+        let mut packed = build(&terms, &mut ws);
+        assert_answers(&packed, &terms);
+        packed.compact_and_chain(&mut ws);
+        assert_answers(&packed, &terms);
+        assert_eq!(packed.remove(&long, &mut ws), Some(0));
+        packed.compact(&mut ws);
+        assert_answers(&packed, &terms[1..]);
+    }
 }
