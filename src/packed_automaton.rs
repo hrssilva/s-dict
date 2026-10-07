@@ -599,36 +599,86 @@ impl PackedAutomaton {
         if self.has_chains {
             return self.lower_bound_chained(term);
         }
-        let mut pos = self.root;
-        let mut count = self.term_count;
-        let mut value = 0u32;
+        let (mut pos, mut count, mut value) = (self.root, self.term_count, 0u32);
         for &byte in term.as_bytes() {
-            let (is_final, n, next, mut cursor) = self.header(pos);
-            // (output, target) of the matching transition, and the output
-            // of the first transition after it (its subtree's end).
-            let mut matched: Option<(u32, u32)> = None;
-            let mut end = count;
-            for i in 0..n {
-                let (b, out, target, after) = self.read_transition_at(cursor, i == 0, is_final, next);
-                cursor = after;
-                if let Some((_, _)) = matched {
-                    end = out;
-                    break;
+            match self.step(pos, count, byte) {
+                Ok((out, child_count, target)) => {
+                    value += out;
+                    count = child_count;
+                    pos = target;
                 }
-                if b == byte {
-                    matched = Some((out, target));
-                } else if b > byte {
-                    return (value + out, false);
-                }
+                Err(skip) => return (value + skip, false),
             }
-            let Some((out, target)) = matched else {
-                return (value + count, false);
-            };
-            value += out;
-            count = end - out;
-            pos = target;
         }
         (value, self.is_final(pos))
+    }
+
+    /// `lower_bound` of each of `terms` (sorted ascending), in order, to
+    /// `out`. The descent stack (`stack`: `(record, rank offset, count)`
+    /// per byte consumed) is kept between consecutive terms and resumed at
+    /// their common prefix, so a prefix the terms share is walked once per
+    /// call -- the shape of a merge's run of new terms into one block.
+    pub(crate) fn lower_bounds_sorted<'a>(
+        &self,
+        terms: impl Iterator<Item = &'a str>,
+        stack: &mut Vec<(u32, u32, u32)>,
+        mut out: impl FnMut(u32, bool),
+    ) {
+        if self.has_chains {
+            for term in terms {
+                let (rank, found) = self.lower_bound(term);
+                out(rank, found);
+            }
+            return;
+        }
+        stack.clear();
+        stack.push((self.root, 0, self.term_count));
+        let mut prev: &[u8] = &[];
+        for term in terms {
+            let word = term.as_bytes();
+            // A walk that stopped short of the common prefix resumes where
+            // it stopped and stops there again, as it should.
+            stack.truncate(common_prefix_len(prev, word) + 1);
+            let (rank, found) = loop {
+                let &(pos, value, count) = stack.last().expect("the stack always holds the root");
+                let Some(&byte) = word.get(stack.len() - 1) else {
+                    break (value, self.is_final(pos));
+                };
+                match self.step(pos, count, byte) {
+                    Ok((offset, child_count, target)) => stack.push((target, value + offset, child_count)),
+                    Err(skip) => break (value + skip, false),
+                }
+            };
+            out(rank, found);
+            prev = word;
+        }
+    }
+
+    /// One `lower_bound` step at the record `pos` (subtree count `count`)
+    /// on `byte`: `Ok((rank offset, child count, target))` through the
+    /// matching transition, or `Err(terms sorting before byte here)`.
+    #[inline(always)]
+    fn step(&self, pos: u32, count: u32, byte: u8) -> Result<(u32, u32, u32), u32> {
+        let (is_final, n, mode, mut cursor) = self.header(pos);
+        // (output, target) of the matching transition; the output of the
+        // first transition after it ends its subtree.
+        let mut matched: Option<(u32, u32)> = None;
+        for i in 0..n {
+            let (b, out, target, after) = self.read_transition_at(cursor, i == 0, is_final, mode);
+            cursor = after;
+            if let Some((m_out, m_target)) = matched {
+                return Ok((m_out, out - m_out, m_target));
+            }
+            if b == byte {
+                matched = Some((out, target));
+            } else if b > byte {
+                return Err(out);
+            }
+        }
+        match matched {
+            Some((out, target)) => Ok((out, count - out, target)),
+            None => Err(count),
+        }
     }
 
     /// A chain step against `query`, out of line so the per-byte loops
@@ -1995,6 +2045,16 @@ mod tests {
             assert_eq!(packed.lower_bound(&probe), (below, present), "lower_bound({probe:?})");
             assert_eq!(packed.rank(&probe).is_some(), present);
         }
+        // Batched descents over a sorted mix of present and absent terms
+        // (prefixes, extensions, divergences) match one descent each.
+        let mut queries: Vec<String> = terms.iter().flat_map(|t| [t.clone(), format!("{t}~"), format!("{t}\0")]).collect();
+        queries.extend(terms.iter().map(|t| t.chars().take(t.chars().count() / 2).collect::<String>()));
+        queries.extend(["", "0", "h", "zzzz"].map(String::from));
+        let queries = sorted(queries);
+        let mut batched = Vec::new();
+        packed.lower_bounds_sorted(queries.iter().map(String::as_str), &mut Vec::new(), |rank, found| batched.push((rank, found)));
+        let single: Vec<(u32, bool)> = queries.iter().map(|q| packed.lower_bound(q)).collect();
+        assert_eq!(batched, single);
         let mut stream = packed.stream();
         for term in terms {
             assert_eq!(stream.next(), Some(term.as_bytes()));

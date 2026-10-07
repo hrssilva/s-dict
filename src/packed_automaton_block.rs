@@ -43,6 +43,8 @@ pub(crate) struct Workspace {
     new_ids: Vec<TermId>,
     /// Indices (into a merge's incoming run) of the terms not yet present.
     new_terms: Vec<u32>,
+    /// `PackedAutomaton::lower_bounds_sorted`'s descent stack.
+    descent: Vec<(u32, u32, u32)>,
 }
 
 #[derive(Debug)]
@@ -214,8 +216,8 @@ impl PackedAutomatonBlock {
     }
 
     /// `merge_into`'s id assignment for a run much smaller than the block:
-    /// one `lower_bound` descent per incoming term finds its old rank,
-    /// instead of streaming every term in the block -- the single-term
+    /// descents (sharing the run's common prefixes) find each incoming
+    /// term's old rank, instead of streaming every term in the block -- the single-term
     /// insert and typical bulk-load case (a batch spread over thousands of
     /// blocks lands a few terms in each). Fills `new_ids`/`new_terms`;
     /// returns the first new term's rank, if any.
@@ -226,25 +228,31 @@ impl PackedAutomatonBlock {
         mut resolved: impl FnMut(TermId),
         ws: &mut Workspace,
     ) -> Option<usize> {
-        let mut first_new = None;
-        let mut copied = 0usize;
-        for (i, &term) in incoming.iter().enumerate() {
-            let (rank, found) = self.packed.lower_bound(term);
+        let (mut first_new, mut copied, mut i) = (None, 0usize, 0u32);
+        let Workspace {
+            old_ids,
+            new_ids,
+            new_terms,
+            descent,
+            ..
+        } = ws;
+        self.packed.lower_bounds_sorted(incoming.iter().copied(), descent, |rank, found| {
             let rank = rank as usize;
-            ws.new_ids.extend_from_slice(&ws.old_ids[copied..rank]);
+            new_ids.extend_from_slice(&old_ids[copied..rank]);
             copied = rank;
             if found {
                 // Copied with the rest of the old ids at its own position.
-                resolved(ws.old_ids[rank]);
+                resolved(old_ids[rank]);
             } else {
-                first_new.get_or_insert(ws.new_ids.len());
+                first_new.get_or_insert(new_ids.len());
                 let id = alloc_id();
-                ws.new_ids.push(id);
-                ws.new_terms.push(i as u32);
+                new_ids.push(id);
+                new_terms.push(i);
                 resolved(id);
             }
-        }
-        ws.new_ids.extend_from_slice(&ws.old_ids[copied..]);
+            i += 1;
+        });
+        new_ids.extend_from_slice(&old_ids[copied..]);
         first_new
     }
 
