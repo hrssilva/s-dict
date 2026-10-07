@@ -390,7 +390,7 @@ impl PackedAutomatonDictionary {
             for u in start..end {
                 let id = alloc_term_id(&mut self.free_term_ids, &mut self.next_term_id);
                 chunk_ids.push(id);
-                for &pos in order.positions(u) {
+                for pos in order.positions(u) {
                     result[pos] = id;
                 }
             }
@@ -446,7 +446,7 @@ impl PackedAutomatonDictionary {
                     id
                 },
                 |id| {
-                    for &pos in order.positions(k) {
+                    for pos in order.positions(k) {
                         result[pos] = id;
                     }
                     k += 1;

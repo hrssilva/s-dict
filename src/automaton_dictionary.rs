@@ -515,7 +515,7 @@ impl AutomatonDictionary {
             for offset in 0..(end - start) {
                 let id = self.alloc_term_id();
                 chunk_ids.push(id);
-                for &pos in order.positions(start + offset) {
+                for pos in order.positions(start + offset) {
                     result[pos] = id;
                 }
             }
@@ -582,7 +582,7 @@ impl AutomatonDictionary {
                     }
                 },
                 |id| {
-                    for &pos in order.positions(k) {
+                    for pos in order.positions(k) {
                         result[pos] = id;
                     }
                     k += 1;
