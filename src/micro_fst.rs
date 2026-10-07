@@ -1538,6 +1538,24 @@ pub(crate) struct PackedAutomaton {
     /// per-state work of `insert_sorted`/`build_sorted`/`compact` doesn't
     /// allocate -- malloc/free was ~10% of a bulk load's profile.
     scratch: Scratch,
+    /// `compact` left chain records (path compression, see
+    /// `append_chain`); mutation expands them first (`unchain`).
+    chained: bool,
+    /// Symbol table for chain labels (`crate::fsst`), shared by every
+    /// block of a dictionary; set by the dictionary once trained.
+    symbols: Option<std::sync::Arc<crate::fsst::SymbolTable>>,
+    /// The current chains were written with `symbols` available.
+    chains_coded: bool,
+}
+
+/// A non-empty chain record: label bytes at `start..start + len` (coded
+/// with the automaton's symbol table if `coded`), then `target`.
+#[derive(Clone, Copy)]
+struct Chain {
+    start: usize,
+    len: usize,
+    target: u32,
+    coded: bool,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -1572,6 +1590,9 @@ impl PackedAutomaton {
             term_count: automaton.len() as u32,
             register: Some(PackedRegistry::with_capacity_hint(automaton.len())),
             scratch: Scratch::default(),
+            chained: false,
+            symbols: None,
+            chains_coded: false,
         };
         let mut written: HashMap<StateId, u32> = HashMap::new();
         let root = Self::compile_state(automaton, automaton.root, &mut result, &mut written);
@@ -1638,6 +1659,9 @@ impl PackedAutomaton {
             term_count: 0,
             register: Some(PackedRegistry::with_capacity_hint(capacity_hint)),
             scratch: Scratch::default(),
+            chained: false,
+            symbols: None,
+            chains_coded: false,
         };
         // frames[i] is the state reached after `path_bytes[..i]` of
         // `last_word`; frames[0] (root) has no incoming byte, so
@@ -1741,6 +1765,7 @@ impl PackedAutomaton {
     /// sorted-merge walk) don't need this to report it back, so unlike
     /// the slab's own `insert_sorted` this returns nothing.
     pub(crate) fn insert_sorted<'a>(&mut self, terms: impl Iterator<Item = &'a str>) {
+        self.unchain();
         let mut frames: Vec<StagingFrame> = vec![self.open_frame(self.root, self.term_count)];
         let mut path_bytes: Vec<u8> = Vec::new();
         let mut last_word: Vec<u8> = Vec::new();
@@ -1805,6 +1830,7 @@ impl PackedAutomaton {
     /// reference-counting or redirect-into-an-existing-record step at
     /// all, unlike the mutable slab design's own `insert`.
     pub(crate) fn insert(&mut self, term: &str) {
+        self.unchain();
         let word = term.as_bytes();
 
         // Walk existing transitions as far as they match, "opening" every
@@ -1871,6 +1897,7 @@ impl PackedAutomaton {
     /// path bottom-up. Superseded records become dead bytes, reclaimed by
     /// [`Self::compact`] like `insert`'s.
     pub(crate) fn remove(&mut self, term: &str) -> bool {
+        self.unchain();
         let word = term.as_bytes();
         let mut staging: Vec<StagingFrame> = vec![self.open_frame(self.root, self.term_count)];
         for &byte in word {
@@ -1916,10 +1943,28 @@ impl PackedAutomaton {
     /// one descent, with each state's subtree count derived top-down from
     /// `term_count` and the outputs, as in `open_frame`.
     pub(crate) fn lower_bound(&self, term: &str) -> (u32, bool) {
+        let t = term.as_bytes();
         let mut pos = self.root;
         let mut count = self.term_count;
         let mut value = 0u32;
-        for &byte in term.as_bytes() {
+        let mut at = 0usize;
+        loop {
+            if let Some(chain) = self.chain_at(pos) {
+                // A chain's states are non-final with one child each: the
+                // whole label either matches or decides the comparison.
+                match self.chain_match(chain, &t[at..]) {
+                    Ok(len) => {
+                        at += len;
+                        pos = chain.target;
+                        continue;
+                    }
+                    Err((m, Some(label_byte))) if t[at + m] > label_byte => return (value + count, false),
+                    Err(_) => return (value, false),
+                }
+            }
+            let Some(&byte) = t.get(at) else {
+                return (value, self.is_final(pos));
+            };
             let (is_final, n, next, mut cursor) = self.header(pos);
             // (output, target) of the matching transition, and the output
             // of the first transition after it (its subtree's end).
@@ -1944,8 +1989,8 @@ impl PackedAutomaton {
             value += out;
             count = end - out;
             pos = target;
+            at += 1;
         }
-        (value, self.is_final(pos))
     }
 
     /// Computes `frame`'s outputs from its children's subtree counts
@@ -2066,15 +2111,23 @@ impl PackedAutomaton {
     /// Records are re-emitted in postorder, children in byte order, as
     /// `build_sorted` writes them, so NEXT targets apply.
     pub(crate) fn compact(&mut self) {
+        if self.chained {
+            // Already compacted, and nothing mutated since (mutation
+            // unchains first).
+            return;
+        }
         let old = PackedAutomaton {
             bytes: std::mem::take(&mut self.bytes),
             root: self.root,
             term_count: self.term_count,
             register: None,
             scratch: Scratch::default(),
+            chained: false,
+            symbols: self.symbols.clone(),
+            chains_coded: false,
         };
         self.register = None;
-        let mut moved: HashMap<u32, u32, BuildHasherDefault<FxHasher>> = HashMap::default();
+        let mut moved = vec![u32::MAX; old.bytes.len()];
         let mut canonical = DedupTable::new();
         let mut pool = std::mem::take(&mut self.scratch.frames);
         let read = |pool: &mut Vec<Vec<(u8, u32, u32)>>, pos: u32| {
@@ -2089,7 +2142,7 @@ impl PackedAutomaton {
         while let Some((pos, children, next)) = stack.last_mut() {
             if let Some(&(_, _, child)) = children.get(*next) {
                 *next += 1;
-                if !moved.contains_key(&child) {
+                if moved[child as usize] == u32::MAX {
                     let grandchildren = read(&mut pool, child);
                     stack.push((child, grandchildren, 0));
                 }
@@ -2099,7 +2152,7 @@ impl PackedAutomaton {
             let mut children = std::mem::take(children);
             stack.pop();
             for child in &mut children {
-                child.2 = moved[&child.2];
+                child.2 = moved[child.2 as usize];
             }
             let is_final = old.is_final(pos);
             let hash = signature_hash(is_final, &children);
@@ -2111,12 +2164,201 @@ impl PackedAutomaton {
                     new_pos
                 }
             };
-            moved.insert(pos, new_pos);
+            moved[pos as usize] = new_pos;
             pool.push(children);
         }
-        self.root = moved[&old.root];
+        self.root = moved[old.root as usize];
         self.bytes.shrink_to_fit();
         self.scratch = Scratch::default();
+    }
+
+    /// `compact`, then path compression (`chain_up`) for read speed. Meant
+    /// for the end of a load: the next mutation expands the chains again
+    /// (`unchain`), so chaining during a load -- e.g. on every
+    /// growth-triggered compaction -- would only churn (measured: +20%
+    /// insertion at 10M lines).
+    pub(crate) fn compact_and_chain(&mut self) {
+        if self.chained && (self.chains_coded || self.symbols.is_none()) {
+            return;
+        }
+        // Chained before a symbol table existed: re-chain with it.
+        self.unchain();
+        self.compact();
+        self.chain_up();
+        self.bytes.shrink_to_fit();
+    }
+
+    /// `(byte, output, target)` per transition; a chain record's is its
+    /// first label byte and its target (traversal helper for `chain_up`/
+    /// `unchain`, which only need the record graph).
+    fn record_edges(&self, pos: u32, out: &mut Vec<(u8, u32, u32)>) {
+        out.clear();
+        match self.chain_at(pos) {
+            Some(chain) => {
+                let mut label = Vec::new();
+                self.chain_label(chain, &mut label);
+                out.push((label[0], 0, chain.target));
+            }
+            None => self.read_children_into(pos, out),
+        }
+    }
+
+    /// Postorder over the record graph from the root: `visit(pos, edges)`
+    /// runs once per record, after all of its targets.
+    fn postorder(&self, mut visit: impl FnMut(u32, &[(u8, u32, u32)])) {
+        // Record addresses are dense small integers (< bytes.len()), so
+        // per-record state lives in plain vectors indexed by address.
+        let mut done = vec![false; self.bytes.len()];
+        let mut pool: Vec<Vec<(u8, u32, u32)>> = Vec::new();
+        let edges = |pool: &mut Vec<Vec<(u8, u32, u32)>>, pos: u32| {
+            let mut v = pool.pop().unwrap_or_default();
+            self.record_edges(pos, &mut v);
+            v
+        };
+        let root_edges = edges(&mut pool, self.root);
+        let mut stack: Vec<(u32, Vec<(u8, u32, u32)>, usize)> = vec![(self.root, root_edges, 0)];
+        while let Some((pos, children, next)) = stack.last_mut() {
+            if let Some(&(_, _, child)) = children.get(*next) {
+                *next += 1;
+                if !done[child as usize] {
+                    let grandchildren = edges(&mut pool, child);
+                    stack.push((child, grandchildren, 0));
+                }
+                continue;
+            }
+            let (pos, children) = (*pos, std::mem::take(children));
+            stack.pop();
+            if !done[pos as usize] {
+                done[pos as usize] = true;
+                visit(pos, &children);
+            }
+            pool.push(children);
+        }
+    }
+
+    /// Second compaction pass (path compression): folds every run of
+    /// single-transition, non-final states whose in-degree is 1 into one
+    /// chain record (`append_chain`). Shared states are never absorbed, so
+    /// the automaton stays exactly as minimal as `compact`'s first pass
+    /// left it -- `reachable_state_count` counts a chain's states.
+    fn chain_up(&mut self) {
+        let old = PackedAutomaton {
+            bytes: std::mem::take(&mut self.bytes),
+            root: self.root,
+            term_count: self.term_count,
+            register: None,
+            scratch: Scratch::default(),
+            chained: false,
+            symbols: self.symbols.clone(),
+            chains_coded: false,
+        };
+        let n = old.bytes.len();
+        let mut chain_like = vec![false; n];
+        let mut indeg = vec![0u32; n];
+        let mut parent_chain_like = vec![false; n];
+        old.postorder(|pos, edges| {
+            let like = edges.len() == 1 && !old.is_final(pos);
+            chain_like[pos as usize] = like;
+            for &(_, _, t) in edges {
+                indeg[t as usize] += 1;
+                parent_chain_like[t as usize] = like;
+            }
+        });
+        let absorbable =
+            |pos: u32| chain_like[pos as usize] && indeg[pos as usize] == 1 && parent_chain_like[pos as usize];
+        let mut moved = vec![u32::MAX; n];
+        // An absorbed node's chain so far: its label (reversed) in `labels`
+        // from `pending_start[pos]`, and the chain's final target. Labels
+        // grow child-first, so one shared buffer suffices: a node's
+        // pending label always ends the buffer when its parent takes it.
+        let mut labels: Vec<u8> = Vec::new();
+        let mut pending_start = vec![u32::MAX; n];
+        let mut pending_target = vec![u32::MAX; n];
+        let mut mapped: Vec<(u8, u32, u32)> = Vec::new();
+        let symbols = self.symbols.clone();
+        let mut coded: Vec<u8> = Vec::new();
+        old.postorder(|pos, edges| {
+            let p = pos as usize;
+            if chain_like[p] {
+                let (b, _, child) = edges[0];
+                let c = child as usize;
+                let (start, target) = if pending_start[c] != u32::MAX {
+                    (pending_start[c] as usize, pending_target[c])
+                } else {
+                    (labels.len(), moved[c])
+                };
+                labels.push(b);
+                if absorbable(pos) {
+                    pending_start[p] = start as u32;
+                    pending_target[p] = target;
+                } else {
+                    let label: Vec<u8> = labels[start..].iter().rev().copied().collect();
+                    labels.truncate(start);
+                    moved[p] = if label.len() == 1 {
+                        self.append_record(false, &[(label[0], 0, target)])
+                    } else {
+                        coded.clear();
+                        if let Some(table) = &symbols {
+                            table.encode(&label, &mut coded);
+                        }
+                        if !coded.is_empty() && coded.len() < label.len() {
+                            self.append_chain(&coded, target, true)
+                        } else {
+                            self.append_chain(&label, target, false)
+                        }
+                    };
+                }
+            } else {
+                mapped.clear();
+                mapped.extend(edges.iter().map(|&(b, out, t)| (b, out, moved[t as usize])));
+                moved[p] = self.append_record(old.is_final(pos), &mapped);
+            }
+        });
+        self.root = moved[old.root as usize];
+        self.chained = true;
+        self.chains_coded = symbols.is_some();
+    }
+
+    /// Expands chain records back into single-transition records, so the
+    /// per-byte mutation machinery (`open_frame`, frames, registry) can
+    /// run. O(records); a no-op unless `compact` chained this automaton.
+    fn unchain(&mut self) {
+        if !self.chained {
+            return;
+        }
+        let old = PackedAutomaton {
+            bytes: std::mem::take(&mut self.bytes),
+            root: self.root,
+            term_count: self.term_count,
+            register: None,
+            scratch: Scratch::default(),
+            chained: false,
+            symbols: self.symbols.clone(),
+            chains_coded: false,
+        };
+        let mut moved = vec![u32::MAX; old.bytes.len()];
+        let mut mapped: Vec<(u8, u32, u32)> = Vec::new();
+        old.postorder(|pos, edges| {
+            let new_pos = match old.chain_at(pos) {
+                Some(chain) => {
+                    let mut label = Vec::new();
+                    old.chain_label(chain, &mut label);
+                    let mut next = moved[chain.target as usize];
+                    for &b in label.iter().rev() {
+                        next = self.append_record(false, &[(b, 0, next)]);
+                    }
+                    next
+                }
+                None => {
+                    mapped.clear();
+                    mapped.extend(edges.iter().map(|&(b, out, t)| (b, out, moved[t as usize])));
+                    self.append_record(old.is_final(pos), &mapped)
+                }
+            };
+            moved[pos as usize] = new_pos;
+        });
+        self.root = moved[old.root as usize];
+        self.chained = false;
     }
 
     /// `read_children`, into a caller-provided buffer.
@@ -2151,6 +2393,11 @@ impl PackedAutomaton {
     /// (see the struct doc comment for why that's sound here).
     fn append_record(&mut self, is_final: bool, children: &[(u8, u32, u32)]) -> u32 {
         debug_assert!(children.len() <= 256, "at most one transition per byte value");
+        if children.is_empty() && !is_final {
+            // The empty non-final state (only an empty automaton's root):
+            // a chain record of length 0.
+            return self.append_chain(&[], 0, false);
+        }
         debug_assert!(
             children.first().is_none_or(|&(_, out, _)| out == u32::from(is_final)),
             "the first output is always is_final, so it is implicit"
@@ -2224,29 +2471,48 @@ impl PackedAutomaton {
     /// test-only: used directly by `PackedAutomatonBlock`/
     /// `PackedAutomatonDictionary`'s own `reachable_state_count` for the
     /// states-per-term investigation (DESIGN.md).
+    /// States, not records: a chain record holds one state per label
+    /// byte.
     pub(crate) fn reachable_state_count(&self) -> usize {
         let mut seen = std::collections::HashSet::new();
         let mut stack = vec![self.root];
+        let mut states = 0usize;
         while let Some(pos) = stack.pop() {
             if seen.insert(pos) {
+                if let Some(chain) = self.chain_at(pos) {
+                    states += self.chain_states(chain);
+                    stack.push(chain.target);
+                    continue;
+                }
+                states += 1;
                 for &(_, _, target) in &self.read_children(pos) {
                     stack.push(target);
                 }
             }
         }
-        seen.len()
+        states
     }
 
     /// Mirrors `Automaton::rank`'s contract exactly.
     pub(crate) fn rank(&self, term: &str) -> Option<u32> {
+        let t = term.as_bytes();
         let mut pos = self.root;
         let mut value = 0u32;
-        for &b in term.as_bytes() {
+        let mut at = 0usize;
+        loop {
+            if let Some(chain) = self.chain_at(pos) {
+                at += self.chain_match(chain, &t[at..]).ok()?;
+                pos = chain.target;
+                continue;
+            }
+            let Some(&b) = t.get(at) else {
+                return self.is_final(pos).then_some(value);
+            };
             let (output, target) = self.get(pos, b)?;
             value += output;
             pos = target;
+            at += 1;
         }
-        self.is_final(pos).then_some(value)
     }
 
     /// Mirrors `Automaton::term_at_into`'s contract exactly.
@@ -2255,6 +2521,11 @@ impl PackedAutomaton {
         let mut value = rank;
         let mut pos = self.root;
         loop {
+            if let Some(chain) = self.chain_at(pos) {
+                self.chain_label(chain, buf);
+                pos = chain.target;
+                continue;
+            }
             if value == 0 && self.is_final(pos) {
                 return;
             }
@@ -2297,6 +2568,12 @@ impl PackedAutomaton {
         out: &mut [Option<String>],
     ) {
         if targets.is_empty() {
+            return;
+        }
+        if let Some(chain) = self.chain_at(pos) {
+            let len = self.chain_label(chain, buf);
+            self.decode_batch(chain.target, targets, value_offset, buf, out);
+            buf.truncate(buf.len() - len);
             return;
         }
         let (is_final, count, next_flag, mut cursor) = self.header(pos);
@@ -2347,11 +2624,129 @@ impl PackedAutomaton {
         }
     }
 
+    /// Appends a chain record: single-transition, non-final states in one
+    /// record (path compression). Layout, reading downward from the `0x00`
+    /// header: `len << 2 | coded << 1 | next` (reversed LEB128), the
+    /// stored label (`len` bytes, forward order, so it is one contiguous
+    /// slice; FSST-coded if `coded`), then the target delta unless NEXT
+    /// (target = the record just below the label). Length 0 is the empty
+    /// non-final state, with no target.
+    fn append_chain(&mut self, label: &[u8], target: u32, coded: bool) -> u32 {
+        let mut next = false;
+        if !label.is_empty() {
+            next = !self.bytes.is_empty() && target as usize == self.bytes.len() - 1;
+            if !next {
+                let field = self.bytes.len() as u32;
+                write_leb128_rev(&mut self.bytes, field - target);
+            }
+            self.bytes.extend_from_slice(label);
+        }
+        let len = u32::try_from(label.len()).expect("chain label fits u32");
+        write_leb128_rev(&mut self.bytes, len << 2 | u32::from(coded) << 1 | u32::from(next));
+        self.bytes.push(0);
+        (self.bytes.len() - 1) as u32
+    }
+
+    /// The chain record at `pos`, if it is a non-empty one.
+    #[inline]
+    fn chain_at(&self, pos: u32) -> Option<Chain> {
+        if self.bytes[pos as usize] != 0 {
+            return None;
+        }
+        let (packed_len, start) = read_leb128_rev(&self.bytes, pos as usize - 1);
+        let len = (packed_len >> 2) as usize;
+        if len == 0 {
+            return None;
+        }
+        let label_start = start - len;
+        let target = if packed_len & 1 == 1 {
+            (label_start - 1) as u32
+        } else {
+            let (delta, field) = read_leb128_rev(&self.bytes, label_start - 1);
+            field as u32 - delta
+        };
+        Some(Chain {
+            start: label_start,
+            len,
+            target,
+            coded: packed_len & 2 == 2,
+        })
+    }
+
+    fn table(&self) -> &crate::fsst::SymbolTable {
+        self.symbols.as_deref().expect("coded chain without a symbol table")
+    }
+
+    /// Appends `chain`'s decoded label to `out`; returns its length (the
+    /// chain's number of states).
+    #[inline]
+    fn chain_label(&self, chain: Chain, out: &mut Vec<u8>) -> usize {
+        let before = out.len();
+        let stored = &self.bytes[chain.start..chain.start + chain.len];
+        if chain.coded {
+            self.table().decode(stored, out);
+        } else {
+            out.extend_from_slice(stored);
+        }
+        out.len() - before
+    }
+
+    /// `crate::fsst::SymbolTable::match_prefix`'s contract for `chain`.
+    #[inline]
+    fn chain_match(&self, chain: Chain, query: &[u8]) -> Result<usize, (usize, Option<u8>)> {
+        let stored = &self.bytes[chain.start..chain.start + chain.len];
+        if chain.coded {
+            return self.table().match_prefix(stored, query);
+        }
+        let m = stored.iter().zip(query).take_while(|(a, b)| a == b).count();
+        if m == stored.len() {
+            Ok(m)
+        } else {
+            Err((m, query.get(m).map(|_| stored[m])))
+        }
+    }
+
+    fn chain_states(&self, chain: Chain) -> usize {
+        if chain.coded {
+            self.table().decoded_len(&self.bytes[chain.start..chain.start + chain.len])
+        } else {
+            chain.len
+        }
+    }
+
+    /// Makes `symbols` this automaton's chain-label table (the next
+    /// `compact_and_chain` codes chains with it).
+    pub(crate) fn set_symbols(&mut self, symbols: Option<std::sync::Arc<crate::fsst::SymbolTable>>) {
+        self.symbols = symbols;
+    }
+
+    /// Appends every chain label (decoded) -- a training sample.
+    pub(crate) fn chain_labels_into(&self, out: &mut Vec<Vec<u8>>) {
+        self.postorder(|pos, _| {
+            if let Some(chain) = self.chain_at(pos) {
+                let mut label = Vec::new();
+                self.chain_label(chain, &mut label);
+                out.push(label);
+            }
+        });
+    }
+
     #[inline]
     fn is_final(&self, pos: u32) -> bool {
         self.bytes[pos as usize] & 0xC0 == 0x40
     }
 
+
+    /// Follows chain records from `pos`, appending their labels to `buf`;
+    /// returns the first non-chain record and the bytes appended.
+    fn resolve_chains(&self, mut pos: u32, buf: &mut Vec<u8>) -> (u32, usize) {
+        let mut pushed = 0;
+        while let Some(chain) = self.chain_at(pos) {
+            pushed += self.chain_label(chain, buf);
+            pos = chain.target;
+        }
+        (pos, pushed)
+    }
 
     /// `(is_final, transition_count, mode, cursor)` -- `cursor` is the
     /// offset of the first transition's first field below the header;
@@ -2361,6 +2756,12 @@ impl PackedAutomaton {
     fn header(&self, pos: u32) -> (bool, usize, RecordMode, usize) {
         let header = self.bytes[pos as usize];
         let mut cursor = (pos as usize).wrapping_sub(1);
+        if header == 0 {
+            // A chain record; callers resolve non-empty chains first
+            // (`chain_at`), so this is the empty non-final state.
+            debug_assert!(self.chain_at(pos).is_none(), "header() on a chain record");
+            return (false, 0, RecordMode::GENERAL, cursor);
+        }
         if header & 0x80 != 0 {
             let code = header & 0x3F;
             let mode = RecordMode {
@@ -2514,11 +2915,14 @@ impl PackedAutomaton {
     /// stream`'s own amortized cost rather than a naive port of its
     /// per-visit re-lookup.
     pub(crate) fn stream(&self) -> PackedTermsStream<'_> {
-        let (is_final, count, next, cursor) = self.header(self.root);
+        let mut buf = Vec::new();
+        let (root, pushed) = self.resolve_chains(self.root, &mut buf);
+        let (is_final, count, next, cursor) = self.header(root);
         PackedTermsStream {
             packed: self,
-            buf: Vec::new(),
+            buf,
             stack: vec![PackedStreamFrame {
+                pushed,
                 is_final,
                 next,
                 first: true,
@@ -2795,6 +3199,9 @@ impl<'a> TermsStream<'a> {
 /// [`StreamFrame`]'s counterpart, caching a parse cursor instead of an
 /// index, per [`PackedAutomaton::stream`]'s own doc comment.
 struct PackedStreamFrame {
+    /// Bytes appended to the buffer when this frame was entered (its
+    /// transition byte plus any chain labels resolved after it).
+    pushed: usize,
     is_final: bool,
     /// The record's NEXT flag and folded label (see `read_transition_at`).
     next: RecordMode,
@@ -2834,10 +3241,8 @@ impl<'a> PackedTermsStream<'a> {
                 return Some(&self.buf);
             }
             if self.stack[depth - 1].remaining == 0 {
-                self.stack.pop();
-                if depth > 1 {
-                    self.buf.pop();
-                }
+                let pushed = self.stack.pop().expect("depth > 0").pushed;
+                self.buf.truncate(self.buf.len() - pushed);
                 continue;
             }
             let frame = &mut self.stack[depth - 1];
@@ -2848,8 +3253,10 @@ impl<'a> PackedTermsStream<'a> {
             frame.remaining -= 1;
             frame.cursor = next_cursor;
             self.buf.push(b);
+            let (target, chained) = self.packed.resolve_chains(target, &mut self.buf);
             let (child_is_final, child_count, child_next, child_cursor) = self.packed.header(target);
             self.stack.push(PackedStreamFrame {
+                pushed: 1 + chained,
                 is_final: child_is_final,
                 next: child_next,
                 first: true,
@@ -4177,7 +4584,14 @@ mod tests {
             single.insert(t);
         }
 
-        for packed in [&built, &batched, &single] {
+        let mut chained = built.clone();
+        chained.compact_and_chain();
+        let mut coded = built.clone();
+        let sample: Vec<&[u8]> = terms.iter().map(|t| t.as_bytes()).collect();
+        coded.set_symbols(Some(std::sync::Arc::new(crate::fsst::SymbolTable::train(&sample))));
+        coded.compact_and_chain();
+        assert!(coded.chains_coded);
+        for packed in [&built, &batched, &single, &chained, &coded] {
             let mut buf = Vec::new();
             for (rank, term) in terms.iter().enumerate() {
                 assert_eq!(packed.rank(term), Some(rank as u32));
@@ -4226,6 +4640,10 @@ mod tests {
         assert_eq!(packed.reachable_state_count(), exact.reachable_state_count());
         let fresh = PackedAutomaton::build_sorted(terms.iter().map(String::as_str));
         assert!(packed.size_bytes() <= fresh.size_bytes());
+        // Path compression keeps the same states (chains hold one per
+        // label byte) and every answer below.
+        packed.compact_and_chain();
+        assert_eq!(packed.reachable_state_count(), exact.reachable_state_count());
 
         let mut buf = Vec::new();
         for (rank, term) in terms.iter().enumerate() {
@@ -4255,6 +4673,9 @@ mod tests {
             .collect();
         let mut model = std::collections::BTreeSet::<String>::new();
         let mut packed = PackedAutomaton::build_sorted(std::iter::empty());
+        // Chaining compactions below code labels with this table.
+        let sample: Vec<&[u8]> = pool.iter().map(|t| t.as_bytes()).collect();
+        packed.set_symbols(Some(std::sync::Arc::new(crate::fsst::SymbolTable::train(&sample))));
         let mut state = 0x9E37_79B9_u32;
         for step in 0..3000 {
             state ^= state << 13;
@@ -4269,7 +4690,13 @@ mod tests {
             }
             packed.release_construction_state();
             if step % 97 == 0 {
-                packed.compact();
+                // Alternate plain and chaining compaction; mutations after
+                // a chaining one expand the chains first.
+                if step % 194 == 0 {
+                    packed.compact_and_chain();
+                } else {
+                    packed.compact();
+                }
             }
             if step % 50 == 0 || step == 2999 {
                 let sorted: Vec<&String> = model.iter().collect();

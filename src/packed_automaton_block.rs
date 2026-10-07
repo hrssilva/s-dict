@@ -105,6 +105,22 @@ impl PackedAutomatonBlock {
         self.compact_bytes_per_term = bytes_per_term(&self.packed, self.ids.len());
     }
 
+    /// End of a load: `compact` plus path compression for faster reads
+    /// (`PackedAutomaton::compact_and_chain`), coding chain labels with
+    /// `symbols` when given.
+    pub(crate) fn finish(&mut self, symbols: Option<&std::sync::Arc<crate::fsst::SymbolTable>>) {
+        if let Some(table) = symbols {
+            self.packed.set_symbols(Some(table.clone()));
+        }
+        self.packed.compact_and_chain();
+        self.compact_bytes_per_term = bytes_per_term(&self.packed, self.ids.len());
+    }
+
+    /// Every chain label of this block (decoded): a training sample.
+    pub(crate) fn chain_labels_into(&self, out: &mut Vec<Vec<u8>>) {
+        self.packed.chain_labels_into(out);
+    }
+
     pub(crate) fn len(&self) -> usize {
         self.ids.len()
     }
@@ -139,6 +155,11 @@ impl PackedAutomatonBlock {
         self.ids.rank_of(id)
     }
 
+    /// All ids in rank order (`BlockIds::to_vec`, a bulk decode).
+    pub(crate) fn ids(&self) -> Vec<TermId> {
+        self.ids.to_vec()
+    }
+
     /// Logical size of the compressed `rank -> TermId` array.
     pub(crate) fn ids_bytes(&self) -> usize {
         self.ids.size_bytes()
@@ -160,12 +181,13 @@ impl PackedAutomatonBlock {
     /// between consecutive entries) rather than one `term_at_into` call
     /// per rank.
     pub(crate) fn decode_into(&self, out: &mut EntriesArena) {
+        let ids = self.ids.to_vec();
         let mut stream = self.packed.stream();
         let mut rank = 0usize;
         while let Some(term_bytes) = stream.next() {
             let term = std::str::from_utf8(term_bytes)
                 .expect("keys were inserted as valid UTF-8 str bytes");
-            out.push(term, self.ids.get(rank));
+            out.push(term, ids[rank]);
             rank += 1;
         }
     }

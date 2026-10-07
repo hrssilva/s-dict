@@ -68,6 +68,11 @@ const DEFAULT_BLOCK_MIN: usize = 256;
 /// (21.5 us) for +0.4% size. DESIGN.md's "incremental single-term
 /// mutation".
 const SPLIT_FILL_PERCENT: usize = 90;
+
+/// Chain-label symbol table training sample: up to this many blocks,
+/// evenly spaced, stopping early at this many label bytes.
+const SYMBOL_SAMPLE_BLOCKS: usize = 64;
+const SYMBOL_SAMPLE_BYTES: usize = 1 << 20;
 const DEFAULT_BLOCK_MAX: usize = 1024;
 
 /// See the module doc comment. Same macro structure as `AutomatonDictionary`,
@@ -86,6 +91,9 @@ pub struct PackedAutomatonDictionary {
     block_max: usize,
     len: usize,
     scratch: EntriesArena,
+    /// Chain-label symbol table (`crate::fsst`), trained at the first
+    /// `shrink_to_fit` and shared by every block afterwards.
+    symbols: Option<std::sync::Arc<crate::fsst::SymbolTable>>,
 }
 
 impl Default for PackedAutomatonDictionary {
@@ -121,6 +129,7 @@ impl PackedAutomatonDictionary {
             block_max,
             len: 0,
             scratch: EntriesArena::new(),
+            symbols: None,
         }
     }
 
@@ -143,8 +152,31 @@ impl PackedAutomatonDictionary {
     /// state is already released after every mutation
     /// (`PackedAutomaton::release_construction_state`).
     pub fn shrink_to_fit(&mut self) {
+        if self.symbols.is_none() {
+            // Train the chain-label table once, on the chains of up to
+            // `SYMBOL_SAMPLE_BLOCKS` evenly spaced blocks (chained raw for
+            // the purpose, then re-chained coded below).
+            let live: Vec<usize> = (0..self.blocks.len()).filter(|&i| self.blocks[i].is_some()).collect();
+            let step = (live.len() / SYMBOL_SAMPLE_BLOCKS).max(1);
+            let mut labels: Vec<Vec<u8>> = Vec::new();
+            let mut sampled = 0usize;
+            for &i in live.iter().step_by(step) {
+                let block = self.blocks[i].as_mut().expect("live slot");
+                block.finish(None);
+                let before = labels.len();
+                block.chain_labels_into(&mut labels);
+                sampled += labels[before..].iter().map(Vec::len).sum::<usize>();
+                if sampled >= SYMBOL_SAMPLE_BYTES {
+                    break;
+                }
+            }
+            if !labels.is_empty() {
+                let sample: Vec<&[u8]> = labels.iter().map(Vec::as_slice).collect();
+                self.symbols = Some(std::sync::Arc::new(crate::fsst::SymbolTable::train(&sample)));
+            }
+        }
         for block in self.blocks.iter_mut().flatten() {
-            block.compact();
+            block.finish(self.symbols.as_ref());
         }
         self.blocks.shrink_to_fit();
         self.free_block_slots.shrink_to_fit();
@@ -173,7 +205,8 @@ impl PackedAutomatonDictionary {
             .map(|(key, _)| key.len() + std::mem::size_of::<PackedAutomatonBlockId>())
             .sum();
         let id_to_block_bytes = self.id_to_block.size_bytes();
-        blocks_bytes + directory_bytes + id_to_block_bytes
+        let symbols_bytes = self.symbols.as_ref().map_or(0, |t| t.size_bytes());
+        blocks_bytes + directory_bytes + id_to_block_bytes + symbols_bytes
     }
 
     /// Total reachable state count across every block's `PackedAutomaton`
@@ -285,7 +318,7 @@ impl PackedAutomatonDictionary {
             .as_ref()
             .expect("PackedAutomatonBlockId must reference a live block");
         self.id_to_block
-            .assign(block_id.slot(), (0..block.len()).map(|rank| block.id_at(rank).0));
+            .assign(block_id.slot(), block.ids().into_iter().map(|id| id.0));
     }
 
     fn refresh_directory_key(
@@ -740,6 +773,10 @@ mod tests {
             } else {
                 let t = format!("t{:04}", next() % 3000);
                 assert_eq!(dict.remove(&t), model.remove(&t), "round {round} remove {t}");
+            }
+            if round % 50 == 25 {
+                // Chains every block; later mutations must expand them.
+                dict.shrink_to_fit();
             }
             if round % 20 == 0 || round == 399 {
                 assert_eq!(dict.len(), model.len());

@@ -26,6 +26,7 @@ mod block;
 mod block_ids;
 mod dictionary;
 mod entries_arena;
+mod fsst;
 mod front_coded_block;
 mod front_coded_dictionary;
 mod micro_fst;

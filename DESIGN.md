@@ -4614,3 +4614,93 @@ private real-RDF corpus; 10M-line runs repeated twice (noise < 1%).
 - **Parser/writer split (full file, sharded, warm cache):** 3+9 13.7s,
   4+8 14.5s, 5+7 13.8s, 6+6 12.6s, **7+5 12.1s** on this 6-core / 12-thread
   laptop.
+
+## succinct id permutation (wavelet matrix over run labels)
+
+A block's `rank <-> id` mapping is a permutation made of ~11 increasing
+runs; measured on the full private real-RDF corpus, its run-label entropy
+is 0.30 bytes/term (+0.06 for run tables), while `BlockIds` stored it
+twice -- forward `(run, offset)` per rank and a separate inverse (rank
+samples + deltas) -- at 1.71 bytes/term. Following Barbay & Navarro
+(compressed permutations by runs), `BlockIds` now stores only the label
+sequence (each rank's run, runs numbered in base order) as a wavelet
+matrix: `bits(runs - 1)` bit vectors, each with a cumulative popcount
+every 256 bits. `id(rank) = base[c] + (occurrences of c before rank)` is
+one top-down `rank` pass; `rank(id)` finds the run by binary search over
+the bases, then one bottom-up `select` pass. No offsets and no separate
+inverse; `Implicit` and the `For` fallback are unchanged.
+
+Encoding cost mattered: decoding a block with per-rank `get` (a `rank`
+query per level per entry) made 10M-line insertion 18.39 -> 22.6s; a bulk
+decoder (undo each level's stable partition bottom-up, then hand out each
+run's ids) and reused partition buffers brought it to 20.0s.
+
+Same corpus, packed:
+
+| | before | after |
+|---|---|---|
+| logical size, 10M lines | 42.13 MiB | **35.83 MiB** |
+| logical size, full file sequential | 44.01 MiB | **36.83 MiB (5.61 B/term)** |
+| logical size, full file 7 + 5 | 45.51 MiB | 36.50 MiB |
+| insertion, 10M / full sequential | 18.39 / 27.9s | 20.0 / 30.9s |
+| wall, full file 7 + 5 | 12.1s | 12.4s |
+| get_term / get_id, 10M | ~1,386 / ~1,207 ns | ~1,456 / ~1,300 ns |
+| single-term insert / remove | 37 / 32 us | 53 / 48 us |
+
+Not done: the global run -> block range map that would replace `SlotMap`
+(0.59 -> ~0.1-0.2 bytes/term) -- it needs an interval map maintained
+through splits and removals.
+
+## path compression and FSST-coded chain labels
+
+The automaton walk was ~57% of a lookup: one record per term byte (~59),
+because 91% of states are single-transition. **Chain records** (header
+`0x00`) store a run of single-transition, non-final states as one label
+plus a target. Only compaction creates them: `compact_and_chain` runs the
+exact-minimization pass, then `chain_up` folds every run of
+single-transition non-final states with in-degree 1 (shared states are
+never absorbed, so the automaton stays exactly minimal;
+`reachable_state_count` counts one state per label byte). Mutation stays
+per-byte: `insert`/`insert_sorted`/`remove` first `unchain` (O(records),
+once per block after a compaction). Reads consume a whole chain per step
+(`rank`/`lower_bound` match it against the query, `term_at`/stream/
+`decode_ranks` append it). Chaining is done only at the end of a load
+(`shrink_to_fit` -> `PackedAutomatonBlock::finish`): chaining on
+growth-triggered compactions made the next merge unchain again (+20%
+insertion at 10M lines). Dense address-indexed vectors instead of hash
+maps in the compaction passes cut that pass's cost by more than half.
+
+Raw labels cost a chain header and lose the folded 1-byte single-record
+form, so chains alone grew the dictionary 2%. **FSST** (`src/fsst.rs`,
+after Boncz, Neumann, Leis 2020) codes chain labels with a 255-symbol
+table (1-8 byte symbols, code 255 escapes a literal), trained once per
+dictionary at the first `shrink_to_fit` on up to 64 sampled blocks' chain
+labels (<= 1 MB); a label is coded only when shorter. Matching compares a
+symbol against 8 query bytes with one masked XOR; decoding copies whole
+8-byte symbol slots.
+
+10M lines, sequential, three variants:
+
+| | size | get_term / get_id | insertion |
+|---|---|---|---|
+| target 2 only | 35.83 MiB | 1,456 / 1,302 ns | 20.0s |
+| + chains, raw labels | 36.59 MiB | 1,226 / 1,170 ns | 21.2s |
+| + FSST-coded labels | **32.84 MiB** | 1,327 / 1,297-1,330 ns | 21.8s |
+
+Full file (36.2M triples, 6.88M terms), before targets 2 and 3 -> after,
+with `Dictionary` (fst) for reference:
+
+| | packed before | packed after | `Dictionary` |
+|---|---|---|---|
+| logical size, sequential | 44.01 MiB | **33.90 MiB (5.17 B/term)** | 79.41 MiB |
+| logical size, 7 parsers + 5 writers | 45.51 MiB | **32.93 MiB** | 78.53 MiB |
+| insertion, sequential | 27.9s | 33.7s | 79.7s |
+| wall time, 7 + 5 | 12.1s | 14.3s | 28.7s |
+| get_term / get_id, sequential | 1,300 / 1,185 ns | 1,284 / 1,279 ns | 1,490 / 1,616 ns |
+| single-term insert / remove | 37 / 32 us | 88 / 49 us | 279-302 / 239-257 us |
+| peak RSS, sequential | 106 MiB | 103 MiB | 141 MiB |
+
+Retained allocation is 7% above logical size now (36.27 vs 33.90 MiB),
+up from 2-4%: not yet investigated. Open: a chain-aware mutation path
+(avoiding `unchain` on the first change to a chained block), and the
+global run -> block map that would replace `SlotMap`.
