@@ -14,13 +14,32 @@
 //! structure, like a B-tree of height two): an edit moves at most one
 //! leaf's entries, a lookup is two binary searches.
 
-const NONE: u32 = u32::MAX;
+use std::num::NonZeroU32;
+
+/// A breakpoint's value: the block slot, stored as `slot + 1` so that "no
+/// block" is `None` (and `Option<Slot>` stays 4 bytes) rather than a
+/// sentinel slot number.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Slot(NonZeroU32);
+
+impl Slot {
+    #[inline]
+    fn new(slot: u32) -> Slot {
+        debug_assert!(slot < u32::MAX, "block slots stay below u32::MAX");
+        Slot(NonZeroU32::MIN.saturating_add(slot))
+    }
+
+    #[inline]
+    fn get(self) -> u32 {
+        self.0.get() - 1
+    }
+}
 const LEAF_MAX: usize = 512;
 
 #[derive(Debug, Clone, Default)]
 pub(crate) struct RangeMap {
-    /// Breakpoints `(start, slot or NONE)`, sorted; every leaf non-empty.
-    leaves: Vec<Vec<(u32, u32)>>,
+    /// Breakpoints `(start, block or none)`, sorted; every leaf non-empty.
+    leaves: Vec<Vec<(u32, Option<Slot>)>>,
     /// First start of each leaf.
     firsts: Vec<u32>,
 }
@@ -30,12 +49,12 @@ impl RangeMap {
         RangeMap::default()
     }
 
-    /// The value (slot or NONE) at `x`.
+    /// The value at `x`.
     #[inline]
-    fn value_at(&self, x: u32) -> u32 {
+    fn value_at(&self, x: u32) -> Option<Slot> {
         let leaf = self.firsts.partition_point(|&f| f <= x);
         if leaf == 0 {
-            return NONE;
+            return None;
         }
         let entries = &self.leaves[leaf - 1];
         entries[entries.partition_point(|e| e.0 <= x) - 1].1
@@ -45,7 +64,7 @@ impl RangeMap {
     #[inline]
     pub(crate) fn get(&self, id: u32) -> Option<u32> {
         let v = self.value_at(id);
-        (v != NONE).then_some(v)
+        v.map(Slot::get)
     }
 
     /// Removes every breakpoint starting in `a..=b`.
@@ -67,7 +86,7 @@ impl RangeMap {
     }
 
     /// Inserts a breakpoint at `start` (none may exist there).
-    fn insert_point(&mut self, start: u32, value: u32) {
+    fn insert_point(&mut self, start: u32, value: Option<Slot>) {
         if self.leaves.is_empty() {
             self.leaves.push(vec![(start, value)]);
             self.firsts.push(start);
@@ -85,12 +104,12 @@ impl RangeMap {
         }
     }
 
-    /// Sets ids `a..b` to `value` (slot or NONE), merging with equal
+    /// Sets ids `a..b` to `value`, merging with equal
     /// neighbors so each run stays one breakpoint.
-    fn set_range(&mut self, a: u32, b: u32, value: u32) {
+    fn set_range(&mut self, a: u32, b: u32, value: Option<Slot>) {
         debug_assert!(a < b);
         let after = self.value_at(b);
-        let before = if a == 0 { NONE } else { self.value_at(a - 1) };
+        let before = if a == 0 { None } else { self.value_at(a - 1) };
         self.remove_points(a, b);
         if before != value {
             self.insert_point(a, value);
@@ -103,7 +122,7 @@ impl RangeMap {
     /// Records `slot` for every id in `ids` (any order; sorted and
     /// deduplicated in place), one range per run of consecutive ids.
     pub(crate) fn assign(&mut self, slot: u32, ids: &mut Vec<u32>) {
-        debug_assert!(slot != NONE);
+        let value = Some(Slot::new(slot));
         ids.sort_unstable();
         ids.dedup();
         let mut start = 0;
@@ -112,18 +131,18 @@ impl RangeMap {
             while end < ids.len() && ids[end] == ids[end - 1] + 1 {
                 end += 1;
             }
-            self.set_range(ids[start], ids[end - 1] + 1, slot);
+            self.set_range(ids[start], ids[end - 1] + 1, value);
             start = end;
         }
     }
 
     #[cfg(test)]
     pub(crate) fn set(&mut self, id: u32, slot: u32) {
-        self.set_range(id, id + 1, slot);
+        self.set_range(id, id + 1, Some(Slot::new(slot)));
     }
 
     pub(crate) fn clear(&mut self, id: u32) {
-        self.set_range(id, id + 1, NONE);
+        self.set_range(id, id + 1, None);
     }
 
     /// Logical size: 8 bytes per breakpoint plus per-leaf index entries.
@@ -134,7 +153,7 @@ impl RangeMap {
     /// Repacks leaves full (to `LEAF_MAX / 2 .. LEAF_MAX` entries' worth of
     /// capacity, exactly sized).
     pub(crate) fn shrink_to_fit(&mut self) {
-        let all: Vec<(u32, u32)> = self.leaves.drain(..).flatten().collect();
+        let all: Vec<(u32, Option<Slot>)> = self.leaves.drain(..).flatten().collect();
         self.firsts.clear();
         for chunk in all.chunks(LEAF_MAX) {
             self.firsts.push(chunk[0].0);
@@ -189,7 +208,7 @@ mod tests {
                 }
                 // Equal neighbors are merged: no two adjacent breakpoints
                 // share a value.
-                let all: Vec<(u32, u32)> = map.leaves.iter().flatten().copied().collect();
+                let all: Vec<(u32, Option<Slot>)> = map.leaves.iter().flatten().copied().collect();
                 assert!(all.windows(2).all(|w| w[0].1 != w[1].1 && w[0].0 < w[1].0));
             }
         }

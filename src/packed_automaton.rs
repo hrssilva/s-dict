@@ -9,6 +9,7 @@
 //! and DESIGN.md for every measurement behind it.
 
 use std::hash::Hasher;
+use std::num::NonZeroU32;
 
 /// A fast, non-cryptographic hasher for `register` -- std's default
 /// `HashMap` hasher (`SipHash`) is deliberately slow, traded for DoS
@@ -118,8 +119,9 @@ const REGISTRY_WAYS: usize = 2;
 struct RegistryCell {
     /// High half of the signature hash (the low bits pick the bucket).
     tag: u32,
-    /// Record address + 1; 0 marks an empty cell.
-    target_plus_one: u32,
+    /// The record's address + 1 (`None`: empty cell; a zeroed cell is
+    /// empty).
+    target: Option<NonZeroU32>,
 }
 
 impl PackedRegistry {
@@ -150,7 +152,7 @@ impl PackedRegistry {
     fn candidates(&mut self, hash: u64) -> [Option<u32>; REGISTRY_WAYS] {
         let tag = (hash >> 32) as u32;
         self.bucket(hash)
-            .map(|c| (c.target_plus_one != 0 && c.tag == tag).then(|| c.target_plus_one - 1))
+            .map(|c| c.target.filter(|_| c.tag == tag).map(|t| t.get() - 1))
     }
 
     /// Marks way `way` of `hash`'s bucket most recently used.
@@ -166,7 +168,7 @@ impl PackedRegistry {
         bucket.rotate_right(1);
         bucket[0] = RegistryCell {
             tag: (hash >> 32) as u32,
-            target_plus_one: target + 1,
+            target: Some(NonZeroU32::MIN.saturating_add(target)),
         };
     }
 
@@ -175,7 +177,7 @@ impl PackedRegistry {
     #[cfg(test)]
     fn len(&self) -> usize {
         let used = (self.mask + 1).min(self.buckets.len());
-        self.buckets[..used].iter().flatten().filter(|c| c.target_plus_one != 0).count()
+        self.buckets[..used].iter().flatten().filter(|c| c.target.is_some()).count()
     }
 }
 
@@ -1717,16 +1719,16 @@ fn signature_hash(is_final: bool, children: &[(u8, u32, u32)]) -> u64 {
 /// `HashMap<(bool, Vec<..>), u32>` allocated a `Vec` key per record.
 #[derive(Debug, Default)]
 struct DedupTable {
-    /// The active table (a power of two, at least `MIN_SLOTS`); its
-    /// allocation is kept across `clear`s.
-    slots: Vec<(u64, u32)>,
+    /// The active table (a power of two, at least `MIN_SLOTS`) of `(hash,
+    /// address + 1)`, `None` marking an empty slot; its allocation is kept
+    /// across `clear`s.
+    slots: Vec<(u64, Option<NonZeroU32>)>,
     /// The previous table while growing, kept for its allocation.
-    spare: Vec<(u64, u32)>,
+    spare: Vec<(u64, Option<NonZeroU32>)>,
     len: usize,
 }
 
 impl DedupTable {
-    const EMPTY: u32 = u32::MAX;
     const MIN_SLOTS: usize = 256;
 
     /// Empties the table back to `MIN_SLOTS` slots. Only the active slots
@@ -1734,7 +1736,7 @@ impl DedupTable {
     /// later one pay to clear its table.
     fn clear(&mut self) {
         self.slots.clear();
-        self.slots.resize(Self::MIN_SLOTS, (0, Self::EMPTY));
+        self.slots.resize(Self::MIN_SLOTS, (0, None));
         self.len = 0;
     }
 
@@ -1742,10 +1744,8 @@ impl DedupTable {
         let mask = self.slots.len() - 1;
         let mut i = hash as usize & mask;
         loop {
-            let (h, pos) = self.slots[i];
-            if pos == Self::EMPTY {
-                return None;
-            }
+            let (h, stored) = self.slots[i];
+            let pos = stored?.get() - 1;
             if h == hash && matches(pos) {
                 return Some(pos);
             }
@@ -1758,25 +1758,24 @@ impl DedupTable {
             let doubled = self.slots.len() * 2;
             std::mem::swap(&mut self.slots, &mut self.spare);
             self.slots.clear();
-            self.slots.resize(doubled, (0, Self::EMPTY));
+            self.slots.resize(doubled, (0, None));
             self.len = 0;
             for i in 0..self.spare.len() {
-                let (h, p) = self.spare[i];
-                if p != Self::EMPTY {
-                    self.place(h, p);
+                if let (h, Some(stored)) = self.spare[i] {
+                    self.place(h, stored);
                 }
             }
         }
-        self.place(hash, pos);
+        self.place(hash, NonZeroU32::MIN.saturating_add(pos));
     }
 
-    fn place(&mut self, hash: u64, pos: u32) {
+    fn place(&mut self, hash: u64, stored: NonZeroU32) {
         let mask = self.slots.len() - 1;
         let mut i = hash as usize & mask;
-        while self.slots[i].1 != Self::EMPTY {
+        while self.slots[i].1.is_some() {
             i = (i + 1) & mask;
         }
-        self.slots[i] = (hash, pos);
+        self.slots[i] = (hash, Some(stored));
         self.len += 1;
     }
 }
