@@ -8,7 +8,7 @@
 //! of a load. See the `PackedAutomaton` doc comment for the record layout,
 //! and DESIGN.md for every measurement behind it.
 
-use std::hash::{Hash, Hasher};
+use std::hash::Hasher;
 
 /// A fast, non-cryptographic hasher for `register` -- std's default
 /// `HashMap` hasher (`SipHash`) is deliberately slow, traded for DoS
@@ -1687,11 +1687,19 @@ fn write_leb128(bytes: &mut Vec<u8>, mut value: u32) {
     }
 }
 
+/// Hash of a record's signature: one FxHash round per transition (byte,
+/// output and target packed into one word; overlapping bits only cost hash
+/// quality, since hits are verified against the record), then a fold so
+/// the low bits (registry bucket) depend on every word, not only the high
+/// bits (registry tag).
 fn signature_hash(is_final: bool, children: &[(u8, u32, u32)]) -> u64 {
     let mut hasher = FxHasher::default();
-    is_final.hash(&mut hasher);
-    children.hash(&mut hasher);
-    hasher.finish()
+    hasher.add((children.len() as u64) << 1 | u64::from(is_final));
+    for &(byte, output, target) in children {
+        hasher.add(u64::from(target) << 32 ^ u64::from(output) << 8 ^ u64::from(byte));
+    }
+    let h = hasher.finish();
+    (h ^ h >> 32).wrapping_mul(FX_SEED)
 }
 
 /// `compact`'s exact dedup: open addressing over `(signature hash, new
