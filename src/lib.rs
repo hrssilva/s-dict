@@ -23,6 +23,7 @@ mod automaton_block;
 mod automaton_dictionary;
 mod batch;
 mod block;
+mod block_ids;
 mod dictionary;
 mod entries_arena;
 mod front_coded_block;
@@ -32,6 +33,7 @@ mod packed_automaton_block;
 mod packed_automaton_dictionary;
 mod plain;
 mod reverse_map;
+mod sharded;
 
 pub use automaton_dictionary::{AutomatonBlockId, AutomatonDictionary};
 pub use batch::{PreparedBatch, TermBatch};
@@ -39,6 +41,7 @@ pub use dictionary::{BlockId, Dictionary, RebuildStats};
 pub use front_coded_dictionary::{FrontCodedBlockId, FrontCodedDictionary};
 pub use packed_automaton_dictionary::{PackedAutomatonBlockId, PackedAutomatonDictionary};
 pub use plain::PlainDictionary;
+pub use sharded::{ShardRouter, ShardedDictionary};
 
 /// Not part of this crate's public API -- thin wrappers exposing
 /// otherwise-`pub(crate)` construction primitives to `examples/

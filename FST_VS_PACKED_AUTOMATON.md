@@ -31,9 +31,13 @@ survey) and `DESIGN.md` (every measurement, in full, with methodology).
 | Memory at scale (clustered, 2M terms) | 12.92 bytes/term, flat | 14.7-14.8 bytes/term, flat-ish |
 | Memory at scale (hashlike, 300K terms) | ~29.8 bytes/term, flat | ~104-109 bytes/term, flat (was ~104-132, growing, before the dedup-structure fix) |
 | Dead/unreachable state reclamation | n/a -- always freshly rebuilt | `compact`: copy reachable records with exact dedup (yields the *minimal* automaton); on growth >2x per merge, and for every block in `shrink_to_fit` |
-| Real RDF, 6.3M terms, each at its default blocks: logical size | 88.7 MiB (64..=256) | **87.6 MiB** (256..=1024, 90% split fill; 322.6 before the record format, compaction, reverse-map packing and block changes) |
-| Real RDF, 6.3M terms: insertion (prepared batches, 1 writer) | 47.7s | **22.1s** (incl. final compaction) |
-| Real RDF, 6.3M terms: get_term / get_id (dictionary level) | 1,550 / 1,703 ns | **1,089 / 1,269 ns** |
+| Real RDF, 6.3M terms, each at its default blocks: logical size | 88.7 MiB (64..=256) | **77.0 MiB** (256..=1024, 90% split fill, folded labels; 322.6 before the record format, compaction, reverse-map packing, block and label changes) |
+| Real RDF, full file (6.88M terms): logical size | 79.4 MiB (compressed reverse map) | **46.4 MiB** (compressed block ids and reverse map) |
+| Real RDF, full file: insertion, 1 writer / wall time, 4 parsers + 8 writers | 81.5s / 25.5s | **35.1s / 15.9s** |
+| Real RDF, 6.3M terms: insertion (prepared batches, 1 writer) | 47.7s | **22.2s** (incl. final compaction) |
+| Real RDF, 6.3M terms: get_term / get_id (dictionary level) | 1,550 / 1,703 ns | **1,116-1,156 / 1,138-1,195 ns** |
+| Real RDF, 6.3M terms: peak RSS (1 writer) | 134 MiB | **131 MiB** |
+| Real RDF, 6.3M terms: wall time, 4 parsers + 8 writers (`ShardedDictionary`) | 12.8s | **6.9s** |
 | Real RDF, 6.3M terms: single-term insert / remove | 296 / 219 us | **22.5 / 19.9 us** |
 
 ## Algorithm and minimization
@@ -182,9 +186,13 @@ immediately below, and **no** subtree counts are stored at all -- they're
 derived top-down from the root's `term_count` and each parent's outputs
 while descending (`open_frame`), which `insert`/`insert_sorted` already
 do. All of it is compatible with append-only incremental mutation.
-Label folding (the remaining -2.1) and fixed-width transitions for
-high-degree states (Lucene's approach, for binary search) are open; see
-DESIGN.md's "fst-style record encoding".
+Label folding was adopted afterwards: a single-transition, non-final
+record whose label is in a curated 63-byte RDF table keeps the label in
+its header byte (`fst`'s `StateOneTrans*` common-input trick) --
+-12% dictionary size on real RDF; see DESIGN.md's "label folding".
+Fixed-width transitions for high-degree states (Lucene's approach, for
+binary search) remain open.
+
 ## Mutability
 
 `fst` has none. `Builder` (`vendor/fst/src/raw/build.rs:43-73`) requires

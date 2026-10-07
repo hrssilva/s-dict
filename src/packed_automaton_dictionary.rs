@@ -112,7 +112,7 @@ impl PackedAutomatonDictionary {
             blocks: Vec::new(),
             free_block_slots: Vec::new(),
             directory: Vec::new(),
-            id_to_block: ReverseMap::new(block_max),
+            id_to_block: ReverseMap::new(),
             free_term_ids: Vec::new(),
             next_term_id: 0,
             block_min,
@@ -163,7 +163,7 @@ impl PackedAutomatonDictionary {
             .blocks
             .iter()
             .filter_map(|b| b.as_ref())
-            .map(|b| b.payload_bytes() + b.len() * std::mem::size_of::<TermId>())
+            .map(|b| b.payload_bytes() + b.ids_bytes())
             .sum();
         let directory_bytes: usize = self
             .directory
@@ -279,18 +279,18 @@ impl PackedAutomatonDictionary {
     }
 
     fn assign_ranks(&mut self, block_id: PackedAutomatonBlockId, skip: usize) {
-        // A block over `block_max` (a batch run can overshoot by far more
-        // than `ReverseMap`'s rank bits allow) is always about to be split
-        // by `split_while_oversized`, which assigns every chunk from rank
-        // 0 -- so only settled blocks are assigned.
+        // A block over `block_max` is always about to be split by
+        // `split_while_oversized`, which assigns every chunk from rank 0 --
+        // assigning it here would be wasted work.
         if self.block(block_id).len() > self.block_max {
             return;
         }
-        let len = self.block(block_id).len();
-        for local_rank in skip..len {
-            let id = self.block(block_id).id_at(local_rank);
-            self.set_id_to_block(id, block_id, local_rank);
-        }
+        let block = self.blocks[block_id.slot() as usize]
+            .as_ref()
+            .expect("PackedAutomatonBlockId must reference a live block");
+        let len = block.len();
+        self.id_to_block
+            .assign(block_id.slot(), (skip..len).map(|rank| (block.id_at(rank).0, rank)));
     }
 
     fn refresh_directory_key(
@@ -425,9 +425,8 @@ impl PackedAutomatonDictionary {
                 PackedAutomatonBlock::build((start..end).map(term).zip(chunk_ids.iter().copied()));
             let min_key: Box<str> = block.min_key().into();
             let block_id = self.alloc_block(block);
-            for (local_rank, &id) in chunk_ids.iter().enumerate() {
-                self.set_id_to_block(id, block_id, local_rank);
-            }
+            self.id_to_block
+                .assign(block_id.slot(), chunk_ids.iter().enumerate().map(|(rank, id)| (id.0, rank)));
             self.directory.push((min_key, block_id));
             self.len += end - start;
             start = end;

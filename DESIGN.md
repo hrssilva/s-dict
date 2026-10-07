@@ -4318,3 +4318,206 @@ Final, each dictionary at its default, same corpus:
 arrive first, so the two 12-worker runs held different term sets -- 4.40M
 vs 4.29M -- and their sizes aren't comparable.) Peak RSS at 10M, 1 writer:
 144 vs 134 MiB.
+
+## label folding
+
+The last measured encoding step (fresh-graph re-emission: -2.05
+bytes/term). Single-transition, non-final records -- 91% of states,
+mostly unique term tails -- now have their own header form, `1 N cccccc`:
+N is NEXT, `cccccc` the label's code in a 63-entry table (0: label byte
+stored below). All other records use `0 F nnnnnn` (final flag, count with
+the existing escape) and no longer carry NEXT -- a single-transition
+*final* state is rare (dozens in 6.3M terms), so nothing measurable was
+lost.
+
+Which 63 labels (same private real-RDF corpus, 10M triples, one writer):
+
+| table | logical size | insertion |
+|---|---|---|
+| none (new header layout only) | 87.56 MiB | 21.9s |
+| `fst`'s `COMMON_INPUTS` (general text; no `<>"#@`) | 78.01 MiB | 22.0s |
+| curated RDF (`RDF_LABELS`: digits, a-z, `<>"/:.#-_@%^`, space, 14 capitals) | **77.02 MiB** | 22.3s |
+| adaptive: top 63 bytes of the first batch's term text | 77.74 MiB | 22.6s |
+
+The adaptive table lost because term-text byte frequency isn't
+single-transition-label frequency. The curated table is a constant with
+nothing derived from any dataset. (The public W3C `rdf-tests` corpus was
+considered as a source and rejected: 159 KB, missing common bytes such as
+`7`, `k`, `z`, and full of test-specific punctuation.)
+
+Result vs `Dictionary` (fst) at each default, one writer:
+
+| triples | `Dictionary` | packed |
+|---|---|---|
+| 1M | 11.25 MiB | **9.65 MiB** (-14%) |
+| 5M | 68.94 MiB | **59.16 MiB** (-14%) |
+| 10M | 88.71 MiB | **77.02 MiB** (-13%) |
+
+Peak RSS at 10M: 131 MiB vs `Dictionary`'s 134. Lookups: `get_term`
+1,116-1,156 ns over two runs (1,064-1,089 before folding; `Dictionary`
+1,550), `get_id` 1,138-1,195 ns. Insertion and single-term mutation
+unchanged (22.2s; ~20 / ~18 us).
+
+Remaining: sharding the single writer by key range (both dictionaries
+are writer-bound with 12 parser workers), and fixed-width transitions on
+wide states for the in-cache hashlike `term_at_into` regression.
+
+## sharding the writer
+
+Every dictionary here has one writer. With 12 parser workers both were
+writer-bound (`Dictionary` 48.3s, packed 22.3s wall for the first 10M
+lines of the same private real-RDF corpus, versus 57.7s / 29.5s fully
+sequential). `ShardedDictionary<D>` (`src/sharded.rs`) holds N independent
+dictionaries, each owning one key range: `shard_of` is a binary search
+over N-1 bounds, a global `TermId` carries the shard in its top bits
+(`global_id`/`split_id`, asserting the local id fits), and it implements
+`TermDictionary` like the others. `router()` gives parser workers an owned
+copy of the routing while writer threads hold `shards_mut()`.
+`s-bench`'s `nt_dict_file_bench` drives it: parsers route each term into
+per-shard `TermBatch`es, and each writer thread inserts its shards' batches.
+
+What it took to make that scale, in order:
+
+1. **Comparable inputs.** A running triple cap with parallel workers stops
+   at whichever batches arrive first, so configurations loaded different
+   term sets. Capped runs now parse a byte prefix (the first N lines, found
+   before timing): every configuration loads the same 6,274,377 terms.
+2. **Balanced shards.** Bounds at quantiles of a 65,536-triple sample put
+   49% of the terms in one of 4 shards. A sample includes a distinct term
+   with probability proportional to its occurrences, so regions dense in
+   once-used terms are under-weighted. Taking quantiles over the sample's
+   singletons (Good-Turing) didn't fix it, nor did reshaping the sample
+   (64x1024, 4096x16, 16384x4, 65536x1 triples: the same 1.82M-term first
+   shard of 8). An unbiased distinct sample would need a full pre-pass.
+   Instead: 32 fine shards per writer, dealt round-robin, which spreads any
+   dense region over every writer. That also absorbed a second imbalance:
+   at equal term counts, per-shard insertion cost varied ~7x (correlation
+   with term count 0.69, with occurrences or bytes ~0) -- consistent with
+   key regions arriving in random order touching every block each batch --
+   and heavy shards cluster in key order. Busy time per writer at 8 shards
+   per writer: 3-14s; at 32: within 15% of each other.
+3. **Removing the bench's own contention.** The counting allocator updated
+   one shared atomic on every allocation; with 8+ threads allocating, that
+   cache line more than doubled writer time (6 parsers + 6 writers: 14.0s
+   -> 6.6s wall when switched off). It now counts only bytes freed while
+   the finished dictionary is dropped -- nothing during timed phases.
+   (Earlier multi-threaded numbers carried this overhead for both
+   dictionaries alike; single-threaded ones ~6%.)
+4. **Bounded queues.** Per-writer queues of `2 x parsers x 32` sub-batches
+   buffered ~8 parser batches per writer (1.3 GB peak RSS). One parser
+   batch per writer: 0.50 GB peak, ~15% slower.
+
+Result, first 10M lines (6.27M terms), wall time:
+
+| parsers + writers | `Dictionary` (fst) | packed |
+|---|---|---|
+| 1 + 1 (sequential) | 57.7s | 29.5s |
+| 12 + 1 | 48.3s | 22.3s |
+| 8 + 4 | 15.6s | 7.5s |
+| 6 + 6 | 13.6s (13.5s bounded queues) | 6.9s (7.4s) |
+| 4 + 8 | 11.9s (12.8s) | 6.0s (6.9s) |
+
+(6-core / 12-thread laptop CPU; all-core clocks are well below its
+single-core boost, so per-thread work inflates as threads are added.)
+Logical size is unchanged by sharding (packed 77.0 MiB, fst 88.6-88.8);
+retained allocation +3.7 MiB for packed at 256 shards (per-shard tables).
+Lookups unchanged except `get_id`'s routing step (packed 1,117 -> 1,270
+ns); single-term insert 19 -> 25 us. Peak RSS with bounded queues:
+packed 499 MiB, fst 464 MiB (the 12 + 1 runs: 599 / 580).
+
+## block id encoding
+
+Each block's `rank -> TermId` array was a plain `Vec<TermId>`: 4 bytes per
+term, a third of packed's size. In a bulk load each batch assigns new ids
+in sorted key order and a block covers a contiguous key range, so the
+terms one batch adds to one block get consecutive ids that increase with
+rank: a block's ids are a few such runs, interleaved. Measured on the full
+private real-RDF corpus (6.88M terms, 8,847 blocks): 11.1 runs per block,
+mean length 70, 2% singleton runs, 27% of blocks a single run, and 100% of
+runs increasing with rank. Candidate encodings (bytes/term):
+
+| encoding | bytes/term |
+|---|---|
+| raw `u32` | 4.00 |
+| global bit-packing (23 bits) | 2.88 |
+| FOR per block | 2.18 |
+| FOR per 128 (BP128-style) / PFOR per 128 | 2.04 / 2.04 |
+| delta + zigzag FOR per 128 | 1.91 |
+| run table: `bases[run] + offset` | 1.38 |
+| run table, single-run blocks implicit | **0.98** |
+| run index only, offset by counting (not O(1)) | 0.39 |
+
+The FOR family sees the interleaving as noise. `BlockIds`
+(`src/block_ids.rs`) implements the 0.98 row: per block, the smallest of
+`Implicit` (`id = base + rank`), `Runs` (bit-packed `(run, offset)` plus a
+base table) and `For` (block minimum plus bit-packed offsets, the fallback
+for single-term inserts or reused ids). Runs are found greedily in rank
+order -- an id continues the open run expecting it, or starts one -- so
+every run is monotone and offsets are exact for any id order; only the
+size depends on structure. Access is O(1). Merges and removes decode,
+edit and re-encode (both were already O(block)).
+
+Full file, same corpus (`nt_dict_file_bench`, 36.2M triples, 6.88M terms):
+
+| | `Dictionary` (fst) | packed, before | packed, now |
+|---|---|---|---|
+| logical size, sequential | 93.81 MiB (14.30 B/term) | 81.44 MiB | **61.76 MiB (9.41 B/term)** |
+| logical size, 4 parsers + 8 writers | 94.48 MiB | 81.58 MiB | **63.58 MiB** |
+| wall time, 4 + 8 | 24.5s | 15.4s | **13.4s** |
+| insertion, sequential | 81.8s | 38.2-39.0s | **31.5s** |
+| get_term / get_id, sequential | 1,513-2,191 / 1,734-2,296 ns | 995 / 1,111 ns | 986 / 1,110 ns |
+| single-term insert / remove | 242-461 / 217-346 us | 19-25 / 17-18 us | 29-36 / 27-28 us |
+| peak RSS, sequential | 143 MiB | 143 MiB | 129 MiB |
+
+(`Dictionary`'s ranges span this and the previous full-file run; its code
+didn't change, the spread is this laptop's thermal/page-cache state.)
+Packed is now 34% smaller than `Dictionary`. The cost: single-term
+mutations re-encode a block's ids (~+10 us). The sharded layout is ~2 MiB
+larger (256 shards cut some runs, and each shard has its own id space).
+
+## reverse map encoding
+
+`ReverseMap` (`TermId -> (block slot, local rank)`, shared by `Dictionary`
+and packed) was one `u32` per id: 4 bytes/term, packed's largest fixed
+cost after block-id compression. The same batch structure applies: a
+batch's ids for one block are consecutive with increasing ranks, so 64
+consecutive ids fall in few blocks. Measured candidates on the full
+private real-RDF corpus (6.88M ids; 98,186 id runs, 70 ids each -- exactly
+`BlockIds`' runs seen from the other side):
+
+| reverse map | bytes/term | id -> term |
+|---|---|---|
+| packed `u32` | 4.00 | O(1) |
+| global bit-packing (14 slot + 10 rank bits) | 3.00 | O(1) |
+| per-64-id chunk: slot table + rank FOR + live bit | 1.41 | O(1) |
+| per-128 / per-256 chunks | 1.49 / 1.60 | O(1) |
+| id-run range map + rank deltas | 0.67 | binary search + prefix sum |
+| id-run range map, ranks via `BlockIds` select | 0.08 | O(block) scan |
+
+Chosen: per-64-id chunks (O(1), local maintenance). Ranks shift on every
+merge, so writes go through `assign` (sort by id, rewrite each touched
+chunk once): the full load made 51,876 rank-assignment calls touching
+1.11M chunks (~21 per call), so per-call batching -- not per-entry
+rewrites -- is what keeps this cheap. Chunks live in one `u64` pool,
+rewritten in place when they fit, else appended; garbage is compacted past
+half the pool and in `shrink_to_fit`. Per-chunk FOR ranks also removed the
+old `2 x block_max` rank-bit limit.
+
+Full file (36.2M triples, 6.88M terms; `nt_dict_file_bench`):
+
+| | `Dictionary` (fst) before / now | packed before / now |
+|---|---|---|
+| logical size, sequential | 93.81 / **79.41 MiB** | 61.76 / **46.38 MiB (7.07 B/term)** |
+| logical size, 4 parsers + 8 writers | 94.48 / 80.20 MiB | 63.58 / 48.50 MiB |
+| insertion, sequential | 81.8 / 81.5s | 31.5 / 35.1s |
+| wall time, 4 + 8 (warm page cache) | 24.5 / 25.5s | 13.4 / 15.9s |
+| get_term / get_id, sequential | 1,513-2,191 / 1,530-2,296 ns | 986 / 1,110 -> 1,034 / 1,125 ns |
+| single-term insert / remove | 242-461 / 217-346 us -> 296 / 231 us | 29-36 / 27-28 -> 52-57 / 50 us |
+
+Packed is now 42% smaller than `Dictionary` (46.4 vs 79.4 MiB); the
+reverse map went from 4 to ~1.66 bytes/term (headers and 32-bit slot
+table entries above the 1.41 estimate). Costs: each rank reassignment
+re-encodes ~21 chunks (writer time +25% sharded, sequential insertion
++3.6s, single-term mutations +~23 us); lookups ~+5%. (One 4 + 8 run read
+the file with a cold page cache: 30.3s wall, parsers' summed time 94.9s
+instead of ~43s, writers unchanged; the warm rerun is reported.)

@@ -128,7 +128,7 @@ impl Dictionary {
             blocks: Vec::new(),
             free_block_slots: Vec::new(),
             directory: Vec::new(),
-            id_to_block: ReverseMap::new(block_max),
+            id_to_block: ReverseMap::new(),
             free_term_ids: Vec::new(),
             next_term_id: 0,
             block_min,
@@ -453,9 +453,10 @@ impl Dictionary {
         entries: impl Iterator<Item = (&'a str, TermId)>,
         skip: usize,
     ) {
-        for (local_rank, (_, id)) in entries.enumerate().skip(skip) {
-            self.set_id_to_block(id, block_id, local_rank);
-        }
+        self.id_to_block.assign(
+            block_id.slot(),
+            entries.enumerate().skip(skip).map(|(rank, (_, id))| (id.0, rank)),
+        );
     }
 
     /// The directory index of the block that owns (or would own) `term`,
@@ -658,9 +659,8 @@ impl Dictionary {
             self.stats.blocks_rebuilt += 1;
             let min_key: Box<str> = block.min_key().into();
             let block_id = self.alloc_block(block);
-            for (local_rank, &id) in chunk_ids.iter().enumerate() {
-                self.set_id_to_block(id, block_id, local_rank);
-            }
+            self.id_to_block
+                .assign(block_id.slot(), chunk_ids.iter().enumerate().map(|(rank, id)| (id.0, rank)));
             self.directory.push((min_key, block_id));
             self.len += end - start;
             start = end;

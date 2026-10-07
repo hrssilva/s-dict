@@ -1497,19 +1497,24 @@ struct StagingFrame {
 /// [`PackedAutomaton::compact`], which callers trigger (see
 /// `PackedAutomatonBlock::merge_into` and DESIGN.md's "copy-compaction").
 ///
-/// Record layout (fst-style, DESIGN.md's "fst-style record encoding"):
-/// a record's address is its *last* byte, the header, and it is parsed
-/// downward from there (`fst`'s own convention), so every field can be
-/// written while appending in postorder. Header: bit 7 `is_final`, bit 6
-/// NEXT, bits 0-5 transition count (63 = escape: one more byte below
-/// holds `count - 63`). Then, per transition in byte order, reading
-/// downward: `[byte: u8]`, `[output: reversed LEB128]` (omitted for the
-/// first transition: always `is_final`), `[target delta: reversed
-/// LEB128]` (`field_start - target`; omitted when NEXT, which only
-/// single-transition records set, meaning the target is the record
-/// immediately below). No subtree counts are stored: `term_count` holds
-/// the root's, and every other state's is derived top-down while
-/// descending (`open_frame`).
+/// Record layout (fst-style, DESIGN.md's "fst-style record encoding" and
+/// "label folding"): a record's address is its *last* byte, the header,
+/// and it is parsed downward from there (`fst`'s own convention), so every
+/// field can be written while appending in postorder. Two header forms:
+///
+/// - `1 N cccccc` -- one transition, not final (91% of states on real
+///   RDF). `cccccc` is the label's code in [`RDF_LABELS`] (0: the label
+///   byte is stored below the header). N (NEXT): the target is the record
+///   immediately below; otherwise a target delta follows.
+/// - `0 F nnnnnn` -- everything else. F is `is_final`; `nnnnnn` the
+///   transition count (63 = escape: one more byte below holds
+///   `count - 63`). Then, per transition in byte order, reading downward:
+///   `[byte: u8]`, `[output: reversed LEB128]` (omitted for the first
+///   transition: always `is_final`), `[target delta: reversed LEB128]`.
+///
+/// Target deltas are `field_start - target`. No subtree counts are stored:
+/// `term_count` holds the root's, and every other state's is derived
+/// top-down while descending (`open_frame`).
 #[allow(dead_code)]
 #[derive(Clone, Debug)]
 pub(crate) struct PackedAutomaton {
@@ -2082,16 +2087,27 @@ impl PackedAutomaton {
             children.first().is_none_or(|&(_, out, _)| out == u32::from(is_final)),
             "the first output is always is_final, so it is implicit"
         );
-        let next = children.len() == 1
-            && !self.bytes.is_empty()
-            && children[0].2 as usize == self.bytes.len() - 1;
-        // Written in reverse so the record reads forward from its header
-        // downward: t_0 is nearest the header.
-        for (i, &(b, out, target)) in children.iter().enumerate().rev() {
+        if let [(byte, _, target)] = *children
+            && !is_final
+        {
+            // Single-transition form: `1 N cccccc`.
+            let next = !self.bytes.is_empty() && target as usize == self.bytes.len() - 1;
             if !next {
                 let field = self.bytes.len() as u32;
                 write_leb128_rev(&mut self.bytes, field - target);
             }
+            let code = label_table().code(byte);
+            if code == 0 {
+                self.bytes.push(byte);
+            }
+            self.bytes.push(0x80 | (u8::from(next) << 6) | code);
+            return (self.bytes.len() - 1) as u32;
+        }
+        // General form: `0 F nnnnnn`, transitions written in reverse so
+        // the record reads forward from its header downward.
+        for (i, &(b, out, target)) in children.iter().enumerate().rev() {
+            let field = self.bytes.len() as u32;
+            write_leb128_rev(&mut self.bytes, field - target);
             if i > 0 {
                 write_leb128_rev(&mut self.bytes, out);
             }
@@ -2100,10 +2116,8 @@ impl PackedAutomaton {
         if children.len() >= PACKED_COUNT_ESCAPE {
             self.bytes.push((children.len() - PACKED_COUNT_ESCAPE) as u8);
         }
-        let header = (u8::from(is_final) << 7)
-            | (u8::from(next) << 6)
-            | children.len().min(PACKED_COUNT_ESCAPE) as u8;
-        self.bytes.push(header);
+        self.bytes
+            .push((u8::from(is_final) << 6) | children.len().min(PACKED_COUNT_ESCAPE) as u8);
         (self.bytes.len() - 1) as u32
     }
 
@@ -2267,23 +2281,32 @@ impl PackedAutomaton {
 
     #[inline]
     fn is_final(&self, pos: u32) -> bool {
-        self.bytes[pos as usize] & 0x80 != 0
+        self.bytes[pos as usize] & 0xC0 == 0x40
     }
 
 
-    /// `(is_final, transition_count, next, cursor)` -- `cursor` is the
-    /// offset of the first transition's `byte` field; transitions are
-    /// parsed downward from there (see the struct doc comment).
+    /// `(is_final, transition_count, mode, cursor)` -- `cursor` is the
+    /// offset of the first transition's first field below the header;
+    /// transitions are parsed downward from there (see the struct doc
+    /// comment).
     #[inline]
-    fn header(&self, pos: u32) -> (bool, usize, bool, usize) {
+    fn header(&self, pos: u32) -> (bool, usize, RecordMode, usize) {
         let header = self.bytes[pos as usize];
         let mut cursor = (pos as usize).wrapping_sub(1);
+        if header & 0x80 != 0 {
+            let code = header & 0x3F;
+            let mode = RecordMode {
+                next: header & 0x40 != 0,
+                label: (code != 0).then(|| label_table().byte(code)),
+            };
+            return (false, 1, mode, cursor);
+        }
         let mut count = (header & 0x3F) as usize;
         if count == PACKED_COUNT_ESCAPE {
             count += self.bytes[cursor] as usize;
             cursor = cursor.wrapping_sub(1);
         }
-        (header & 0x80 != 0, count, header & 0x40 != 0, cursor)
+        (header & 0x40 != 0, count, RecordMode::GENERAL, cursor)
     }
 
     /// Sequentially scans this state's transitions for `byte`, parsing
@@ -2366,19 +2389,22 @@ impl PackedAutomaton {
     /// kind of restructuring), and this function existing is no reason
     /// to risk perturbing it again without a fresh measurement.
     ///
-    /// `first`/`is_final`/`next` come from the record's header: the first
-    /// transition's output is implicit (`is_final`), and a `next` record's
-    /// one target is the record immediately below it.
+    /// `first`/`is_final`/`mode` come from the record's header: the first
+    /// transition's output is implicit (`is_final`), a folded label isn't
+    /// stored, and a NEXT record's one target is the record immediately
+    /// below it.
     #[inline(always)]
     fn read_transition_at(
         &self,
         cursor: usize,
         first: bool,
         is_final: bool,
-        next: bool,
+        mode: RecordMode,
     ) -> (u8, u32, u32, usize) {
-        let b = self.bytes[cursor];
-        let mut cursor = cursor.wrapping_sub(1);
+        let (b, mut cursor) = match mode.label {
+            Some(label) => (label, cursor),
+            None => (self.bytes[cursor], cursor.wrapping_sub(1)),
+        };
         let output = if first {
             u32::from(is_final)
         } else {
@@ -2386,7 +2412,7 @@ impl PackedAutomaton {
             cursor = start.wrapping_sub(1);
             value
         };
-        let target = if next {
+        let target = if mode.next {
             cursor as u32
         } else {
             let (delta, start) = read_leb128_rev(&self.bytes, cursor);
@@ -2447,6 +2473,69 @@ fn write_leb128(bytes: &mut Vec<u8>, mut value: u32) {
         }
         bytes.push(byte | 0x80);
     }
+}
+
+/// What a record's header says about how to parse its transitions: NEXT
+/// (single transition, target is the record immediately below) and a
+/// label folded into the header (single transition, label not stored).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct RecordMode {
+    next: bool,
+    label: Option<u8>,
+}
+
+impl RecordMode {
+    const GENERAL: RecordMode = RecordMode {
+        next: false,
+        label: None,
+    };
+}
+
+/// The 63 labels a single-transition record can fold into its header
+/// (6-bit code `1..=63`; 0 = label stored separately) -- `fst`'s
+/// `COMMON_INPUTS` idea (`vendor/fst/src/raw/common_inputs.rs`).
+pub(crate) struct LabelTable {
+    bytes: [u8; 64],
+    codes: [u8; 256],
+}
+
+impl LabelTable {
+    const fn new(labels: &[u8; 63]) -> LabelTable {
+        let mut bytes = [0u8; 64];
+        let mut codes = [0u8; 256];
+        let mut i = 0;
+        while i < 63 {
+            bytes[i + 1] = labels[i];
+            codes[labels[i] as usize] = (i + 1) as u8;
+            i += 1;
+        }
+        LabelTable { bytes, codes }
+    }
+
+    #[inline]
+    fn code(&self, byte: u8) -> u8 {
+        self.codes[byte as usize]
+    }
+
+    #[inline]
+    fn byte(&self, code: u8) -> u8 {
+        self.bytes[code as usize]
+    }
+}
+
+/// Curated for N-Triples terms: digits, lowercase, the IRI/literal
+/// punctuation `<>"/:.#-_@%^`, space, and 14 common capitals. On real RDF
+/// (DESIGN.md's "label folding") it beat both `fst`'s own table (tuned for
+/// general text: no `<`, `>`, `"`, `#`, `@`) and a table adapted to the
+/// first batch's byte frequencies (term bytes aren't distributed like the
+/// labels of single-transition records, mostly unique tails).
+static RDF_LABELS: LabelTable = LabelTable::new(
+    b"0123456789abcdefghijklmnopqrstuvwxyz<>\"/:.#-_@%^ ABCDEFILMNPRST",
+);
+
+#[inline]
+fn label_table() -> &'static LabelTable {
+    &RDF_LABELS
 }
 
 /// `PackedAutomaton`'s header escape: a transition count `>= 63` stores
@@ -2577,8 +2666,8 @@ impl<'a> TermsStream<'a> {
 /// index, per [`PackedAutomaton::stream`]'s own doc comment.
 struct PackedStreamFrame {
     is_final: bool,
-    /// The record's NEXT flag (see `read_transition_at`).
-    next: bool,
+    /// The record's NEXT flag and folded label (see `read_transition_at`).
+    next: RecordMode,
     /// No transition visited yet (the first one's output is implicit).
     first: bool,
     yielded_final: bool,

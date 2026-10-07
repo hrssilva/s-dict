@@ -33,6 +33,7 @@
 
 use crate::TermId;
 use crate::entries_arena::EntriesArena;
+use crate::block_ids::BlockIds;
 use crate::micro_fst::PackedAutomaton;
 
 /// `merge_into` compacts a block (`PackedAutomaton::compact`) once its
@@ -59,7 +60,8 @@ pub(crate) struct PackedAutomatonBlock {
     /// Bytes per term right after the last fresh build or compaction --
     /// the baseline `merge_into` compares growth against.
     compact_bytes_per_term: f32,
-    ids: Vec<TermId>,
+    /// `rank -> TermId`, compressed (`BlockIds`: run table / FOR).
+    ids: BlockIds,
     min_key: Box<str>,
 }
 
@@ -84,7 +86,7 @@ impl PackedAutomatonBlock {
     ) -> PackedAutomatonBlock {
         let pairs: Vec<(&'a str, TermId)> = entries.collect();
         let min_key: Box<str> = pairs.first().map_or_else(Box::default, |&(t, _)| t.into());
-        let ids: Vec<TermId> = pairs.iter().map(|&(_, id)| id).collect();
+        let ids = BlockIds::new(&pairs.iter().map(|&(_, id)| id).collect::<Vec<_>>());
         let mut packed = PackedAutomaton::build_sorted(pairs.iter().map(|&(t, _)| t));
         // Blocks are long-lived: keep only what queries need.
         packed.release_construction_state();
@@ -116,7 +118,7 @@ impl PackedAutomatonBlock {
     }
 
     pub(crate) fn id_at(&self, local_rank: usize) -> TermId {
-        self.ids[local_rank]
+        self.ids.get(local_rank)
     }
 
     pub(crate) fn term_at_into(&self, local_rank: usize, buf: &mut Vec<u8>) {
@@ -132,6 +134,11 @@ impl PackedAutomatonBlock {
     /// `Block::payload_bytes`'s analog -- see `PackedAutomaton::size_bytes`'s
     /// own doc comment for exactly what's included (and, under sustained
     /// inserts, what dead-record bloat this can carry -- see DESIGN.md).
+    /// Logical size of the compressed `rank -> TermId` array.
+    pub(crate) fn ids_bytes(&self) -> usize {
+        self.ids.size_bytes()
+    }
+
     pub(crate) fn payload_bytes(&self) -> usize {
         self.packed.size_bytes()
     }
@@ -153,7 +160,7 @@ impl PackedAutomatonBlock {
         while let Some(term_bytes) = stream.next() {
             let term = std::str::from_utf8(term_bytes)
                 .expect("keys were inserted as valid UTF-8 str bytes");
-            out.push(term, self.ids[rank]);
+            out.push(term, self.ids.get(rank));
             rank += 1;
         }
     }
@@ -211,7 +218,8 @@ impl PackedAutomatonBlock {
             return self.merge_small_run(&incoming, alloc_id, resolved);
         }
 
-        let mut new_ids = Vec::with_capacity(self.ids.len() + incoming.len());
+        let old_ids = self.ids.to_vec();
+        let mut new_ids = Vec::with_capacity(old_ids.len() + incoming.len());
         let mut unchanged_prefix = None;
         let mut added = 0usize;
         let mut inc = incoming.iter().copied().peekable();
@@ -233,7 +241,7 @@ impl PackedAutomatonBlock {
                 }
             }
             let matched = inc.peek() == Some(&old_term);
-            let id = self.ids[old_rank];
+            let id = old_ids[old_rank];
             new_ids.push(id);
             if matched {
                 inc.next();
@@ -269,18 +277,19 @@ impl PackedAutomatonBlock {
         mut alloc_id: impl FnMut() -> TermId,
         mut resolved: impl FnMut(TermId),
     ) -> PackedMergeOutcome {
-        let mut new_ids = Vec::with_capacity(self.ids.len() + incoming.len());
+        let old_ids = self.ids.to_vec();
+        let mut new_ids = Vec::with_capacity(old_ids.len() + incoming.len());
         let mut new_terms: Vec<&str> = Vec::new();
         let mut unchanged_prefix = None;
         let mut copied = 0usize;
         for &term in incoming {
             let (rank, found) = self.packed.lower_bound(term);
             let rank = rank as usize;
-            new_ids.extend_from_slice(&self.ids[copied..rank]);
+            new_ids.extend_from_slice(&old_ids[copied..rank]);
             copied = rank;
             if found {
                 // Copied with the rest of the old ids at its own position.
-                resolved(self.ids[rank]);
+                resolved(old_ids[rank]);
             } else {
                 unchanged_prefix.get_or_insert(new_ids.len());
                 let id = alloc_id();
@@ -289,7 +298,7 @@ impl PackedAutomatonBlock {
                 resolved(id);
             }
         }
-        new_ids.extend_from_slice(&self.ids[copied..]);
+        new_ids.extend_from_slice(&old_ids[copied..]);
         let added = new_terms.len();
         let unchanged_prefix = unchanged_prefix.unwrap_or(new_ids.len());
         if added > 0 {
@@ -307,7 +316,7 @@ impl PackedAutomatonBlock {
         self.packed.reserve_registry(terms.len());
         self.packed.insert_sorted(terms.iter().copied());
         self.packed.release_construction_state();
-        self.ids = new_ids;
+        self.ids = BlockIds::new(&new_ids);
         self.compact_if_grown();
         if unchanged_prefix == 0 {
             self.min_key = self.term_at(0).into_boxed_str();
@@ -340,7 +349,9 @@ impl PackedAutomatonBlock {
             return None;
         }
         let old_rank = rank as usize;
-        let removed_id = self.ids.remove(old_rank);
+        let mut ids = self.ids.to_vec();
+        let removed_id = ids.remove(old_rank);
+        self.ids = BlockIds::new(&ids);
         self.packed.reserve_registry(1);
         self.packed.remove(term);
         self.packed.release_construction_state();
