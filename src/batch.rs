@@ -22,12 +22,11 @@ struct Range {
     depth: u32,
 }
 
-/// One term being sorted: its current cached key, its bytes and its input
-/// index -- self-contained, so a pass reads nothing but the term bytes.
+/// One term being sorted: its current cached key and its input index (16
+/// bytes: a batch holds one per term while it is prepared).
 #[derive(Clone, Copy)]
-struct Record<'a> {
+struct Record {
     key: u64,
-    term: &'a [u8],
     index: u32,
 }
 
@@ -67,13 +66,14 @@ impl BatchOrder {
     /// further, so a long shared prefix (namespace IRIs) is read once per
     /// 7 bytes instead of once per comparison. Ties whose terms ended are
     /// the groups. Iterative, so duplicates of a very long term can't
-    /// overflow the stack. Measured on real RDF batches (prepare alone): 154
-    /// ns/term, against 215 for a comparison sort plus a grouping pass;
+    /// overflow the stack. Measured on real RDF batches (prepare alone): 159
+    /// ns/term (154 with records holding term slices, at twice the memory),
+    /// against 215 for a comparison sort plus a grouping pass;
     /// what remains is mostly cache misses fetching term bytes.
     pub(crate) fn prepare<'a>(&mut self, len: usize, term: impl Fn(usize) -> &'a str) {
         let len32 = u32::try_from(len).expect("batch length fits u32");
-        let mut records: Vec<Record<'a>> =
-            (0..len32).map(|i| Record { key: 0, term: term(i as usize).as_bytes(), index: i }).collect();
+        let term = |r: &Record| term(r.index as usize).as_bytes();
+        let mut records: Vec<Record> = (0..len32).map(|index| Record { key: 0, index }).collect();
         self.starts.clear();
         self.work.clear();
         if len > 0 {
@@ -90,10 +90,10 @@ impl BatchOrder {
             let range = &mut records[lo as usize..hi as usize];
             let first = self.work.len();
             if range.len() <= SMALL_RANGE {
-                range.sort_unstable_by(|a, b| a.term[d..].cmp(&b.term[d..]));
+                range.sort_unstable_by(|a, b| term(a)[d..].cmp(&term(b)[d..]));
                 let mut group = 0;
                 for i in 1..range.len() {
-                    if range[i - 1].term[d..] != range[i].term[d..] {
+                    if term(&range[i - 1])[d..] != term(&range[i])[d..] {
                         self.work.push(Range { lo: lo + group as u32, hi: lo + i as u32, depth: ENDED });
                         group = i;
                     }
@@ -101,7 +101,7 @@ impl BatchOrder {
                 self.work.push(Range { lo: lo + group as u32, hi, depth: ENDED });
             } else {
                 for r in range.iter_mut() {
-                    r.key = key(r.term, d);
+                    r.key = key(term(r), d);
                 }
                 range.sort_unstable_by_key(|r| r.key);
                 let mut start = 0usize;
