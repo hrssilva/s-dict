@@ -239,10 +239,8 @@ impl BlockIds {
         for l in 0..levels as usize {
             let shift = levels as usize - 1 - l;
             let mut words = vec![0u64; bit_words];
-            for (i, &c) in cur.iter().enumerate() {
-                if c >> shift & 1 == 1 {
-                    words[i / 64] |= 1 << (i % 64);
-                }
+            for (word, chunk) in words.iter_mut().zip(cur.chunks(64)) {
+                *word = chunk.iter().enumerate().fold(0, |w, (j, &c)| w | u64::from(c >> shift & 1) << j);
             }
             let mut samples: Vec<u32> = Vec::with_capacity(bit_words.div_ceil(SAMPLE_WORDS) + 1);
             let mut ones = 0u32;
@@ -259,16 +257,14 @@ impl BlockIds {
             level_data.resize(start + sample_words, 0);
             level_data.extend_from_slice(&words);
             zeros.push(len as u32 - ones);
-            // Stable partition into the spare buffer: zeros first.
+            // Stable partition into the spare buffer, zeros first --
+            // branch-free: label bits are effectively random.
             let (mut zero, mut one) = (0usize, (len as u32 - ones) as usize);
             for &c in &cur {
-                if c >> shift & 1 == 0 {
-                    spare[zero] = c;
-                    zero += 1;
-                } else {
-                    spare[one] = c;
-                    one += 1;
-                }
+                let bit = (c >> shift & 1) as usize;
+                spare[if bit == 0 { zero } else { one }] = c;
+                zero += 1 - bit;
+                one += bit;
             }
             std::mem::swap(&mut cur, &mut spare);
         }
@@ -465,14 +461,15 @@ impl BlockIds {
         let mut prev = vec![0u32; n];
         for l in (0..levels).rev() {
             let (_, words_at) = self.level(l);
+            let words = &self.data[words_at..words_at + n.div_ceil(64)];
             let (mut zero, mut one) = (0usize, self.u32_at(self.third, l) as usize);
-            for (i, slot) in prev.iter_mut().enumerate() {
-                if self.data[words_at + i / 64] >> (i % 64) & 1 == 0 {
-                    *slot = cur[zero];
-                    zero += 1;
-                } else {
-                    *slot = cur[one];
-                    one += 1;
+            // Branch-free: label bits are effectively random.
+            for (chunk, &word) in prev.chunks_mut(64).zip(words) {
+                for (j, slot) in chunk.iter_mut().enumerate() {
+                    let bit = (word >> j & 1) as usize;
+                    *slot = cur[if bit == 0 { zero } else { one }];
+                    zero += 1 - bit;
+                    one += bit;
                 }
             }
             std::mem::swap(&mut cur, &mut prev);
