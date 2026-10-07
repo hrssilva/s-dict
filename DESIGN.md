@@ -4582,3 +4582,35 @@ unchanged):
 | get_term, sequential / 4 + 8 | 1,034 / 1,097 ns | 1,299 / 1,438 ns | 1,490 / 1,596 ns |
 | get_id, sequential / 4 + 8 | 1,125 / 1,272 ns | 1,199 / 1,301 ns | 1,616 / 2,051 ns |
 | peak RSS, 4 + 8 | 441 MiB | 387 MiB | 461 MiB |
+
+## cheap time wins: what helped and what didn't
+
+From a flat profile of a 10M-line sequential load (automaton path work
+~30%, malloc/free ~10%, batch sort ~14%) and a per-phase lookup breakdown
+(`get_id`: directory route ~250 ns, block automaton walk ~690 ns;
+`get_term`: id -> block/rank ~270 ns, automaton walk ~770 ns). Same
+private real-RDF corpus; 10M-line runs repeated twice (noise < 1%).
+
+- **Allocation churn: kept.** `PackedAutomaton` keeps construction
+  scratch (`Scratch`: a per-confirm child list and a pool of frame child
+  lists, released with the registry), `open_frame` builds its frame in one
+  pooled buffer instead of two allocations, and `compact` dedups with an
+  open-addressing table of `(signature hash, new address)` verified
+  against the written record (`record_matches`) instead of a
+  `HashMap<(bool, Vec<..>), u32>` with a `Vec` key per record. Insertion
+  22.34 -> 18.39s at 10M lines (-17.7%); full file sequential 33.1 ->
+  27.9s, peak RSS 126 -> 106 MiB; size and lookups unchanged.
+- **Inline key prefixes in the directory: rejected.** 84% of adjacent
+  directory keys share their first 8 bytes, and 56% still tie at 32 bytes
+  (namespace IRIs); a prefix-first binary search walked long runs of equal
+  prefixes and measured ~50x slower (11.5-12.1 us per route vs ~250 ns).
+  Routing is ~20% of `get_id`; a trie over the directory keys would be the
+  way to cut it, not worth it before the automaton walk (~57%).
+- **Hash-grouping batch terms before sorting: rejected.** Grouping
+  duplicates with a hash map and sorting only distinct terms made parse +
+  batch preparation slower (8.1 -> 10.9s with keyed SipHash, 11.1s with
+  FxHash): within one 65,536-triple batch most occurrences are distinct,
+  so hashing every one costs more than the comparison sort it saves.
+- **Parser/writer split (full file, sharded, warm cache):** 3+9 13.7s,
+  4+8 14.5s, 5+7 13.8s, 6+6 12.6s, **7+5 12.1s** on this 6-core / 12-thread
+  laptop.

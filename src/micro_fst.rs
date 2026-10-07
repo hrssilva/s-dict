@@ -1533,6 +1533,17 @@ pub(crate) struct PackedAutomaton {
     /// real RDF (DESIGN.md's "releasing PackedAutomaton's registry
     /// between mutations").
     register: Option<PackedRegistry>,
+    /// Reusable buffers for construction (released with the registry):
+    /// a per-confirm child list and a pool of frame child lists, so the
+    /// per-state work of `insert_sorted`/`build_sorted`/`compact` doesn't
+    /// allocate -- malloc/free was ~10% of a bulk load's profile.
+    scratch: Scratch,
+}
+
+#[derive(Clone, Debug, Default)]
+struct Scratch {
+    children: Vec<(u8, u32, u32)>,
+    frames: Vec<Vec<(u8, u32, u32)>>,
 }
 
 #[allow(dead_code)]
@@ -1560,6 +1571,7 @@ impl PackedAutomaton {
             root: 0,
             term_count: automaton.len() as u32,
             register: Some(PackedRegistry::with_capacity_hint(automaton.len())),
+            scratch: Scratch::default(),
         };
         let mut written: HashMap<StateId, u32> = HashMap::new();
         let root = Self::compile_state(automaton, automaton.root, &mut result, &mut written);
@@ -1625,6 +1637,7 @@ impl PackedAutomaton {
             root: 0,
             term_count: 0,
             register: Some(PackedRegistry::with_capacity_hint(capacity_hint)),
+            scratch: Scratch::default(),
         };
         // frames[i] is the state reached after `path_bytes[..i]` of
         // `last_word`; frames[0] (root) has no incoming byte, so
@@ -1643,10 +1656,7 @@ impl PackedAutomaton {
             Self::confirm_down_to(&mut result, &mut frames, &mut path_bytes, common + 1);
 
             for &b in &word[common..] {
-                frames.push(StagingFrame {
-                    is_final: false,
-                    children: Vec::new(),
-                });
+                frames.push(result.new_frame());
                 path_bytes.push(b);
             }
             frames
@@ -1689,6 +1699,7 @@ impl PackedAutomaton {
             let frame = frames.pop().expect("loop guard ensures at least one entry");
             let byte = path_bytes.pop().expect("one byte per non-root frame");
             let (pos, count) = result.confirm_frame(&frame);
+            result.recycle_frame(frame);
 
             let parent = frames
                 .last_mut()
@@ -1701,6 +1712,7 @@ impl PackedAutomaton {
         if keep_from == 0 {
             let root_frame = frames.pop().expect("root frame always present");
             (result.root, result.term_count) = result.confirm_frame(&root_frame);
+            result.recycle_frame(root_frame);
         }
     }
 
@@ -1767,10 +1779,7 @@ impl PackedAutomaton {
                     .is_final;
             if !already_present {
                 for &b in &word[matched..] {
-                    frames.push(StagingFrame {
-                        is_final: false,
-                        children: Vec::new(),
-                    });
+                    frames.push(self.new_frame());
                     path_bytes.push(b);
                 }
                 frames
@@ -1945,28 +1954,51 @@ impl PackedAutomaton {
     /// register) the confirmed record. Returns `(address, subtree_count)`.
     fn confirm_frame(&mut self, frame: &StagingFrame) -> (u32, u32) {
         let mut running = u32::from(frame.is_final);
-        let mut children = Vec::with_capacity(frame.children.len());
+        let mut children = std::mem::take(&mut self.scratch.children);
+        children.clear();
         for &(b, child_count, target) in &frame.children {
             children.push((b, running, target));
             running += child_count;
         }
-        (self.write_confirmed_state(frame.is_final, &children), running)
+        let pos = self.write_confirmed_state(frame.is_final, &children);
+        self.scratch.children = children;
+        (pos, running)
     }
 
     /// Opens the record at `pos` (whose subtree count is `count`) into an
     /// editable frame. Child counts are the differences between
     /// consecutive outputs; the last child gets the rest of `count`.
-    fn open_frame(&self, pos: u32, count: u32) -> StagingFrame {
-        let transitions = self.read_children(pos);
-        let mut children = Vec::with_capacity(transitions.len());
-        for (i, &(b, out, target)) in transitions.iter().enumerate() {
-            let end = transitions.get(i + 1).map_or(count, |&(_, next_out, _)| next_out);
-            children.push((b, end - out, target));
+    fn open_frame(&mut self, pos: u32, count: u32) -> StagingFrame {
+        let mut children = self.scratch.frames.pop().unwrap_or_default();
+        children.clear();
+        let (is_final, n, mode, mut cursor) = self.header(pos);
+        for i in 0..n {
+            let (b, out, target, after) = self.read_transition_at(cursor, i == 0, is_final, mode);
+            cursor = after;
+            children.push((b, out, target));
         }
+        // Outputs -> child counts, ascending, so `children[i + 1].1` is
+        // still that child's original output when read.
+        for i in 0..n {
+            let end = if i + 1 < n { children[i + 1].1 } else { count };
+            children[i].1 = end - children[i].1;
+        }
+        StagingFrame { is_final, children }
+    }
+
+    /// An empty frame whose child list comes from the scratch pool.
+    fn new_frame(&mut self) -> StagingFrame {
+        let mut children = self.scratch.frames.pop().unwrap_or_default();
+        children.clear();
         StagingFrame {
-            is_final: self.is_final(pos),
+            is_final: false,
             children,
         }
+    }
+
+    /// Returns a confirmed frame's child list to the scratch pool.
+    fn recycle_frame(&mut self, frame: StagingFrame) {
+        self.scratch.frames.push(frame.children);
     }
 
     /// `get`/`insert` take `children` by reference, so unlike the prior
@@ -2017,6 +2049,7 @@ impl PackedAutomaton {
     /// remain valid (see [`Self::registry`]).
     pub(crate) fn release_construction_state(&mut self) {
         self.register = None;
+        self.scratch = Scratch::default();
         self.bytes.shrink_to_fit();
     }
 
@@ -2038,19 +2071,26 @@ impl PackedAutomaton {
             root: self.root,
             term_count: self.term_count,
             register: None,
+            scratch: Scratch::default(),
         };
         self.register = None;
         let mut moved: HashMap<u32, u32, BuildHasherDefault<FxHasher>> = HashMap::default();
-        let mut canonical: HashMap<(bool, Vec<(u8, u32, u32)>), u32, BuildHasherDefault<FxHasher>> =
-            HashMap::default();
+        let mut canonical = DedupTable::new();
+        let mut pool = std::mem::take(&mut self.scratch.frames);
+        let read = |pool: &mut Vec<Vec<(u8, u32, u32)>>, pos: u32| {
+            let mut v = pool.pop().unwrap_or_default();
+            v.clear();
+            old.read_children_into(pos, &mut v);
+            v
+        };
         // (old address, its children, next child to visit)
-        let mut stack: Vec<(u32, Vec<(u8, u32, u32)>, usize)> =
-            vec![(old.root, old.read_children(old.root), 0)];
+        let root_children = read(&mut pool, old.root);
+        let mut stack: Vec<(u32, Vec<(u8, u32, u32)>, usize)> = vec![(old.root, root_children, 0)];
         while let Some((pos, children, next)) = stack.last_mut() {
             if let Some(&(_, _, child)) = children.get(*next) {
                 *next += 1;
                 if !moved.contains_key(&child) {
-                    let grandchildren = old.read_children(child);
+                    let grandchildren = read(&mut pool, child);
                     stack.push((child, grandchildren, 0));
                 }
                 continue;
@@ -2062,19 +2102,47 @@ impl PackedAutomaton {
                 child.2 = moved[&child.2];
             }
             let is_final = old.is_final(pos);
-            let key = (is_final, children);
-            let new_pos = match canonical.get(&key) {
-                Some(&existing) => existing,
+            let hash = signature_hash(is_final, &children);
+            let new_pos = match canonical.find(hash, |candidate| self.record_matches(candidate, is_final, &children)) {
+                Some(existing) => existing,
                 None => {
-                    let new_pos = self.append_record(is_final, &key.1);
-                    canonical.insert(key, new_pos);
+                    let new_pos = self.append_record(is_final, &children);
+                    canonical.insert(hash, new_pos);
                     new_pos
                 }
             };
             moved.insert(pos, new_pos);
+            pool.push(children);
         }
         self.root = moved[&old.root];
         self.bytes.shrink_to_fit();
+        self.scratch = Scratch::default();
+    }
+
+    /// `read_children`, into a caller-provided buffer.
+    fn read_children_into(&self, pos: u32, out: &mut Vec<(u8, u32, u32)>) {
+        let (is_final, count, mode, mut cursor) = self.header(pos);
+        for i in 0..count {
+            let (b, output, target, after) = self.read_transition_at(cursor, i == 0, is_final, mode);
+            cursor = after;
+            out.push((b, output, target));
+        }
+    }
+
+    /// Whether the record at `pos` has exactly this signature.
+    fn record_matches(&self, pos: u32, is_final: bool, children: &[(u8, u32, u32)]) -> bool {
+        let (f, count, mode, mut cursor) = self.header(pos);
+        if f != is_final || count != children.len() {
+            return false;
+        }
+        for (i, &expected) in children.iter().enumerate() {
+            let (b, output, target, after) = self.read_transition_at(cursor, i == 0, is_final, mode);
+            cursor = after;
+            if (b, output, target) != expected {
+                return false;
+            }
+        }
+        true
     }
 
     /// Appends one state's record to `bytes` -- ordinary amortized-growth
@@ -2472,6 +2540,68 @@ fn write_leb128(bytes: &mut Vec<u8>, mut value: u32) {
             break;
         }
         bytes.push(byte | 0x80);
+    }
+}
+
+fn signature_hash(is_final: bool, children: &[(u8, u32, u32)]) -> u64 {
+    let mut hasher = FxHasher::default();
+    is_final.hash(&mut hasher);
+    children.hash(&mut hasher);
+    hasher.finish()
+}
+
+/// `compact`'s exact dedup: open addressing over `(signature hash, new
+/// record address)`. A probe hit is confirmed against the record already
+/// written (`record_matches`), so no signature is stored -- the previous
+/// `HashMap<(bool, Vec<..>), u32>` allocated a `Vec` key per record.
+struct DedupTable {
+    slots: Vec<(u64, u32)>,
+    len: usize,
+}
+
+impl DedupTable {
+    const EMPTY: u32 = u32::MAX;
+
+    fn new() -> DedupTable {
+        DedupTable {
+            slots: vec![(0, Self::EMPTY); 256],
+            len: 0,
+        }
+    }
+
+    fn find(&self, hash: u64, mut matches: impl FnMut(u32) -> bool) -> Option<u32> {
+        let mask = self.slots.len() - 1;
+        let mut i = hash as usize & mask;
+        loop {
+            let (h, pos) = self.slots[i];
+            if pos == Self::EMPTY {
+                return None;
+            }
+            if h == hash && matches(pos) {
+                return Some(pos);
+            }
+            i = (i + 1) & mask;
+        }
+    }
+
+    fn insert(&mut self, hash: u64, pos: u32) {
+        if (self.len + 1) * 2 > self.slots.len() {
+            let grown = vec![(0, Self::EMPTY); self.slots.len() * 2];
+            let old = std::mem::replace(&mut self.slots, grown);
+            self.len = 0;
+            for (h, p) in old {
+                if p != Self::EMPTY {
+                    self.insert(h, p);
+                }
+            }
+        }
+        let mask = self.slots.len() - 1;
+        let mut i = hash as usize & mask;
+        while self.slots[i].1 != Self::EMPTY {
+            i = (i + 1) & mask;
+        }
+        self.slots[i] = (hash, pos);
+        self.len += 1;
     }
 }
 
