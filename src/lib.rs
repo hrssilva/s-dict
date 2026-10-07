@@ -30,6 +30,7 @@ mod fsst;
 mod front_coded_block;
 mod front_coded_dictionary;
 mod micro_fst;
+mod packed_automaton;
 mod packed_automaton_block;
 mod packed_automaton_dictionary;
 mod plain;

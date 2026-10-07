@@ -34,7 +34,7 @@
 use crate::TermId;
 use crate::entries_arena::EntriesArena;
 use crate::block_ids::BlockIds;
-use crate::micro_fst::PackedAutomaton;
+use crate::packed_automaton::PackedAutomaton;
 
 /// `merge_into` compacts a block (`PackedAutomaton::compact`) once its
 /// bytes per term exceed this multiple of the value right after its last
