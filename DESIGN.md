@@ -4925,3 +4925,39 @@ before (lookups, size and peak RSS unchanged). A release build with
 `-C debug-assertions -C overflow-checks` ran a 3M-line real-data prefix
 (load, 200K lookups, 2K single-term mutations; sequential and 2 writer
 shards) without a failed premise.
+
+## invariants as types
+
+Runtime checks and state flags that a type can make unnecessary, each
+measured before being kept (10M-line sequential loads, interleaved with the
+previous build):
+
+- **`PreparedBatch` is a type state.** `TermBatch::prepare(self) ->
+  PreparedBatch`; `insert_prepared(&PreparedBatch)`; `into_batch` to edit
+  again. Holding one is the proof of preparation: the `prepared` flag, the
+  `Option` from `prepared()`, and "`push` invalidates preparation" are gone.
+  Measured with the bench's default 16 codegen units it read +1.5% insertion
+  with +0.15% instructions; with `codegen-units = 1` on both sides, +0.2% --
+  the difference was LLVM partitioning moving inlining of unrelated code
+  (`PackedTermsStream::next`, s-parser's `Scanner::iri`), not the change.
+  Kept.
+- **`BlockIds` is one variant per encoding** (`Implicit`, `Wavelet`,
+  `FrameOfReference`), each with only its own fields, instead of one struct
+  whose `base` meant the run count for wavelets. Deriving every section
+  offset cost ~2% (recomputed per level per query); storing only the levels'
+  offset is neutral and keeps the size at 40 bytes (a test guards it).
+  `Implicit`'s bulk decode briefly overflowed for a run ending at
+  `u32::MAX` (caught by the existing extremes test).
+- **`Option<NonZeroU32>` replaces empty sentinels** in registry cells, the
+  range map and the compaction dedup table (`value + 1`, built with
+  `NonZeroU32::MIN.saturating_add`): same size, and "empty" can't be
+  mistaken for a slot or an address. Neutral (+0.45% / -1% lookups, inside
+  run-to-run spread).
+- **Rejected: one `Chains` enum for `has_chains`/`pristine`/`chains_coded`**
+  (the three valid combinations only). Consistently +1.2% insertion over
+  nine rounds, also with a tag-only check -- `lower_bound`'s hot loop is
+  codegen-sensitive (see "profiling the insertion slowdown").
+
+Left as they are: `blocks: Vec<Option<_>>` (free slots exist; the `Option`
+is the honest type), `TermId(pub u32)` (ids are caller input, so lookups
+validate them), and input-dependent length checks.

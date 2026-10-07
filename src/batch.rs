@@ -148,9 +148,10 @@ impl BatchOrder {
     }
 }
 
-/// Owned term text and flat ordering metadata for one caller-bounded batch.
-/// `clear` retains capacity. Preparation never touches a dictionary and can
-/// run on parser workers; moving the batch does not invalidate any references.
+/// Owned term text for one caller-bounded batch, being filled. `clear`
+/// retains capacity. [`TermBatch::prepare`] turns it into a
+/// [`PreparedBatch`] -- off the writer thread, if wanted: preparation never
+/// touches a dictionary.
 #[derive(Debug, Default)]
 pub struct TermBatch {
     /// Concatenated term bytes; kept as bytes (each term was a `&str`, so
@@ -158,8 +159,9 @@ pub struct TermBatch {
     text: Vec<u8>,
     /// `(start, end)` of each term in `text`.
     terms: Vec<(u32, u32)>,
-    pub(crate) order: BatchOrder,
-    prepared: bool,
+    /// The sorted, grouped order; meaningful only in a `PreparedBatch`
+    /// (kept here so its buffers are reused across batches).
+    order: BatchOrder,
 }
 
 impl TermBatch {
@@ -173,14 +175,12 @@ impl TermBatch {
         self.text.extend_from_slice(term.as_bytes());
         let end = u32::try_from(self.text.len()).expect("TermBatch text fits u32 offsets");
         self.terms.push((start as u32, end));
-        self.prepared = false;
     }
 
     pub fn clear(&mut self) {
         self.text.clear();
         self.terms.clear();
         self.order.clear();
-        self.prepared = false;
     }
 
     pub fn len(&self) -> usize {
@@ -196,35 +196,65 @@ impl TermBatch {
     }
 
     /// The bytes of the term pushed `index`-th.
-    pub(crate) fn term(&self, index: usize) -> &[u8] {
+    fn term(&self, index: usize) -> &[u8] {
         let (start, end) = self.terms[index];
         &self.text[start as usize..end as usize]
     }
 
-    /// Sort and group duplicate terms, retaining original input positions.
-    pub fn prepare(&mut self) {
-        if self.prepared {
-            return;
-        }
+    /// Sorts and groups duplicate terms (keeping every input position) and
+    /// returns the batch as one a dictionary inserts as is. The batch can't
+    /// change while prepared, so its order always matches its terms
+    /// ([`PreparedBatch::into_batch`] to change it again).
+    pub fn prepare(mut self) -> PreparedBatch {
         let (text, terms) = (&self.text, &self.terms);
         self.order.prepare(terms.len(), |i| {
             let (start, end) = terms[i];
             &text[start as usize..end as usize]
         });
-        self.prepared = true;
-    }
-
-    /// A read-only view that guarantees sorted metadata matches the term text.
-    /// Returns `None` after any push/clear until `prepare` is called again.
-    pub fn prepared(&self) -> Option<PreparedBatch<'_>> {
-        self.prepared.then_some(PreparedBatch { batch: self })
+        PreparedBatch(self)
     }
 }
 
-/// Validated by `TermBatch::prepare`; borrows and prevents mutation of its batch.
-#[derive(Clone, Copy, Debug)]
-pub struct PreparedBatch<'a> {
-    pub(crate) batch: &'a TermBatch,
+/// A [`TermBatch`] whose terms are sorted and grouped: what
+/// `PackedAutomatonDictionary::insert_prepared` takes. Only
+/// [`TermBatch::prepare`] makes one.
+#[derive(Debug)]
+pub struct PreparedBatch(TermBatch);
+
+impl Default for PreparedBatch {
+    /// An empty prepared batch.
+    fn default() -> Self {
+        TermBatch::default().prepare()
+    }
+}
+
+impl PreparedBatch {
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    pub fn text_bytes(&self) -> usize {
+        self.0.text_bytes()
+    }
+
+    /// Back to an editable batch (same terms, all capacity kept): `clear`
+    /// it to reuse its buffers for the next batch.
+    pub fn into_batch(self) -> TermBatch {
+        self.0
+    }
+
+    pub(crate) fn order(&self) -> &BatchOrder {
+        &self.0.order
+    }
+
+    /// The bytes of the term pushed `index`-th.
+    pub(crate) fn term(&self, index: usize) -> &[u8] {
+        self.0.term(index)
+    }
 }
 
 #[cfg(test)]

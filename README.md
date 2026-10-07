@@ -95,23 +95,24 @@ assert_eq!(dict.get_id("http://www.w3.org/1999/02/22-rdf-syntax-ns#type"), None)
 dict.shrink_to_fit();
 ```
 
-For ingestion with parser workers, prepare a reusable owned batch before
-passing it to the single dictionary writer. Returned ids keep input order.
+For ingestion with parser workers, prepare a batch before passing it to the
+single dictionary writer. Returned ids keep input order.
 
 ```rust
 use s_dict::{PackedAutomatonDictionary, TermBatch};
 let mut batch = TermBatch::new();
 batch.push("example");
 batch.push("example");
-batch.prepare(); // Can run on a parser worker, independently of the dictionary.
+let prepared = batch.prepare(); // Can run on a parser worker, independently of the dictionary.
 let mut dict = PackedAutomatonDictionary::new();
-let ids = dict.insert_prepared(batch.prepared().unwrap());
+let ids = dict.insert_prepared(&prepared);
 assert_eq!(ids[0], ids[1]);
+let mut batch = prepared.into_batch();
 batch.clear(); // Reuse text and metadata capacity for the next bounded batch.
 ```
 
-`push` and `clear` invalidate preparation; the borrowed `PreparedBatch`
-view prevents modification during insertion.
+`prepare` consumes the batch: a `PreparedBatch` can't change, so its
+sorted order always matches its terms (`into_batch` to edit it again).
 
 `TermId` is `u32`, matching `s-graph`'s id space; ids are reused after
 removal, and running out of ids panics rather than wrapping. Block size is

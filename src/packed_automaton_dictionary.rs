@@ -113,9 +113,8 @@ impl PackedAutomatonDictionary {
     /// Inserts a batch prepared off the writer thread (`TermBatch::prepare`
     /// sorted and grouped it). Returns ids in original input order,
     /// including duplicate occurrences.
-    pub fn insert_prepared(&mut self, prepared: PreparedBatch<'_>) -> Vec<TermId> {
-        let batch = prepared.batch;
-        self.insert_ordered(&batch.order, |u| batch.term(batch.order.first(u)))
+    pub fn insert_prepared(&mut self, batch: &PreparedBatch) -> Vec<TermId> {
+        self.insert_ordered(batch.order(), |u| batch.term(batch.order().first(u)))
     }
 
     /// End of a load: compacts every block to its exact minimal automaton
@@ -694,9 +693,9 @@ mod tests {
         for t in &refs {
             batch.push(t);
         }
-        batch.prepare();
+        let batch = batch.prepare();
         let mut prepared = PackedAutomatonDictionary::with_block_bounds(8, 32);
-        let ids = prepared.insert_prepared(batch.prepared().expect("prepared"));
+        let ids = prepared.insert_prepared(&batch);
         let mut plain = PackedAutomatonDictionary::with_block_bounds(8, 32);
         assert_eq!(ids, plain.insert_batch(&refs));
         for (t, id) in refs.iter().zip(&ids) {
