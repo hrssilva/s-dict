@@ -39,31 +39,45 @@ const MAX_RUNS: usize = 256;
 const SAMPLE_BITS: usize = 256;
 const SAMPLE_WORDS: usize = SAMPLE_BITS / 64;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Kind {
-    Implicit,
-    Wavelet,
-    For,
-}
+/// A block's `rank <-> TermId` permutation in the smallest of three
+/// encodings (module doc).
+#[derive(Debug, Clone)]
+pub(crate) struct BlockIds(Repr);
 
 #[derive(Debug, Clone)]
-pub(crate) struct BlockIds {
+enum Repr {
+    /// A single run: `id = base + rank`, no per-entry data.
+    Implicit { len: u32, base: u32 },
+    Wavelet(Wavelet),
+    For(FrameOfReference),
+}
+
+/// Run labels as a wavelet matrix, in one allocation (`data`, in words):
+/// the run table (`base | len << 32` per run, runs in base order), each
+/// run's bottom-level start (two `u32` per word), each level's zero count
+/// (two per word), then the levels, each `sample words + bit words`.
+/// Section offsets follow from `runs` and `levels`; only the levels' one,
+/// used on every query, is stored (deriving it per level cost ~2%).
+#[derive(Debug, Clone)]
+struct Wavelet {
     len: u32,
-    kind: Kind,
-    /// `Wavelet`: levels (`bits(runs - 1)`). `For`: offset bits.
-    width: u8,
-    /// `For`: bits of a stored rank.
-    rank_bits: u8,
-    /// `Implicit`/`For`: the base id. `Wavelet`: the run count.
+    /// Word offset of the first level: `zeros_at() + ceil(levels / 2)`.
+    levels_at: u32,
+    /// At most `MAX_RUNS`.
+    runs: u16,
+    /// `bits(runs - 1)`.
+    levels: u8,
+    data: Box<[u64]>,
+}
+
+/// The fallback: `id = base + offset`, `width`-bit offsets from word 0 of
+/// `data`, then ranks in id order (`rank_bits` each) after them.
+#[derive(Debug, Clone)]
+struct FrameOfReference {
+    len: u32,
     base: u32,
-    /// Section starts in `data` (words). `Wavelet`: run table
-    /// (`base | len << 32` per run) at 0, then bottom-level starts (two
-    /// `u32` per word), per-level zero counts (two per word), and the
-    /// levels, each `sample words + bit words`. `For`: offsets at 0, ranks
-    /// in id order at `second`.
-    second: u32,
-    third: u32,
-    fourth: u32,
+    width: u8,
+    rank_bits: u8,
     data: Box<[u64]>,
 }
 
@@ -129,7 +143,7 @@ impl BlockIds {
     pub(crate) fn new(ids: &[TermId]) -> BlockIds {
         let len = ids.len();
         if len == 0 {
-            return Self::implicit(0, 0);
+            return BlockIds(Repr::Implicit { len: 0, base: 0 });
         }
         let (min, max) = ids.iter().fold((u32::MAX, 0), |(lo, hi), id| (lo.min(id.0), hi.max(id.0)));
 
@@ -160,7 +174,10 @@ impl BlockIds {
             last = run;
         }
         if runs.len() == 1 {
-            return Self::implicit(len, runs[0].0);
+            return BlockIds(Repr::Implicit {
+                len: len as u32,
+                base: runs[0].0,
+            });
         }
 
         let rank_bits = bits(len as u64 - 1);
@@ -172,48 +189,114 @@ impl BlockIds {
             let (sample_words, bit_words) = level_words(len);
             let wavelet_size = 8 * (k + k.div_ceil(2) + (levels as usize).div_ceil(2) + levels as usize * (sample_words + bit_words));
             if wavelet_size <= for_size {
-                return Self::wavelet(&runs, &labels, levels);
+                return BlockIds(Repr::Wavelet(Wavelet::new(&runs, &labels, levels)));
             }
         }
-        Self::frame_of_reference(ids, min, for_bits, rank_bits)
+        BlockIds(Repr::For(FrameOfReference::new(ids, min, for_bits, rank_bits)))
     }
 
-    fn implicit(len: usize, base: u32) -> BlockIds {
-        BlockIds {
-            len: len as u32,
-            kind: Kind::Implicit,
-            width: 0,
-            rank_bits: 0,
-            base,
-            second: 0,
-            third: 0,
-            fourth: 0,
-            data: Box::new([]),
+    #[inline]
+    pub(crate) fn len(&self) -> usize {
+        match &self.0 {
+            Repr::Implicit { len, .. } => *len as usize,
+            Repr::Wavelet(w) => w.len as usize,
+            Repr::For(f) => f.len as usize,
         }
     }
 
-    fn frame_of_reference(ids: &[TermId], min: u32, for_bits: u8, rank_bits: u8) -> BlockIds {
+    #[inline]
+    pub(crate) fn get(&self, rank: usize) -> TermId {
+        debug_assert!(rank < self.len());
+        match &self.0 {
+            Repr::Implicit { base, .. } => TermId(base + rank as u32),
+            Repr::Wavelet(w) => w.get(rank),
+            Repr::For(f) => f.get(rank),
+        }
+    }
+
+    /// The rank of `id` in this block, if present.
+    #[inline]
+    pub(crate) fn rank_of(&self, id: TermId) -> Option<usize> {
+        match &self.0 {
+            &Repr::Implicit { len, base } => (id.0 >= base && id.0 - base < len).then(|| (id.0 - base) as usize),
+            Repr::Wavelet(w) => w.rank_of(id.0),
+            Repr::For(f) => f.rank_of(id.0),
+        }
+    }
+
+    /// Appends all ids in rank order to `out`.
+    pub(crate) fn decode_into(&self, out: &mut Vec<TermId>) {
+        match &self.0 {
+            &Repr::Implicit { len, base } => out.extend((0..len).map(|rank| TermId(base + rank))),
+            Repr::Wavelet(w) => w.decode_into(out),
+            Repr::For(f) => out.extend((0..f.len as usize).map(|r| f.get(r))),
+        }
+    }
+
+    #[cfg(test)]
+    fn to_vec(&self) -> Vec<TermId> {
+        let mut out = Vec::new();
+        self.decode_into(&mut out);
+        out
+    }
+
+    /// Logical size: the single data allocation.
+    pub(crate) fn size_bytes(&self) -> usize {
+        match &self.0 {
+            Repr::Implicit { .. } => 0,
+            Repr::Wavelet(w) => w.data.len() * 8,
+            Repr::For(f) => f.data.len() * 8,
+        }
+    }
+}
+
+impl FrameOfReference {
+    fn new(ids: &[TermId], min: u32, width: u8, rank_bits: u8) -> FrameOfReference {
         let len = ids.len();
         let mut by_id: Vec<u32> = (0..len as u32).collect();
         by_id.sort_unstable_by_key(|&r| ids[r as usize].0);
-        let mut data = pack(ids.iter().map(|id| u64::from(id.0 - min)), len, for_bits);
-        let second = data.len() as u32;
+        let mut data = pack(ids.iter().map(|id| u64::from(id.0 - min)), len, width);
         data.extend(pack(by_id.iter().map(|&r| u64::from(r)), len, rank_bits));
-        BlockIds {
+        FrameOfReference {
             len: len as u32,
-            kind: Kind::For,
-            width: for_bits,
-            rank_bits,
             base: min,
-            second,
-            third: 0,
-            fourth: 0,
+            width,
+            rank_bits,
             data: data.into_boxed_slice(),
         }
     }
 
+    #[inline]
+    fn get(&self, rank: usize) -> TermId {
+        TermId(self.base + read_bits(&self.data, rank * self.width as usize, self.width as usize) as u32)
+    }
+
+    /// Binary search over the ranks stored in id order.
+    #[inline]
+    fn rank_of(&self, id: u32) -> Option<usize> {
+        let rank_bits = self.rank_bits as usize;
+        let inverse = &self.data[words_for(self.len as usize, self.width)..];
+        let at = |k: usize| read_bits(inverse, k * rank_bits, rank_bits) as usize;
+        let (mut lo, mut hi) = (0usize, self.len as usize);
+        while lo < hi {
+            let mid = (lo + hi) / 2;
+            let found = self.get(at(mid)).0;
+            if found == id {
+                return Some(at(mid));
+            }
+            if found < id {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        None
+    }
+}
+
+impl Wavelet {
     /// `runs` in greedy order, `labels` per rank in that order.
-    fn wavelet(runs: &[(u32, u64)], labels: &[u32], levels: u8) -> BlockIds {
+    fn new(runs: &[(u32, u64)], labels: &[u32], levels: u8) -> Wavelet {
         let len = labels.len();
         let k = runs.len();
         // Relabel runs in base order, so `rank_of` can binary-search bases.
@@ -272,40 +355,56 @@ impl BlockIds {
         for (i, &c) in cur.iter().enumerate().rev() {
             starts[c as usize] = i as u32;
         }
-        let second = data.len() as u32;
         push_u32s(&mut data, &starts);
-        let third = data.len() as u32;
         push_u32s(&mut data, &zeros);
-        let fourth = data.len() as u32;
         data.extend_from_slice(&level_data);
-        BlockIds {
+        let runs = u16::try_from(k).expect("at most MAX_RUNS runs");
+        let levels_at = (k + k.div_ceil(2) + (levels as usize).div_ceil(2)) as u32;
+        debug_assert_eq!(data.len(), levels_at as usize + levels as usize * (sample_words + bit_words));
+        Wavelet {
             len: len as u32,
-            kind: Kind::Wavelet,
-            width: levels,
-            rank_bits: 0,
-            base: k as u32,
-            second,
-            third,
-            fourth,
+            levels_at,
+            runs,
+            levels,
             data: data.into_boxed_slice(),
         }
     }
 
+    /// Word offset of the per-run bottom-level starts (after the run table).
     #[inline]
-    pub(crate) fn len(&self) -> usize {
-        self.len as usize
+    fn starts_at(&self) -> usize {
+        self.runs as usize
     }
 
+    /// Word offset of the per-level zero counts.
     #[inline]
-    fn u32_at(&self, section: u32, index: usize) -> u32 {
-        (self.data[section as usize + index / 2] >> (32 * (index % 2))) as u32
+    fn zeros_at(&self) -> usize {
+        self.starts_at() + (self.runs as usize).div_ceil(2)
     }
 
-    /// `(sample section start, bit words start)` of wavelet level `l`.
+
+    #[inline]
+    fn u32_at(&self, section: usize, index: usize) -> u32 {
+        (self.data[section + index / 2] >> (32 * (index % 2))) as u32
+    }
+
+    /// Bottom-level start of run `c`.
+    #[inline]
+    fn start(&self, c: usize) -> usize {
+        self.u32_at(self.starts_at(), c) as usize
+    }
+
+    /// Zeros in level `l`.
+    #[inline]
+    fn zeros(&self, l: usize) -> usize {
+        self.u32_at(self.zeros_at(), l) as usize
+    }
+
+    /// `(sample section start, bit words start)` of level `l`.
     #[inline]
     fn level(&self, l: usize) -> (usize, usize) {
-        let (sample_words, bit_words) = level_words(self.len());
-        let at = self.fourth as usize + l * (sample_words + bit_words);
+        let (sample_words, bit_words) = level_words(self.len as usize);
+        let at = self.levels_at as usize + l * (sample_words + bit_words);
         (at, at + sample_words)
     }
 
@@ -333,7 +432,7 @@ impl BlockIds {
     /// Position in level `l` of the `j`-th (0-based) one (`ones`) or zero.
     fn select(&self, l: usize, j: usize, ones: bool) -> usize {
         let (samples_at, words_at) = self.level(l);
-        let groups = self.len().div_ceil(64).div_ceil(SAMPLE_WORDS);
+        let groups = (self.len as usize).div_ceil(64).div_ceil(SAMPLE_WORDS);
         let before = |g: usize| {
             let o = self.sample(samples_at, g);
             if ones { o } else { g * SAMPLE_BITS - o }
@@ -362,96 +461,61 @@ impl BlockIds {
         }
     }
 
+    /// `id(rank) = base[c] + (occurrences of c before rank)`: one top-down
+    /// `rank` pass recovers the label `c` and its occurrence index.
     #[inline]
-    pub(crate) fn get(&self, rank: usize) -> TermId {
-        debug_assert!(rank < self.len());
-        match self.kind {
-            Kind::Implicit => TermId(self.base + rank as u32),
-            Kind::For => TermId(self.base + read_bits(&self.data, rank * self.width as usize, self.width as usize) as u32),
-            Kind::Wavelet => {
-                let (mut i, mut c) = (rank, 0usize);
-                for l in 0..self.width as usize {
-                    let (_, words_at) = self.level(l);
-                    let bit = (self.data[words_at + i / 64] >> (i % 64) & 1) as usize;
-                    c = c << 1 | bit;
-                    let ones = self.rank1(l, i);
-                    i = if bit == 0 { i - ones } else { self.u32_at(self.third, l) as usize + ones };
-                }
-                let run = self.data[c];
-                TermId(run as u32 + (i - self.u32_at(self.second, c) as usize) as u32)
-            }
+    fn get(&self, rank: usize) -> TermId {
+        let (mut i, mut c) = (rank, 0usize);
+        for l in 0..self.levels as usize {
+            let (_, words_at) = self.level(l);
+            let bit = (self.data[words_at + i / 64] >> (i % 64) & 1) as usize;
+            c = c << 1 | bit;
+            let ones = self.rank1(l, i);
+            i = if bit == 0 { i - ones } else { self.zeros(l) + ones };
         }
+        TermId(self.data[c] as u32 + (i - self.start(c)) as u32)
     }
 
-    /// The rank of `id` in this block, if present.
-    pub(crate) fn rank_of(&self, id: TermId) -> Option<usize> {
-        let id = id.0;
-        match self.kind {
-            Kind::Implicit => (id >= self.base && id - self.base < self.len).then(|| (id - self.base) as usize),
-            Kind::Wavelet => {
-                // Run whose base is the last <= id.
-                let (mut lo, mut hi) = (0usize, self.base as usize);
-                while lo < hi {
-                    let mid = (lo + hi) / 2;
-                    if (self.data[mid] as u32) <= id {
-                        lo = mid + 1;
-                    } else {
-                        hi = mid;
-                    }
-                }
-                let c = lo.checked_sub(1)?;
-                let run = self.data[c];
-                let offset = (id - run as u32) as usize;
-                if offset >= (run >> 32) as usize {
-                    return None;
-                }
-                let levels = self.width as usize;
-                let mut i = self.u32_at(self.second, c) as usize + offset;
-                for l in (0..levels).rev() {
-                    let bit = c >> (levels - 1 - l) & 1;
-                    i = if bit == 0 {
-                        self.select(l, i, false)
-                    } else {
-                        self.select(l, i - self.u32_at(self.third, l) as usize, true)
-                    };
-                }
-                Some(i)
-            }
-            Kind::For => {
-                let rank_bits = self.rank_bits as usize;
-                let inverse = &self.data[self.second as usize..];
-                let at = |k: usize| read_bits(inverse, k * rank_bits, rank_bits) as usize;
-                let (mut lo, mut hi) = (0usize, self.len());
-                while lo < hi {
-                    let mid = (lo + hi) / 2;
-                    let found = self.get(at(mid)).0;
-                    if found == id {
-                        return Some(at(mid));
-                    }
-                    if found < id {
-                        lo = mid + 1;
-                    } else {
-                        hi = mid;
-                    }
-                }
-                None
+    /// The run holding `id` (binary search over run bases), then one
+    /// bottom-up `select` pass to its rank.
+    #[inline]
+    fn rank_of(&self, id: u32) -> Option<usize> {
+        let (mut lo, mut hi) = (0usize, self.runs as usize);
+        while lo < hi {
+            let mid = (lo + hi) / 2;
+            if (self.data[mid] as u32) <= id {
+                lo = mid + 1;
+            } else {
+                hi = mid;
             }
         }
+        let c = lo.checked_sub(1)?;
+        let run = self.data[c];
+        let offset = (id - run as u32) as usize;
+        if offset >= (run >> 32) as usize {
+            return None;
+        }
+        let levels = self.levels as usize;
+        let mut i = self.start(c) + offset;
+        for l in (0..levels).rev() {
+            i = if c >> (levels - 1 - l) & 1 == 0 {
+                self.select(l, i, false)
+            } else {
+                self.select(l, i - self.zeros(l), true)
+            };
+        }
+        Some(i)
     }
 
-    /// Appends all ids in rank order to `out`. `Wavelet` decodes in bulk -- per-rank `get`
-    /// would cost a `rank` query per level per entry, and merges call this
-    /// on every block they touch: start from the bottom level (labels
-    /// sorted, each contiguous), undo each level's stable partition
-    /// bottom-up, then hand out each run's consecutive ids in rank order.
-    pub(crate) fn decode_into(&self, out: &mut Vec<TermId>) {
-        if self.kind != Kind::Wavelet {
-            out.extend((0..self.len()).map(|r| self.get(r)));
-            return;
-        }
-        let (n, k, levels) = (self.len(), self.base as usize, self.width as usize);
+    /// Bulk decode -- per-rank `get` would cost a `rank` query per level
+    /// per entry, and merges call this on every block they touch: start
+    /// from the bottom level (labels sorted, each contiguous), undo each
+    /// level's stable partition bottom-up, then hand out each run's
+    /// consecutive ids in rank order.
+    fn decode_into(&self, out: &mut Vec<TermId>) {
+        let (n, k, levels) = (self.len as usize, self.runs as usize, self.levels as usize);
         let mut by_start: Vec<usize> = (0..k).collect();
-        by_start.sort_unstable_by_key(|&c| self.u32_at(self.second, c));
+        by_start.sort_unstable_by_key(|&c| self.start(c));
         let mut cur: Vec<u32> = Vec::with_capacity(n);
         for &c in &by_start {
             let run_len = (self.data[c] >> 32) as usize;
@@ -461,7 +525,7 @@ impl BlockIds {
         for l in (0..levels).rev() {
             let (_, words_at) = self.level(l);
             let words = &self.data[words_at..words_at + n.div_ceil(64)];
-            let (mut zero, mut one) = (0usize, self.u32_at(self.third, l) as usize);
+            let (mut zero, mut one) = (0usize, self.zeros(l));
             // Branch-free: label bits are effectively random.
             for (chunk, &word) in prev.chunks_mut(64).zip(words) {
                 for (j, slot) in chunk.iter_mut().enumerate() {
@@ -480,18 +544,6 @@ impl BlockIds {
             TermId(id)
         }));
     }
-
-    #[cfg(test)]
-    fn to_vec(&self) -> Vec<TermId> {
-        let mut out = Vec::new();
-        self.decode_into(&mut out);
-        out
-    }
-
-    /// Logical size: the single data allocation.
-    pub(crate) fn size_bytes(&self) -> usize {
-        self.data.len() * 8
-    }
 }
 
 #[cfg(test)]
@@ -508,14 +560,14 @@ mod tests {
         assert_eq!(b.to_vec(), v);
         assert_eq!((0..v.len()).map(|r| b.get(r)).collect::<Vec<_>>(), v);
         for (rank, &id) in v.iter().enumerate() {
-            assert_eq!(b.rank_of(id), Some(rank), "{:?} id {id:?}", b.kind);
+            assert_eq!(b.rank_of(id), Some(rank), "{:?} id {id:?}", b.0);
         }
         // Absent ids: just outside each id, where not present.
         let present: std::collections::HashSet<u32> = v.iter().map(|id| id.0).collect();
         for &TermId(id) in v {
             for probe in [id.wrapping_sub(1), id.wrapping_add(1)] {
                 if !present.contains(&probe) {
-                    assert_eq!(b.rank_of(TermId(probe)), None, "{:?} probe {probe}", b.kind);
+                    assert_eq!(b.rank_of(TermId(probe)), None, "{:?} probe {probe}", b.0);
                 }
             }
         }
@@ -526,7 +578,7 @@ mod tests {
     fn implicit_runs_and_for_round_trip() {
         assert_eq!(round_trip(&[]).size_bytes(), 0);
         let b = round_trip(&ids(&[100, 101, 102, 103]));
-        assert_eq!(b.kind, Kind::Implicit);
+        assert!(matches!(b.0, Repr::Implicit { .. }));
         assert_eq!(b.size_bytes(), 0, "base and length live in the struct");
         // Three interleaved runs, each increasing with rank.
         let mut v = Vec::new();
@@ -538,17 +590,23 @@ mod tests {
             });
         }
         let b = round_trip(&ids(&v));
-        assert_eq!(b.kind, Kind::Wavelet);
+        assert!(matches!(b.0, Repr::Wavelet(_)));
         // Wavelet matrix: 2 levels of 300 bits plus rank samples, and 3
         // runs' base/length/start (~160 bytes). Raw u32 both ways: 2,400.
         assert!(b.size_bytes() < 200, "{}", b.size_bytes());
         // No runs at all: FOR over a narrow range.
         let v: Vec<u32> = (0..500u32).map(|i| 7_000 + (i * 7919) % 997).collect();
         let b = round_trip(&ids(&v));
-        assert_eq!(b.kind, Kind::For);
+        assert!(matches!(b.0, Repr::For(_)));
         // Decreasing ids: each its own run, so FOR wins.
         let v: Vec<u32> = (0..400u32).rev().collect();
-        assert_eq!(round_trip(&ids(&v)).kind, Kind::For);
+        assert!(matches!(round_trip(&ids(&v)).0, Repr::For(_)));
+    }
+
+    /// One per block: no encoding's fields may grow every block.
+    #[test]
+    fn stays_small() {
+        assert!(std::mem::size_of::<BlockIds>() <= 40, "{}", std::mem::size_of::<BlockIds>());
     }
 
     /// A transiently oversized block (a whole batch run before its split)
@@ -560,7 +618,7 @@ mod tests {
             v.push(1_000_000 + i);
             v.push(5_000_000 + i);
         }
-        assert_eq!(round_trip(&ids(&v)).kind, Kind::Wavelet);
+        assert!(matches!(round_trip(&ids(&v)).0, Repr::Wavelet(_)));
     }
 
     #[test]
