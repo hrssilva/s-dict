@@ -188,6 +188,17 @@ impl PackedAutomatonDictionary {
         self.blocks.iter().flatten().map(PackedAutomatonBlock::reachable_state_count).sum()
     }
 
+    /// Every live id, in its term's lexicographic order (`out` is cleared
+    /// first): position = the term's rank. One pass over the blocks, no
+    /// term decoding.
+    pub fn ids_in_term_order(&self, out: &mut Vec<TermId>) {
+        out.clear();
+        out.reserve(self.len);
+        for &(_, slot) in &self.directory {
+            self.block(slot).ids_into(out);
+        }
+    }
+
     /// Writes the term for `id` into `buf` (cleared first), reusing its
     /// allocation; returns whether `id` is present.
     pub fn get_term_into(&self, id: TermId, buf: &mut Vec<u8>) -> bool {
@@ -683,6 +694,23 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn ids_in_term_order_follow_term_order() {
+        let mut dict = PackedAutomatonDictionary::with_block_bounds(2, 8);
+        let terms: Vec<String> = (0..300).map(|i| format!("t{:05}", (i * 7919) % 1000)).collect();
+        for t in &terms {
+            dict.insert(t);
+        }
+        for t in terms.iter().step_by(5) {
+            dict.remove(t);
+        }
+        let mut ids = Vec::new();
+        dict.ids_in_term_order(&mut ids);
+        assert_eq!(ids.len(), dict.len());
+        let decoded: Vec<String> = ids.iter().map(|&id| dict.get_term(id).expect("live id")).collect();
+        assert!(decoded.windows(2).all(|w| w[0] < w[1]), "strictly increasing terms");
     }
 
     #[test]
