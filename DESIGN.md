@@ -4961,3 +4961,34 @@ previous build):
 Left as they are: `blocks: Vec<Option<_>>` (free slots exist; the `Option`
 is the honest type), `TermId(pub u32)` (ids are caller input, so lookups
 validate them), and input-dependent length checks.
+
+## renumbering ids to term order
+
+`renumber(block_order)` reassigns every id block by block (term order
+within a block) and returns the old -> new mapping; `block_sizes` and
+`ids_in_term_order` expose what an order needs. With the identity order,
+ids become term ranks: every block's id permutation collapses to one run
+(`BlockIds` implicit) and the id -> block map to one range per block.
+Measured on the full private real-RDF file after a sequential load
+(`s-bench`'s `nt_dict_file_bench ... graph-renumber-rank`, same session as
+the load-order baseline):
+
+| | load-order ids | renumbered to term order |
+|---|---|---|
+| dictionary logical size | 30.79 MiB | **26.09 MiB** (-15%) |
+| `get_term` / `get_id` | 1,246 / 1,252 ns | **874 / 1,085 ns** |
+| single-term insert / remove | 23.2 / 23.3 us | **13.6 / 13.4 us** |
+| renumber (6.88M ids) | -- | 0.15 s, including rewriting the collected triples |
+
+The id side was ~4.7 MiB of id-run structure after the load (batches leave
+~11 runs per block); scrambled ids cost far more (11.6 bytes/term on a 300K
+real-term sample: 3.6 for the permutations, 8.0 for the id -> block map).
+For the graph built over the same triples, term-ordered ids shrink
+`s_graph`'s trie by 21% (correlated terms are lexicographic neighbours);
+combined dictionary + graph 189.7 -> 151.7 MiB. Ordering blocks by graph
+affinity instead (max-adjacency or chain over subject-block/object-block
+co-occurrence) did worse than term order (131.5 / 132.6 MiB of graph vs
+125.6). Renumbering invalidates every id handed out before it: callers remap
+with the returned mapping (PRODUCTION_READINESS.md, item 3). New terms
+afterwards take `len()` and later ids, out of rank order, until the next
+renumbering.
