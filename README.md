@@ -47,6 +47,10 @@ size (4.69 bytes/term), 21-22s of dictionary insertion with one writer,
 12s wall time with 7 parser threads and 5 writers, ~1.25 us per lookup in
 either direction, ~24 us per single-term insert or remove.
 
+See [PRODUCTION_READINESS.md](PRODUCTION_READINESS.md) for what remains
+before general production use (persistence, fallible operations, the id
+reuse contract, fuzzing/CI, API stability).
+
 ## Install
 
 ```toml
