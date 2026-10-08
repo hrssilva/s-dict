@@ -204,6 +204,51 @@ impl PackedAutomatonDictionary {
         self.blocks.iter().flatten().map(PackedAutomatonBlock::reachable_state_count).sum()
     }
 
+    /// Terms per block, in block (term) order.
+    pub fn block_sizes(&self) -> Vec<usize> {
+        self.directory.iter().map(|&(_, slot)| self.block(slot).len()).collect()
+    }
+
+    /// Reassigns every id: blocks in `block_order` (a permutation of
+    /// `0..block_count()`, positions in term order) get consecutive id
+    /// ranges from 0, each block's terms in term order -- so the identity
+    /// order makes every id its term's rank. Returns the mapping, indexed by
+    /// old id (`u32::MAX` for ids not in use). Every block's ids become one
+    /// run and the id -> block map one range per block, the cheapest form
+    /// both have; freed ids are forgotten, and the next new term gets
+    /// `len()`. Every id handed out before is invalidated: callers remap
+    /// what they hold with the returned mapping.
+    pub fn renumber(&mut self, block_order: &[usize]) -> Vec<u32> {
+        assert_eq!(block_order.len(), self.directory.len(), "one position per block");
+        let mut seen = vec![false; block_order.len()];
+        for &pos in block_order {
+            assert!(!std::mem::replace(&mut seen[pos], true), "block_order is a permutation");
+        }
+        let mut old_to_new = vec![u32::MAX; self.next_term_id as usize];
+        let mut ids = std::mem::take(&mut self.workspace.ids);
+        let mut runs = Vec::with_capacity(block_order.len());
+        let mut next = 0u32;
+        for &pos in block_order {
+            let slot = self.directory[pos].1;
+            let block = self.blocks[slot as usize].as_mut().expect("a live block slot");
+            ids.clear();
+            block.ids_into(&mut ids);
+            for (rank, old) in ids.iter().enumerate() {
+                old_to_new[old.0 as usize] = next + rank as u32;
+            }
+            block.set_id_run(next);
+            let len = u32::try_from(ids.len()).expect("block length fits u32");
+            runs.push((next, len, slot));
+            next += len;
+        }
+        self.workspace.ids = ids;
+        self.id_to_block = RangeMap::from_adjacent_runs(runs.into_iter());
+        self.next_term_id = next;
+        self.free_term_ids.clear();
+        debug_assert_eq!(next as usize, self.len);
+        old_to_new
+    }
+
     /// Every live id, in its term's lexicographic order (`out` is cleared
     /// first): position = the term's rank. One pass over the blocks, no
     /// term decoding.
@@ -620,6 +665,49 @@ mod tests {
         let mut out = vec![Some("stale".to_string())];
         dict.get_terms_seeked_into(&[], &mut out);
         assert!(out.is_empty());
+    }
+
+    /// After `renumber`, every term keeps resolving under its new id, ids
+    /// follow the requested block order, the id structures collapse to one
+    /// run per block, and new terms take `len()`.
+    #[test]
+    fn renumber_reassigns_ids_by_block_order() {
+        let mut dict = PackedAutomatonDictionary::with_block_bounds(4, 16);
+        let terms: Vec<String> = (0..400).map(|i| format!("t{:05}", (i * 7919) % 1000)).collect();
+        let mut old = Vec::new();
+        for t in &terms {
+            old.push(dict.insert(t));
+        }
+        for t in terms.iter().step_by(9) {
+            dict.remove(t);
+        }
+        dict.shrink_to_fit();
+        let live: Vec<(String, TermId)> = terms.iter().cloned().zip(old).filter(|(t, _)| dict.get_id(t).is_some()).collect();
+        let blocks = dict.block_count();
+        let order: Vec<usize> = (0..blocks).rev().collect();
+        let sizes = dict.block_sizes();
+        let map = dict.renumber(&order);
+        assert_eq!(dict.size_breakdown()[1].1, 0, "every block's ids are one run");
+        for (t, old_id) in &live {
+            let new_id = TermId(map[old_id.0 as usize]);
+            assert_eq!(dict.get_id(t), Some(new_id));
+            assert_eq!(dict.get_term(new_id).as_deref(), Some(t.as_str()));
+        }
+        // Reversed block order: the last block (largest terms) gets id 0.
+        let mut by_term: Vec<&(String, TermId)> = live.iter().collect();
+        by_term.sort();
+        let last_block_first = by_term[by_term.len() - sizes[blocks - 1]];
+        assert_eq!(dict.get_id(&last_block_first.0), Some(TermId(0)));
+        // New terms take the next id, then the dictionary keeps working.
+        assert_eq!(dict.insert("t99999-new"), TermId(dict.len() as u32 - 1));
+        let identity: Vec<usize> = (0..dict.block_count()).collect();
+        let map = dict.renumber(&identity);
+        let mut ranked: Vec<String> = live.iter().map(|(t, _)| t.clone()).chain(["t99999-new".to_string()]).collect();
+        ranked.sort();
+        for (rank, t) in ranked.iter().enumerate() {
+            assert_eq!(dict.get_id(t), Some(TermId(rank as u32)), "identity order: id = rank");
+        }
+        assert_eq!(map.iter().filter(|&&m| m != u32::MAX).count(), dict.len());
     }
 
     #[test]

@@ -195,6 +195,13 @@ impl BlockIds {
         BlockIds(Repr::For(FrameOfReference::new(ids, min, for_bits, rank_bits)))
     }
 
+    /// `len` consecutive ids from `base`, in rank order.
+    pub(crate) fn run(len: usize, base: u32) -> BlockIds {
+        let len = u32::try_from(len).expect("block length fits u32");
+        debug_assert!(base.checked_add(len).is_some(), "the run stays within u32");
+        BlockIds(Repr::Implicit { len, base })
+    }
+
     #[inline]
     pub(crate) fn len(&self) -> usize {
         match &self.0 {

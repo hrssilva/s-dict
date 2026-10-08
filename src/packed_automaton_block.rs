@@ -136,6 +136,11 @@ impl PackedAutomatonBlock {
         buf
     }
 
+    /// Gives this block's terms the ids `base..base + len()`, in rank order.
+    pub(crate) fn set_id_run(&mut self, base: u32) {
+        self.ids = BlockIds::run(self.len(), base);
+    }
+
     /// Appends every id in rank order to `out`.
     pub(crate) fn ids_into(&self, out: &mut Vec<TermId>) {
         self.ids.decode_into(out);

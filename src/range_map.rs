@@ -119,6 +119,31 @@ impl RangeMap {
         }
     }
 
+    /// A map from consecutive id ranges `(first id, length, slot)`, in id
+    /// order and adjacent (each starts where the previous ends), followed
+    /// by unassigned ids. O(ranges).
+    pub(crate) fn from_adjacent_runs(runs: impl Iterator<Item = (u32, u32, u32)>) -> RangeMap {
+        let mut points: Vec<(u32, Option<Slot>)> = Vec::new();
+        let mut end = 0u32;
+        for (start, len, slot) in runs {
+            debug_assert_eq!(start, end, "runs are adjacent, in id order");
+            if len == 0 {
+                continue;
+            }
+            points.push((start, Some(Slot::new(slot))));
+            end = start + len;
+        }
+        if !points.is_empty() {
+            points.push((end, None));
+        }
+        let mut map = RangeMap::new();
+        for chunk in points.chunks(LEAF_MAX) {
+            map.firsts.push(chunk[0].0);
+            map.leaves.push(chunk.to_vec());
+        }
+        map
+    }
+
     /// Records `slot` for every id in `ids` (any order; sorted and
     /// deduplicated in place), one range per run of consecutive ids.
     pub(crate) fn assign(&mut self, slot: u32, ids: &mut Vec<u32>) {
