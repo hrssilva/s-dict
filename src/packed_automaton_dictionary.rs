@@ -182,6 +182,22 @@ impl PackedAutomatonDictionary {
         blocks_bytes + directory_bytes + self.id_to_block.size_bytes() + symbols_bytes
     }
 
+    /// `size_bytes` by component, as `(name, bytes)`: the block automata,
+    /// the blocks' `rank <-> TermId` permutations, the directory, the
+    /// `TermId -> block` map and the chain-label symbol table.
+    pub fn size_breakdown(&self) -> Vec<(&'static str, usize)> {
+        let automata = self.blocks.iter().flatten().map(PackedAutomatonBlock::payload_bytes).sum();
+        let ids = self.blocks.iter().flatten().map(PackedAutomatonBlock::ids_bytes).sum();
+        let directory = self.directory.iter().map(|(key, _)| key.len() + std::mem::size_of::<u32>()).sum();
+        vec![
+            ("block automata", automata),
+            ("block id permutations", ids),
+            ("directory", directory),
+            ("id -> block map", self.id_to_block.size_bytes()),
+            ("symbol table", self.symbols.as_ref().map_or(0, |t| t.size_bytes())),
+        ]
+    }
+
     /// Total reachable automaton states across every block, for the
     /// states-per-term investigation (DESIGN.md).
     pub fn reachable_state_count(&self) -> usize {
@@ -604,6 +620,16 @@ mod tests {
         let mut out = vec![Some("stale".to_string())];
         dict.get_terms_seeked_into(&[], &mut out);
         assert!(out.is_empty());
+    }
+
+    #[test]
+    fn size_breakdown_sums_to_size_bytes() {
+        let mut dict = PackedAutomatonDictionary::with_block_bounds(4, 16);
+        for i in 0..500 {
+            dict.insert(&format!("http://example.org/entity-{}", (i * 7919) % 1000));
+        }
+        dict.shrink_to_fit();
+        assert_eq!(dict.size_breakdown().iter().map(|&(_, b)| b).sum::<usize>(), dict.size_bytes());
     }
 
     #[test]
