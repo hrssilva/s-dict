@@ -249,6 +249,64 @@ impl PackedAutomatonDictionary {
         old_to_new
     }
 
+    /// Reassigns every id by group, then term order: `group_of(id)` (below
+    /// `groups`) picks each live term's group; group 0's terms get the
+    /// first ids, in term order, then group 1's, and so on. A block holds
+    /// one id run per group it has terms in, and the id -> block map one
+    /// range per (group, block). Otherwise as [`Self::renumber`]: returns
+    /// the mapping by old id, forgets freed ids, the next new term gets
+    /// `len()`, and every id handed out before is invalidated.
+    pub fn renumber_grouped(&mut self, groups: usize, mut group_of: impl FnMut(TermId) -> usize) -> Vec<u32> {
+        let mut ids = std::mem::take(&mut self.workspace.ids);
+        self.ids_in_term_order(&mut ids);
+        let group: Vec<u8> = ids
+            .iter()
+            .map(|&id| {
+                let g = group_of(id);
+                assert!(g < groups && groups <= 256, "group below `groups` (at most 256)");
+                g as u8
+            })
+            .collect();
+        let mut cursor = vec![0u32; groups];
+        for &g in &group {
+            cursor[g as usize] += 1;
+        }
+        let mut next = 0u32;
+        for c in &mut cursor {
+            let count = *c;
+            *c = next;
+            next += count;
+        }
+        let mut old_to_new = vec![u32::MAX; self.next_term_id as usize];
+        let mut runs = Vec::new();
+        let mut new_ids = Vec::new();
+        let mut at = 0;
+        for &(_, slot) in &self.directory {
+            let block = self.blocks[slot as usize].as_mut().expect("a live block slot");
+            let len = block.len();
+            new_ids.clear();
+            let first: Vec<u32> = cursor.clone();
+            for (old, &g) in ids[at..at + len].iter().zip(&group[at..at + len]) {
+                let new = cursor[g as usize];
+                cursor[g as usize] += 1;
+                old_to_new[old.0 as usize] = new;
+                new_ids.push(TermId(new));
+            }
+            block.set_ids(&new_ids);
+            for (g, &start) in first.iter().enumerate() {
+                runs.push((start, cursor[g] - start, slot));
+            }
+            at += len;
+        }
+        runs.sort_unstable_by_key(|&(start, len, _)| (start, len));
+        self.id_to_block = RangeMap::from_adjacent_runs(runs.into_iter().filter(|&(_, len, _)| len > 0));
+        self.workspace.ids = ids;
+        self.next_term_id = next;
+        self.free_term_ids.clear();
+        debug_assert_eq!(next as usize, self.len);
+        old_to_new
+    }
+
     /// Every live id, in its term's lexicographic order (`out` is cleared
     /// first): position = the term's rank. One pass over the blocks, no
     /// term decoding.
@@ -708,6 +766,46 @@ mod tests {
             assert_eq!(dict.get_id(t), Some(TermId(rank as u32)), "identity order: id = rank");
         }
         assert_eq!(map.iter().filter(|&&m| m != u32::MAX).count(), dict.len());
+    }
+
+    /// After `renumber_grouped`, every term keeps resolving, each group's
+    /// ids are a contiguous range in group order and term order inside it,
+    /// mutations keep working, and new terms take `len()`.
+    #[test]
+    fn renumber_grouped_orders_ids_by_group_then_term() {
+        let mut dict = PackedAutomatonDictionary::with_block_bounds(4, 16);
+        let terms: Vec<String> = (0..400).map(|i| format!("t{:05}", (i * 7919) % 1000)).collect();
+        let mut old = Vec::new();
+        for t in &terms {
+            old.push(dict.insert(t));
+        }
+        for t in terms.iter().step_by(9) {
+            dict.remove(t);
+        }
+        let live: Vec<(String, TermId)> = terms.iter().cloned().zip(old).filter(|(t, _)| dict.get_id(t).is_some()).collect();
+        // Group by the term's last digit modulo 3; group 1 deliberately empty.
+        let group_of_term = |t: &str| match (t.as_bytes()[t.len() - 1] - b'0') % 3 {
+            0 => 2,
+            1 => 0,
+            _ => 3,
+        };
+        let by_old_id: std::collections::HashMap<u32, usize> = live.iter().map(|(t, id)| (id.0, group_of_term(t))).collect();
+        let map = dict.renumber_grouped(4, |id| by_old_id[&id.0]);
+        let mut expected: Vec<(usize, &str)> = live.iter().map(|(t, _)| (group_of_term(t), t.as_str())).collect();
+        expected.sort();
+        for (new_id, &(_, t)) in expected.iter().enumerate() {
+            assert_eq!(dict.get_id(t), Some(TermId(new_id as u32)), "group order, then term order");
+            assert_eq!(dict.get_term(TermId(new_id as u32)).as_deref(), Some(t));
+        }
+        for (t, old_id) in &live {
+            assert_eq!(map[old_id.0 as usize], dict.get_id(t).unwrap().0);
+        }
+        let new_id = dict.insert("t99999-new");
+        assert_eq!(new_id, TermId(dict.len() as u32 - 1));
+        let gone = expected[expected.len() / 2].1;
+        assert_eq!(dict.remove(gone), Some(TermId(expected.len() as u32 / 2)));
+        assert_eq!(dict.get_id(gone), None);
+        assert_eq!(dict.get_term(new_id).as_deref(), Some("t99999-new"));
     }
 
     #[test]
