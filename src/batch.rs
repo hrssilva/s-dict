@@ -1,6 +1,9 @@
 //! Owned, reusable batches whose ordering can be prepared off the writer
 //! thread.
 
+use crate::DictError;
+use crate::limits::MAX_BATCH_TEXT_BYTES;
+
 /// A batch's sorted, grouped order: `order` lists input indices in term
 /// order, and `starts` delimits each group of identical terms (plus a final
 /// end), so group `g` is `order[starts[g]..starts[g + 1]]`.
@@ -169,12 +172,23 @@ impl TermBatch {
         Self::default()
     }
 
-    /// Appends `term`. Panics if the batch's text would exceed 4 GiB.
-    pub fn push(&mut self, term: &str) {
+    /// Appends `term`, or refuses (the batch unchanged) if the batch's
+    /// text would exceed its 4 GiB limit (`u32` offsets).
+    pub fn try_push(&mut self, term: &str) -> Result<(), DictError> {
         let start = self.text.len();
+        let end = start + term.len();
+        if end > MAX_BATCH_TEXT_BYTES {
+            return Err(DictError::BatchTooLarge { len: end, max: MAX_BATCH_TEXT_BYTES });
+        }
         self.text.extend_from_slice(term.as_bytes());
-        let end = u32::try_from(self.text.len()).expect("TermBatch text fits u32 offsets");
-        self.terms.push((start as u32, end));
+        // Both fit: `MAX_BATCH_TEXT_BYTES` is at most `u32::MAX`.
+        self.terms.push((start as u32, end as u32));
+        Ok(())
+    }
+
+    /// [`Self::try_push`], panicking on error.
+    pub fn push(&mut self, term: &str) {
+        self.try_push(term).unwrap_or_else(|e| panic!("{e}"));
     }
 
     pub fn clear(&mut self) {
@@ -278,6 +292,21 @@ mod tests {
             map.entry(t.clone()).or_default().push(i);
         }
         map.into_iter().collect()
+    }
+
+    /// Text beyond the limit (small in unit tests) is refused, leaving the
+    /// batch as it was.
+    #[test]
+    fn try_push_refuses_text_beyond_the_limit() {
+        let mut batch = TermBatch::new();
+        let chunk = "x".repeat(MAX_BATCH_TEXT_BYTES / 4);
+        for _ in 0..4 {
+            batch.try_push(&chunk).unwrap();
+        }
+        assert_eq!(batch.try_push("y"), Err(DictError::BatchTooLarge { len: MAX_BATCH_TEXT_BYTES + 1, max: MAX_BATCH_TEXT_BYTES }));
+        assert_eq!((batch.len(), batch.text_bytes()), (4, MAX_BATCH_TEXT_BYTES));
+        batch.try_push("").unwrap();
+        assert_eq!(batch.prepare().len(), 5);
     }
 
     #[test]

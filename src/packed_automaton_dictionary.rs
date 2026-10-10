@@ -11,9 +11,10 @@ use std::sync::Arc;
 use crate::batch::{BatchOrder, PreparedBatch};
 use crate::entries_arena::EntriesArena;
 use crate::fsst::SymbolTable;
+use crate::limits::{BLOCK_TEXT_LIMIT, MAX_TERM_BYTES};
 use crate::packed_automaton_block::{PackedAutomatonBlock, Workspace};
 use crate::range_map::RangeMap;
-use crate::{TermDictionary, TermId};
+use crate::{DictError, TermDictionary, TermId};
 
 /// Larger than an `fst` block's 64..=256: incremental merges make bigger
 /// blocks cheap here. On real RDF, 256..=1024 vs 64..=256 measured -8%
@@ -35,9 +36,9 @@ const SPLIT_FILL_PERCENT: usize = 90;
 const SYMBOL_SAMPLE_BLOCKS: usize = 64;
 const SYMBOL_SAMPLE_BYTES: usize = 1 << 20;
 
-/// Ids are `0..MAX_TERM_ID`: `u32::MAX` is never assigned, so `id + 1`
-/// (an id range's end) always fits.
-const MAX_TERM_ID: u32 = u32::MAX - 1;
+/// The default id limit: ids are below `u32::MAX`, so `id + 1` (an id
+/// range's end) always fits.
+const DEFAULT_ID_LIMIT: u32 = u32::MAX;
 
 #[derive(Debug)]
 pub struct PackedAutomatonDictionary {
@@ -51,6 +52,8 @@ pub struct PackedAutomatonDictionary {
     id_to_block: RangeMap,
     free_term_ids: Vec<u32>,
     next_term_id: u32,
+    /// Every id handed out is below this (`set_id_limit`).
+    id_limit: u32,
     block_min: usize,
     block_max: usize,
     len: usize,
@@ -69,17 +72,45 @@ impl Default for PackedAutomatonDictionary {
     }
 }
 
-/// Hands out term ids: freed ones first, then fresh ones. Panics once the
-/// `u32` id space is exhausted rather than wrapping (which would alias
-/// live ids).
-fn alloc_term_id(free_term_ids: &mut Vec<u32>, next_term_id: &mut u32) -> TermId {
+/// Hands out term ids: freed ones first, then fresh ones below
+/// `id_limit`. Callers check `ids_available` before mutating anything
+/// (`check_new_terms`); the assert only guards that premise, rather than
+/// wrapping into live ids.
+fn alloc_term_id(free_term_ids: &mut Vec<u32>, next_term_id: &mut u32, id_limit: u32) -> TermId {
     if let Some(id) = free_term_ids.pop() {
         return TermId(id);
     }
     let id = *next_term_id;
-    assert!(id <= MAX_TERM_ID, "TermId space exhausted");
+    assert!(id < id_limit, "id availability is checked before mutating");
     *next_term_id = id + 1;
     TermId(id)
+}
+
+/// Ends of the chunks a rebuild splits `total` sorted entries into:
+/// `chunks` balanced ones by count, each further cut so it holds at most
+/// `BLOCK_TEXT_LIMIT` bytes of text (or a single term), which keeps every
+/// fresh build addressable (`crate::limits`). `len_at(i)`: entry `i`'s
+/// term length.
+fn chunk_ends(total: usize, chunks: usize, len_at: impl Fn(usize) -> usize) -> Vec<usize> {
+    let chunks = chunks.clamp(1, total.max(1));
+    let (base, extra) = (total / chunks, total % chunks);
+    let mut ends = Vec::with_capacity(chunks);
+    let mut start = 0;
+    for chunk in 0..chunks {
+        let end = start + base + usize::from(chunk < extra);
+        let mut text = 0u64;
+        for i in start..end {
+            let len = len_at(i) as u64;
+            if text > 0 && text + len > BLOCK_TEXT_LIMIT {
+                ends.push(i);
+                text = 0;
+            }
+            text += len;
+        }
+        ends.push(end);
+        start = end;
+    }
+    ends
 }
 
 impl PackedAutomatonDictionary {
@@ -101,6 +132,7 @@ impl PackedAutomatonDictionary {
             id_to_block: RangeMap::new(),
             free_term_ids: Vec::new(),
             next_term_id: 0,
+            id_limit: DEFAULT_ID_LIMIT,
             block_min,
             block_max,
             len: 0,
@@ -112,9 +144,47 @@ impl PackedAutomatonDictionary {
 
     /// Inserts a batch prepared off the writer thread (`TermBatch::prepare`
     /// sorted and grouped it). Returns ids in original input order,
-    /// including duplicate occurrences.
+    /// including duplicate occurrences. Panics where
+    /// [`Self::try_insert_prepared`] returns an error.
     pub fn insert_prepared(&mut self, batch: &PreparedBatch) -> Vec<TermId> {
-        self.insert_ordered(batch.order(), |u| batch.term(batch.order().first(u)))
+        self.try_insert_prepared(batch).unwrap_or_else(|e| panic!("{e}"))
+    }
+
+    /// [`Self::insert_prepared`], or an error (nothing inserted) if a term
+    /// exceeds the term size limit or the batch needs more new ids than
+    /// remain below the id limit.
+    pub fn try_insert_prepared(&mut self, batch: &PreparedBatch) -> Result<Vec<TermId>, DictError> {
+        let order = batch.order();
+        self.try_insert_ordered(order, |u| batch.term(order.first(u)))
+    }
+
+    /// Ids still available to new terms: freed ids plus those below the id
+    /// limit not yet handed out.
+    pub fn ids_available(&self) -> u64 {
+        self.free_term_ids.len() as u64 + u64::from(self.id_limit - self.next_term_id)
+    }
+
+    /// Checks, without changing anything, that inserting the distinct
+    /// `uniques` would succeed: every term within the size limit, and ids
+    /// for the new ones. Counts the new terms exactly only when the
+    /// distinct count alone could exceed the ids available.
+    fn check_new_terms(&self, uniques: &[&[u8]]) -> Result<(), DictError> {
+        if let Some(len) = uniques.iter().map(|t| t.len()).find(|&len| len > MAX_TERM_BYTES) {
+            return Err(DictError::TermTooLarge { len, max: MAX_TERM_BYTES });
+        }
+        let available = self.ids_available();
+        if uniques.len() as u64 <= available {
+            return Ok(());
+        }
+        let needed = uniques.iter().filter(|t| !self.contains_bytes(t)).count() as u64;
+        if needed > available {
+            return Err(DictError::IdsExhausted { needed, available });
+        }
+        Ok(())
+    }
+
+    fn contains_bytes(&self, term: &[u8]) -> bool {
+        self.route(term).is_some_and(|dir_idx| self.block(self.directory[dir_idx].1).contains_bytes(term))
     }
 
     /// End of a load: compacts every block to its exact minimal automaton
@@ -412,32 +482,44 @@ impl PackedAutomatonDictionary {
         Some(self.directory.partition_point(|(min_key, _)| min_key.as_ref() <= term).saturating_sub(1))
     }
 
-    /// Splits the block at `dir_idx`, if it exceeds `block_max`, into
-    /// balanced chunks of at most `SPLIT_FILL_PERCENT` of `block_max` (and
-    /// at least `block_min`) -- rather than by repeated median halving,
-    /// which leaves blocks anywhere from half to completely full after a
-    /// large batch run (DESIGN.md's "block size and fill").
+    /// Splits the block at `dir_idx`, if it exceeds `block_max` terms or
+    /// `BLOCK_TEXT_LIMIT` bytes of text, into balanced chunks of at most
+    /// `SPLIT_FILL_PERCENT` of `block_max` (and at least `block_min`) --
+    /// rather than by repeated median halving, which leaves blocks anywhere
+    /// from half to completely full after a large batch run (DESIGN.md's
+    /// "block size and fill") -- cut further by text (`chunk_ends`).
     fn split_while_oversized(&mut self, dir_idx: usize) {
-        let block_id = self.directory[dir_idx].1;
-        let total = self.block(block_id).len();
-        if total <= self.block_max {
+        let block = self.block(self.directory[dir_idx].1);
+        if block.len() <= self.block_max && block.text_bytes() <= BLOCK_TEXT_LIMIT {
             return;
         }
-        let target = (self.block_max * SPLIT_FILL_PERCENT / 100).max(2 * self.block_min);
-        let chunks = total.div_ceil(target);
-        let (base, extra) = (total / chunks, total % chunks);
-
         let mut arena = std::mem::take(&mut self.workspace.entries);
         arena.clear();
-        self.decode_block(block_id, &mut arena);
-        let mut new_directory = Vec::with_capacity(chunks - 1);
+        self.decode_block(self.directory[dir_idx].1, &mut arena);
+        self.replace_with_chunks(dir_idx, &arena);
+        self.workspace.entries = arena;
+    }
+
+    /// Replaces the block at `dir_idx` with fresh blocks over `arena`'s
+    /// entries (sorted, non-empty, all routed to this block): one if they
+    /// fit `block_max`, else balanced chunks of the split fill, all cut by
+    /// text (`chunk_ends`). The first chunk keeps the block's slot.
+    fn replace_with_chunks(&mut self, dir_idx: usize, arena: &EntriesArena) {
+        debug_assert!(arena.len() > 0, "a block holds at least one term");
+        let total = arena.len();
+        let target = (self.block_max * SPLIT_FILL_PERCENT / 100).max(2 * self.block_min);
+        let chunks = if total <= self.block_max { 1 } else { total.div_ceil(target) };
+        let ends = chunk_ends(total, chunks, |i| arena.term_at(i).len());
+        let block_id = self.directory[dir_idx].1;
+        let mut new_directory = Vec::with_capacity(ends.len() - 1);
         let mut start = 0;
-        for chunk in 0..chunks {
-            let end = start + base + usize::from(chunk < extra);
+        for (chunk, &end) in ends.iter().enumerate() {
             let block = PackedAutomatonBlock::build(arena.terms(start..end), arena.ids(start..end), &mut self.workspace.automaton);
-            // The first chunk keeps the original id and min key.
             let chunk_id = if chunk == 0 {
                 *self.block_mut(block_id) = block;
+                if self.directory[dir_idx].0.as_ref() != arena.term_at(0) {
+                    self.directory[dir_idx].0 = Box::from(arena.term_at(0));
+                }
                 block_id
             } else {
                 let id = self.alloc_block(block);
@@ -447,9 +529,71 @@ impl PackedAutomatonDictionary {
             self.assign_slots(chunk_id);
             start = end;
         }
-        self.workspace.entries = arena;
         // Shift the router's tail once, rather than once per chunk.
         self.directory.splice(dir_idx + 1..dir_idx + 1, new_directory);
+    }
+
+    /// Merges the sorted, distinct `run` into the block at `dir_idx` by
+    /// rebuilding it (`replace_with_chunks`): existing terms keep their
+    /// id, new ones get one; `resolved` gets each run term's id in order.
+    /// For runs an incremental merge can't be shown to fit
+    /// (`PackedAutomatonBlock::fits_incremental`). Returns the terms added.
+    fn merge_run_by_rebuild(&mut self, dir_idx: usize, run: &[&[u8]], mut resolved: impl FnMut(TermId)) -> usize {
+        let mut old = std::mem::take(&mut self.workspace.entries);
+        old.clear();
+        self.decode_block(self.directory[dir_idx].1, &mut old);
+        let mut merged = EntriesArena::new();
+        let (mut i, mut added) = (0, 0);
+        for &term in run {
+            while i < old.len() && old.term_at(i) < term {
+                merged.push(old.term_at(i), old.id_at(i));
+                i += 1;
+            }
+            let id = if i < old.len() && old.term_at(i) == term {
+                i += 1;
+                old.id_at(i - 1)
+            } else {
+                added += 1;
+                alloc_term_id(&mut self.free_term_ids, &mut self.next_term_id, self.id_limit)
+            };
+            merged.push(term, id);
+            resolved(id);
+        }
+        for j in i..old.len() {
+            merged.push(old.term_at(j), old.id_at(j));
+        }
+        self.workspace.entries = old;
+        self.len += added;
+        self.replace_with_chunks(dir_idx, &merged);
+        added
+    }
+
+    /// Removes `term` from the block at `dir_idx` by rebuilding it, for a
+    /// removal an incremental rewrite can't be shown to fit. Returns its
+    /// id; the block is replaced, dropped if emptied.
+    fn remove_by_rebuild(&mut self, dir_idx: usize, term: &[u8]) -> Option<TermId> {
+        let mut old = std::mem::take(&mut self.workspace.entries);
+        old.clear();
+        self.decode_block(self.directory[dir_idx].1, &mut old);
+        let found = (0..old.len()).find(|&i| old.term_at(i) == term);
+        let removed = found.map(|at| {
+            let mut rest = EntriesArena::new();
+            for i in (0..old.len()).filter(|&i| i != at) {
+                rest.push(old.term_at(i), old.id_at(i));
+            }
+            (old.id_at(at), rest)
+        });
+        self.workspace.entries = old;
+        let (id, rest) = removed?;
+        self.id_to_block.clear(id.0);
+        self.free_term_ids.push(id.0);
+        self.len -= 1;
+        if rest.len() == 0 {
+            self.remove_empty_block(dir_idx);
+        } else {
+            self.replace_with_chunks(dir_idx, &rest);
+        }
+        Some(id)
     }
 
     /// Appends `block_id`'s `(term, id)` entries to `arena`.
@@ -466,13 +610,14 @@ impl PackedAutomatonDictionary {
     }
 
     /// Merges the block at `dir_idx` with a neighbor (the next one, or the
-    /// previous one for the last block), then re-splits if oversized.
+    /// previous one for the last block), rebuilt as one block, or as split
+    /// chunks if the two exceed `block_max` terms or the text limit.
     fn merge_with_neighbor(&mut self, dir_idx: usize) {
         if self.directory.len() < 2 {
             return;
         }
-        let (keep_idx, absorb_idx) =
-            if dir_idx + 1 < self.directory.len() { (dir_idx, dir_idx + 1) } else { (dir_idx - 1, dir_idx) };
+        let keep_idx = if dir_idx + 1 < self.directory.len() { dir_idx } else { dir_idx - 1 };
+        let absorb_idx = keep_idx + 1;
         let keep_block_id = self.directory[keep_idx].1;
         let absorb_block_id = self.directory[absorb_idx].1;
 
@@ -480,31 +625,24 @@ impl PackedAutomatonDictionary {
         arena.clear();
         self.decode_block(keep_block_id, &mut arena);
         self.decode_block(absorb_block_id, &mut arena);
-        let all = 0..arena.len();
-        let rebuilt = PackedAutomatonBlock::build(arena.terms(all.clone()), arena.ids(all), &mut self.workspace.automaton);
-        self.workspace.entries = arena;
-        *self.block_mut(keep_block_id) = rebuilt;
-        self.assign_slots(keep_block_id);
-
         self.blocks[absorb_block_id as usize] = None;
         self.free_block_slots.push(absorb_block_id);
         self.directory.remove(absorb_idx);
-        self.split_while_oversized(keep_idx);
+        self.replace_with_chunks(keep_idx, &arena);
+        self.workspace.entries = arena;
     }
 
     /// The first batch into an empty dictionary: balanced blocks of at
     /// most `block_max` terms, built directly.
     fn bootstrap(&mut self, order: &BatchOrder, uniques: &[&[u8]], result: &mut [TermId]) {
         let total = uniques.len();
-        let chunks = total.div_ceil(self.block_max).max(1);
-        let (base, extra) = (total / chunks, total % chunks);
+        let ends = chunk_ends(total, total.div_ceil(self.block_max), |u| uniques[u].len());
         let mut chunk_ids = Vec::with_capacity(self.block_max.min(total));
         let mut start = 0;
-        for chunk in 0..chunks {
-            let end = start + base + usize::from(chunk < extra);
+        for end in ends {
             chunk_ids.clear();
             for u in start..end {
-                let id = alloc_term_id(&mut self.free_term_ids, &mut self.next_term_id);
+                let id = alloc_term_id(&mut self.free_term_ids, &mut self.next_term_id, self.id_limit);
                 chunk_ids.push(id);
                 for pos in order.positions(u) {
                     result[pos] = id;
@@ -523,16 +661,19 @@ impl PackedAutomatonDictionary {
 
     /// Inserts the distinct terms of `order` (sorted), routing each run of
     /// consecutive terms that falls in one block's key range to one
-    /// `merge_into` call. Returns ids in original input order.
-    fn insert_ordered<'a>(&mut self, order: &BatchOrder, term: impl Fn(usize) -> &'a [u8]) -> Vec<TermId> {
+    /// `merge_into` call (or a rebuild, for a run an incremental merge
+    /// can't be shown to fit). Returns ids in original input order, or an
+    /// error, checked before anything changes (`check_new_terms`).
+    fn try_insert_ordered<'a>(&mut self, order: &BatchOrder, term: impl Fn(usize) -> &'a [u8]) -> Result<Vec<TermId>, DictError> {
         let mut result = vec![TermId(0); order.len()];
         let uniques: Vec<&[u8]> = (0..order.unique_len()).map(term).collect();
         if uniques.is_empty() {
-            return result;
+            return Ok(result);
         }
+        self.check_new_terms(&uniques)?;
         if self.directory.is_empty() {
             self.bootstrap(order, &uniques, &mut result);
-            return result;
+            return Ok(result);
         }
 
         let mut u = 0;
@@ -543,10 +684,25 @@ impl PackedAutomatonDictionary {
                 None => uniques.len(),
             };
             let block_id = self.directory[dir_idx].1;
+            let run = &uniques[u..run_end];
+            let run_text: u64 = run.iter().map(|t| t.len() as u64).sum();
+            let block = self.block(block_id);
+            if !block.fits_incremental(run_text, block.text_bytes() + run_text) {
+                let mut k = u;
+                self.merge_run_by_rebuild(dir_idx, run, |id| {
+                    for pos in order.positions(k) {
+                        result[pos] = id;
+                    }
+                    k += 1;
+                });
+                u = run_end;
+                continue;
+            }
             let PackedAutomatonDictionary {
                 blocks,
                 free_term_ids,
                 next_term_id,
+                id_limit,
                 workspace,
                 slot_ids,
                 ..
@@ -555,9 +711,9 @@ impl PackedAutomatonDictionary {
             let mut k = u;
             let block = blocks[block_id as usize].as_mut().expect("a live block slot");
             let outcome = block.merge_into(
-                &uniques[u..run_end],
+                run,
                 || {
-                    let id = alloc_term_id(free_term_ids, next_term_id);
+                    let id = alloc_term_id(free_term_ids, next_term_id, *id_limit);
                     slot_ids.push(id.0);
                     id
                 },
@@ -579,7 +735,7 @@ impl PackedAutomatonDictionary {
             }
             u = run_end;
         }
-        result
+        Ok(result)
     }
 }
 
@@ -594,24 +750,37 @@ impl TermDictionary for PackedAutomatonDictionary {
         Some(self.block(block_id).term_at(local_rank as usize))
     }
 
-    fn insert(&mut self, term: &str) -> TermId {
+    fn try_insert(&mut self, term: &str) -> Result<TermId, DictError> {
         if let Some(id) = self.get_id(term) {
-            return id;
+            return Ok(id);
         }
         let mut order = BatchOrder::default();
         order.prepare(1, |_| term.as_bytes());
-        self.insert_ordered(&order, |_| term.as_bytes())[0]
+        Ok(self.try_insert_ordered(&order, |_| term.as_bytes())?[0])
     }
 
-    fn insert_batch(&mut self, terms: &[&str]) -> Vec<TermId> {
+    fn try_insert_batch(&mut self, terms: &[&str]) -> Result<Vec<TermId>, DictError> {
         let mut order = BatchOrder::default();
         order.prepare(terms.len(), |i| terms[i].as_bytes());
-        self.insert_ordered(&order, |u| terms[order.first(u)].as_bytes())
+        self.try_insert_ordered(&order, |u| terms[order.first(u)].as_bytes())
+    }
+
+    fn check_insert_batch(&self, terms: &[&str]) -> Result<(), DictError> {
+        let mut uniques: Vec<&[u8]> = terms.iter().map(|t| t.as_bytes()).collect();
+        if uniques.len() as u64 > self.ids_available() {
+            uniques.sort_unstable();
+            uniques.dedup();
+        }
+        self.check_new_terms(&uniques)
     }
 
     fn remove(&mut self, term: &str) -> Option<TermId> {
         let dir_idx = self.route(term.as_bytes())?;
         let block_id = self.directory[dir_idx].1;
+        let block = self.block(block_id);
+        if !block.fits_incremental(term.len() as u64, block.text_bytes()) {
+            return self.remove_by_rebuild(dir_idx, term.as_bytes());
+        }
         let (id, unchanged_prefix) = self.blocks[block_id as usize]
             .as_mut()
             .expect("a live block slot")
@@ -630,6 +799,13 @@ impl TermDictionary for PackedAutomatonDictionary {
             }
         }
         Some(id)
+    }
+
+    /// Ids handed out from now on stay below `limit`. Panics if an id at or
+    /// above it was already handed out.
+    fn set_id_limit(&mut self, limit: u32) {
+        assert!(self.next_term_id <= limit, "ids at or above the new limit are already in use");
+        self.id_limit = limit;
     }
 
     fn len(&self) -> usize {
@@ -806,6 +982,127 @@ mod tests {
         assert_eq!(dict.remove(gone), Some(TermId(expected.len() as u32 / 2)));
         assert_eq!(dict.get_id(gone), None);
         assert_eq!(dict.get_term(new_id).as_deref(), Some("t99999-new"));
+    }
+
+    /// Every term and id of `dict` matches `model` (term -> id).
+    fn assert_matches(dict: &PackedAutomatonDictionary, model: &std::collections::BTreeMap<String, TermId>) {
+        assert_eq!(dict.len(), model.len());
+        for (term, &id) in model {
+            assert_eq!(dict.get_id(term), Some(id));
+            assert_eq!(dict.get_term(id).as_deref(), Some(term.as_str()));
+        }
+    }
+
+    /// Long terms (unit-test limits: 256 KiB terms, 16-state chains, 4 MiB
+    /// of records per block) drive merges, removals and neighbor merges
+    /// through the rebuild paths; `next_address` asserts the write bound on
+    /// every write in debug builds.
+    #[test]
+    fn long_terms_stay_within_the_write_bounds() {
+        use crate::limits::MAX_TERM_BYTES;
+        let mut dict = PackedAutomatonDictionary::with_block_bounds(2, 8);
+        let mut model = std::collections::BTreeMap::new();
+        let mut x = 0x9E37_79B9u32;
+        let mut next = move || {
+            x ^= x << 13;
+            x ^= x >> 17;
+            x ^= x << 5;
+            x
+        };
+        let term = |n: u32, len: usize| {
+            let mut t = format!("<http://example.org/{}/", n % 7);
+            while t.len() < len {
+                t.push_str(&format!("{n:x}é"));
+            }
+            t.truncate(t.char_indices().map(|(i, _)| i).take_while(|&i| i <= len).last().unwrap_or(0));
+            t
+        };
+        for round in 0..30 {
+            let lens = [10, 200, 5_000, 60_000, MAX_TERM_BYTES / 2, MAX_TERM_BYTES];
+            let batch: Vec<String> = (0..6).map(|_| term(next() % 50, lens[(next() % 6) as usize])).collect();
+            let refs: Vec<&str> = batch.iter().map(String::as_str).collect();
+            let ids = if round % 3 == 0 { refs.iter().map(|t| dict.insert(t)).collect() } else { dict.insert_batch(&refs) };
+            for (t, id) in batch.iter().zip(ids) {
+                assert_eq!(*model.entry(t.clone()).or_insert(id), id);
+            }
+            if round % 4 == 3 {
+                let victims: Vec<String> = model.keys().step_by(3).cloned().collect();
+                for t in victims {
+                    assert_eq!(dict.remove(&t), model.remove(&t));
+                }
+            }
+            if round % 10 == 9 {
+                dict.shrink_to_fit();
+            }
+            assert_matches(&dict, &model);
+        }
+        assert!(dict.blocks.iter().flatten().all(|b| b.text_bytes() <= crate::limits::BLOCK_TEXT_LIMIT));
+    }
+
+    /// A term over the size limit is refused and changes nothing; one at
+    /// the limit is accepted.
+    #[test]
+    fn oversized_terms_are_refused_without_changes() {
+        use crate::limits::MAX_TERM_BYTES;
+        let mut dict = PackedAutomatonDictionary::with_block_bounds(2, 8);
+        let base: Vec<String> = (0..20).map(|i| format!("t{i:02}")).collect();
+        let refs: Vec<&str> = base.iter().map(String::as_str).collect();
+        dict.insert_batch(&refs);
+        let (len, size) = (dict.len(), dict.size_bytes());
+        let huge = "h".repeat(MAX_TERM_BYTES + 1);
+        let too_large = DictError::TermTooLarge { len: MAX_TERM_BYTES + 1, max: MAX_TERM_BYTES };
+        assert_eq!(dict.try_insert(&huge), Err(too_large.clone()));
+        assert_eq!(dict.try_insert_batch(&["new", &huge]), Err(too_large.clone()));
+        assert_eq!(dict.check_insert_batch(&["new", &huge]), Err(too_large));
+        assert_eq!((dict.len(), dict.size_bytes(), dict.get_id("new")), (len, size, None));
+        let at_limit = "h".repeat(MAX_TERM_BYTES);
+        let id = dict.try_insert(&at_limit).unwrap();
+        assert_eq!(dict.get_term(id).as_deref(), Some(at_limit.as_str()));
+    }
+
+    /// With an id limit, a batch needing more new ids than remain is
+    /// refused whole; terms already present and freed ids don't count
+    /// against it.
+    #[test]
+    fn id_limit_refuses_whole_batches() {
+        let mut dict = PackedAutomatonDictionary::with_block_bounds(2, 8);
+        dict.set_id_limit(10);
+        let first: Vec<String> = (0..8).map(|i| format!("a{i}")).collect();
+        let refs: Vec<&str> = first.iter().map(String::as_str).collect();
+        dict.insert_batch(&refs);
+        assert_eq!(dict.ids_available(), 2);
+        let (len, size) = (dict.len(), dict.size_bytes());
+        let err = dict.try_insert_batch(&["b0", "b1", "b2", "a0"]);
+        assert_eq!(err, Err(DictError::IdsExhausted { needed: 3, available: 2 }));
+        assert_eq!((dict.len(), dict.size_bytes(), dict.get_id("b0")), (len, size, None));
+        // Present terms and duplicates need no ids.
+        let ids = dict.try_insert_batch(&["a1", "b0", "a2", "b0", "b1", "a3"]).unwrap();
+        assert_eq!(ids[1], ids[3]);
+        assert_eq!(dict.ids_available(), 0);
+        assert!(matches!(dict.try_insert("c"), Err(DictError::IdsExhausted { needed: 1, available: 0 })));
+        assert_eq!(dict.try_insert("a5"), Ok(dict.get_id("a5").unwrap()));
+        // A freed id is available again.
+        let freed = dict.remove("a4").unwrap();
+        assert_eq!(dict.try_insert("c"), Ok(freed));
+        assert!(dict.blocks.iter().flatten().all(|b| b.len() > 0));
+    }
+
+    /// A sharded batch is checked on every shard before any inserts: one
+    /// shard out of ids leaves the others unchanged.
+    #[test]
+    fn sharded_batches_are_atomic_across_shards() {
+        use crate::ShardedDictionary;
+        let mut dict = ShardedDictionary::new(vec!["m".to_string()], || PackedAutomatonDictionary::with_block_bounds(2, 8));
+        // Two shards: shard 1 ids start at 1 << 31; leave it 3.
+        dict.set_id_limit((1u32 << 31) + 3);
+        let err = dict.try_insert_batch(&["a", "b", "x", "y", "z", "zz"]);
+        assert_eq!(err, Err(DictError::IdsExhausted { needed: 4, available: 3 }));
+        assert_eq!(dict.len(), 0);
+        let ids = dict.try_insert_batch(&["a", "b", "x", "y", "z"]).unwrap();
+        assert_eq!(ids[2].0, 1 << 31);
+        assert_eq!(dict.len(), 5);
+        assert!(dict.try_insert("zz").is_err());
+        assert_eq!(dict.try_insert("c"), Ok(TermId(2)));
     }
 
     #[test]

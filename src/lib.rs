@@ -15,6 +15,7 @@ mod batch;
 mod block_ids;
 mod entries_arena;
 mod fsst;
+mod limits;
 mod packed_automaton;
 mod packed_automaton_block;
 mod packed_automaton_dictionary;
@@ -39,6 +40,33 @@ struct ReadmeDoctests;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct TermId(pub u32);
 
+/// Why a fallible operation (`try_*`) refused: checked before anything is
+/// changed, so the dictionary is left exactly as it was.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DictError {
+    /// The operation needs `needed` new ids but only `available` remain
+    /// below the dictionary's id limit.
+    IdsExhausted { needed: u64, available: u64 },
+    /// A term is `len` bytes long; at most `max` are supported.
+    TermTooLarge { len: usize, max: usize },
+    /// A batch would hold `len` bytes of text; at most `max` are supported.
+    BatchTooLarge { len: usize, max: usize },
+}
+
+impl std::fmt::Display for DictError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match *self {
+            DictError::IdsExhausted { needed, available } => {
+                write!(f, "term ids exhausted: {needed} new ids needed, {available} available")
+            }
+            DictError::TermTooLarge { len, max } => write!(f, "term of {len} bytes exceeds the {max}-byte limit"),
+            DictError::BatchTooLarge { len, max } => write!(f, "batch of {len} text bytes exceeds the {max}-byte limit"),
+        }
+    }
+}
+
+impl std::error::Error for DictError {}
+
 /// The bidirectional operation surface of the dictionaries in this crate
 /// (a [`PackedAutomatonDictionary`], or a [`ShardedDictionary`] of them).
 pub trait TermDictionary {
@@ -56,21 +84,39 @@ pub trait TermDictionary {
     }
 
     /// Inserts `term`, returning its id. Idempotent: re-inserting a term
-    /// already present returns its existing id unchanged.
-    fn insert(&mut self, term: &str) -> TermId;
+    /// already present returns its existing id unchanged. On error nothing
+    /// changes: see [`DictError`].
+    fn try_insert(&mut self, term: &str) -> Result<TermId, DictError>;
 
-    /// Inserts many terms at once. The default implementation just calls
-    /// [`insert`](Self::insert) in a loop; implementations that can batch
-    /// work by destination (e.g. grouping by block) should override this.
-    fn insert_batch(&mut self, terms: &[&str]) -> Vec<TermId> {
-        terms.iter().map(|t| self.insert(t)).collect()
+    /// [`try_insert`](Self::try_insert), panicking on error.
+    fn insert(&mut self, term: &str) -> TermId {
+        self.try_insert(term).unwrap_or_else(|e| panic!("{e}"))
     }
+
+    /// Inserts many terms at once, returning ids in input order (duplicates
+    /// share one). Atomic: on error nothing is inserted.
+    fn try_insert_batch(&mut self, terms: &[&str]) -> Result<Vec<TermId>, DictError>;
+
+    /// [`try_insert_batch`](Self::try_insert_batch), panicking on error.
+    fn insert_batch(&mut self, terms: &[&str]) -> Vec<TermId> {
+        self.try_insert_batch(terms).unwrap_or_else(|e| panic!("{e}"))
+    }
+
+    /// Whether [`try_insert_batch`](Self::try_insert_batch) of `terms`
+    /// would succeed right now, without changing anything (how
+    /// [`ShardedDictionary`] keeps a batch over several shards atomic).
+    fn check_insert_batch(&self, terms: &[&str]) -> Result<(), DictError>;
 
     /// Removes `term` if present, returning its former id.
     fn remove(&mut self, term: &str) -> Option<TermId>;
 
     /// The number of terms currently in the dictionary.
     fn len(&self) -> usize;
+
+    /// From now on, ids handed out stay below `limit` (inserts that would
+    /// need more report [`DictError::IdsExhausted`]). Panics if an id at
+    /// or above `limit` was already handed out.
+    fn set_id_limit(&mut self, limit: u32);
 
     /// `true` if the dictionary has no terms.
     fn is_empty(&self) -> bool {

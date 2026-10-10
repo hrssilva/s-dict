@@ -1026,19 +1026,26 @@ impl PackedAutomaton {
                 } else {
                     let label: Vec<u8> = labels[start..].iter().rev().copied().collect();
                     labels.truncate(start);
-                    moved[p] = if label.len() == 1 {
-                        self.append_record(false, &[(label[0], 0, target)])
-                    } else {
-                        coded.clear();
-                        if let Some(table) = &symbols {
-                            table.encode(&label, &mut coded);
-                        }
-                        if !coded.is_empty() && coded.len() < label.len() {
-                            self.append_chain(&coded, target, true)
+                    // At most `MAX_CHAIN_STATES` per chain record, last
+                    // piece first (each points at the next): expanding one
+                    // chain stays bounded (`crate::limits`).
+                    let mut next = target;
+                    for piece in label.rchunks(crate::limits::MAX_CHAIN_STATES) {
+                        next = if piece.len() == 1 {
+                            self.append_record(false, &[(piece[0], 0, next)])
                         } else {
-                            self.append_chain(&label, target, false)
-                        }
-                    };
+                            coded.clear();
+                            if let Some(table) = &symbols {
+                                table.encode(piece, &mut coded);
+                            }
+                            if !coded.is_empty() && coded.len() < piece.len() {
+                                self.append_chain(&coded, next, true)
+                            } else {
+                                self.append_chain(piece, next, false)
+                            }
+                        };
+                    }
+                    moved[p] = next;
                 }
             } else {
                 mapped.clear();
@@ -1112,12 +1119,14 @@ impl PackedAutomaton {
         true
     }
 
-    /// The address the next appended byte gets. Record addresses are `u32`:
-    /// a block whose records outgrow 4 GiB (a huge term, or a huge batch
-    /// run into one block before it splits) panics here rather than
-    /// wrapping into wrong addresses. Input-dependent, so always checked.
+    /// The address the next appended byte gets. Record addresses are `u32`;
+    /// callers check every mutation against the write bounds in
+    /// `crate::limits` first (taking a rebuild path otherwise), so records
+    /// never outgrow them. Still checked in release builds: a wrapped
+    /// address would silently corrupt the block.
     #[inline]
     fn next_address(&self) -> u32 {
+        debug_assert!(self.bytes.len() as u64 <= crate::limits::ADDRESS_LIMIT, "write bound exceeded");
         u32::try_from(self.bytes.len()).expect("a block's records exceed 4 GiB")
     }
 

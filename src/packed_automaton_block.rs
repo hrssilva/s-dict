@@ -55,6 +55,8 @@ pub(crate) struct PackedAutomatonBlock {
     compact_bytes_per_term: f32,
     /// `rank -> TermId`, compressed.
     ids: BlockIds,
+    /// Total bytes of the block's terms (`crate::limits` bounds it).
+    text_bytes: u64,
 }
 
 /// What a `merge_into` changed.
@@ -80,12 +82,14 @@ impl PackedAutomatonBlock {
         ws: &mut packed_automaton::Workspace,
     ) -> PackedAutomatonBlock {
         debug_assert_eq!(terms.len(), ids.len());
-        let mut packed = PackedAutomaton::build_sorted(terms, ws);
+        let mut text_bytes = 0u64;
+        let mut packed = PackedAutomaton::build_sorted(terms.inspect(|t| text_bytes += t.len() as u64), ws);
         packed.shrink_to_fit();
         PackedAutomatonBlock {
             compact_bytes_per_term: bytes_per_term(&packed, ids.len()),
             packed,
             ids: BlockIds::new(ids),
+            text_bytes,
         }
     }
 
@@ -107,6 +111,21 @@ impl PackedAutomatonBlock {
 
     pub(crate) fn len(&self) -> usize {
         self.ids.len()
+    }
+
+    pub(crate) fn text_bytes(&self) -> u64 {
+        self.text_bytes
+    }
+
+    /// Whether an incremental mutation over `text` input bytes, leaving
+    /// `text_after` bytes of terms in the block, provably keeps its records
+    /// addressable (`crate::limits`); otherwise the caller rebuilds.
+    pub(crate) fn fits_incremental(&self, text: u64, text_after: u64) -> bool {
+        crate::limits::incremental_fits(self.packed.size_bytes(), text, text_after)
+    }
+
+    pub(crate) fn contains_bytes(&self, term: &[u8]) -> bool {
+        self.packed.lower_bound(term).1
     }
 
     pub(crate) fn rank(&self, term: &str) -> Option<usize> {
@@ -218,6 +237,7 @@ impl PackedAutomatonBlock {
         };
         let added = ws.new_terms.len();
         if added > 0 {
+            self.text_bytes += ws.new_terms.iter().map(|&i| incoming[i as usize].len() as u64).sum::<u64>();
             let terms = ws.new_terms.iter().map(|&i| incoming[i as usize]);
             self.packed.insert_sorted(terms, &mut ws.automaton);
             self.ids = BlockIds::new(&ws.new_ids);
@@ -318,6 +338,7 @@ impl PackedAutomatonBlock {
         self.ids.decode_into(&mut ws.new_ids);
         let removed_id = ws.new_ids.remove(rank);
         self.ids = BlockIds::new(&ws.new_ids);
+        self.text_bytes -= term.len() as u64;
         self.settle(ws);
         Some((removed_id, rank))
     }

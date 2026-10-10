@@ -9,7 +9,7 @@
 //! Each shard's own ids are dense from 0; a global [`TermId`] carries the
 //! shard index in its top `shard_bits` bits.
 
-use crate::{TermDictionary, TermId};
+use crate::{DictError, TermDictionary, TermId};
 
 #[derive(Debug)]
 pub struct ShardedDictionary<D> {
@@ -22,7 +22,9 @@ pub struct ShardedDictionary<D> {
 
 impl<D: TermDictionary> ShardedDictionary<D> {
     /// One shard per range delimited by `bounds` (`bounds.len() + 1`
-    /// shards), each built by `make`.
+    /// shards), each built by `make` and limited to the local id space its
+    /// global ids leave it (`TermDictionary::set_id_limit`), so a shard
+    /// refuses an insert rather than handing out an id that doesn't fit.
     pub fn new(bounds: Vec<String>, mut make: impl FnMut() -> D) -> Self {
         assert!(
             bounds.windows(2).all(|w| w[0] < w[1]),
@@ -31,11 +33,26 @@ impl<D: TermDictionary> ShardedDictionary<D> {
         let shards: Vec<D> = (0..=bounds.len()).map(|_| make()).collect();
         let shard_bits = usize::BITS - (shards.len() - 1).leading_zeros();
         assert!(shard_bits <= 16, "at most 65,536 shards");
-        ShardedDictionary {
+        let mut dict = ShardedDictionary {
             shards,
             bounds: bounds.into_iter().map(String::into_boxed_str).collect(),
             shard_bits,
+        };
+        if shard_bits > 0 {
+            dict.set_id_limit(u32::MAX);
         }
+        dict
+    }
+
+    /// Each shard's sub-batch of `terms`: `(input positions, terms)`.
+    fn per_shard<'a>(&self, terms: &[&'a str]) -> Vec<(Vec<usize>, Vec<&'a str>)> {
+        let mut per_shard: Vec<(Vec<usize>, Vec<&str>)> = vec![Default::default(); self.shards.len()];
+        for (pos, &term) in terms.iter().enumerate() {
+            let (positions, sub) = &mut per_shard[self.shard_of(term)];
+            positions.push(pos);
+            sub.push(term);
+        }
+        per_shard
     }
 
     /// Up to `shards - 1` bounds that split the *distinct* terms of the
@@ -97,7 +114,9 @@ impl<D: TermDictionary> ShardedDictionary<D> {
         &mut self.shards
     }
 
-    /// The global id of `shard`'s local id `local`.
+    /// The global id of `shard`'s local id `local`. Panics if `local`
+    /// doesn't fit the shard's local id space, which only a shard ignoring
+    /// its id limit (`TermDictionary::set_id_limit`) hands out.
     #[inline]
     pub fn global_id(&self, shard: usize, local: TermId) -> TermId {
         if self.shard_bits == 0 {
@@ -106,7 +125,7 @@ impl<D: TermDictionary> ShardedDictionary<D> {
         let local_bits = 32 - self.shard_bits;
         assert!(
             local.0 >> local_bits == 0,
-            "shard {shard} exceeded its {local_bits}-bit local id space"
+            "shard {shard} handed out an id beyond its {local_bits}-bit id limit"
         );
         TermId(((shard as u32) << local_bits) | local.0)
     }
@@ -156,32 +175,43 @@ impl<D: TermDictionary> TermDictionary for ShardedDictionary<D> {
         self.shards.get(shard)?.get_term(local)
     }
 
-    fn insert(&mut self, term: &str) -> TermId {
+    fn try_insert(&mut self, term: &str) -> Result<TermId, DictError> {
         let shard = self.shard_of(term);
-        let local = self.shards[shard].insert(term);
-        self.global_id(shard, local)
+        let local = self.shards[shard].try_insert(term)?;
+        Ok(self.global_id(shard, local))
     }
 
-    /// Routes each term to its shard, inserts each shard's sub-batch with
-    /// one `insert_batch` call, and returns ids in input order.
-    fn insert_batch(&mut self, terms: &[&str]) -> Vec<TermId> {
-        let mut per_shard: Vec<(Vec<usize>, Vec<&str>)> = vec![Default::default(); self.shards.len()];
-        for (pos, &term) in terms.iter().enumerate() {
-            let (positions, sub) = &mut per_shard[self.shard_of(term)];
-            positions.push(pos);
-            sub.push(term);
+    /// Routes each term to its shard, checks every shard's sub-batch
+    /// (`check_insert_batch`, so a refusal leaves every shard unchanged),
+    /// then inserts each with one `try_insert_batch` call. Ids in input
+    /// order.
+    fn try_insert_batch(&mut self, terms: &[&str]) -> Result<Vec<TermId>, DictError> {
+        let per_shard = self.per_shard(terms);
+        for (shard, (_, sub)) in per_shard.iter().enumerate() {
+            if !sub.is_empty() {
+                self.shards[shard].check_insert_batch(sub)?;
+            }
         }
         let mut result = vec![TermId(0); terms.len()];
         for (shard, (positions, sub)) in per_shard.into_iter().enumerate() {
             if sub.is_empty() {
                 continue;
             }
-            let ids = self.shards[shard].insert_batch(&sub);
+            let ids = self.shards[shard].try_insert_batch(&sub)?;
             for (pos, local) in positions.into_iter().zip(ids) {
                 result[pos] = self.global_id(shard, local);
             }
         }
-        result
+        Ok(result)
+    }
+
+    fn check_insert_batch(&self, terms: &[&str]) -> Result<(), DictError> {
+        for (shard, (_, sub)) in self.per_shard(terms).iter().enumerate() {
+            if !sub.is_empty() {
+                self.shards[shard].check_insert_batch(sub)?;
+            }
+        }
+        Ok(())
     }
 
     fn remove(&mut self, term: &str) -> Option<TermId> {
@@ -192,6 +222,21 @@ impl<D: TermDictionary> TermDictionary for ShardedDictionary<D> {
 
     fn len(&self) -> usize {
         self.shards.iter().map(TermDictionary::len).sum()
+    }
+
+    /// Global ids below `limit`: each shard gets the part of its local id
+    /// space whose global ids stay below `limit`.
+    fn set_id_limit(&mut self, limit: u32) {
+        if self.shard_bits == 0 {
+            self.shards[0].set_id_limit(limit);
+            return;
+        }
+        let local_bits = 32 - self.shard_bits;
+        for (i, shard) in self.shards.iter_mut().enumerate() {
+            let base = (i as u64) << local_bits;
+            let local_limit = (u64::from(limit).saturating_sub(base)).min(1 << local_bits);
+            shard.set_id_limit(local_limit as u32);
+        }
     }
 }
 

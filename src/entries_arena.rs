@@ -19,8 +19,10 @@ pub(crate) struct EntriesArena {
     /// Concatenated term bytes (decoded from blocks, so not re-validated as
     /// UTF-8: see `crate::packed_automaton::decoded_term`).
     text: Vec<u8>,
-    /// End offsets into `text`, one per ID; an empty arena needs no allocation.
-    offsets: Vec<u32>,
+    /// End offsets into `text`, one per ID; an empty arena needs no
+    /// allocation. `usize`: a rebuild may merge a large batch run into one
+    /// block's entries (`crate::limits`).
+    offsets: Vec<usize>,
     ids: Vec<TermId>,
 }
 
@@ -51,16 +53,11 @@ impl EntriesArena {
     }
 
     pub(crate) fn term_at(&self, i: usize) -> &[u8] {
-        let start = if i == 0 {
-            0
-        } else {
-            self.offsets[i - 1] as usize
-        };
-        let end = self.offsets[i] as usize;
+        let start = if i == 0 { 0 } else { self.offsets[i - 1] };
+        let end = self.offsets[i];
         &self.text[start..end]
     }
 
-    #[cfg(test)]
     pub(crate) fn id_at(&self, i: usize) -> TermId {
         self.ids[i]
     }
@@ -68,8 +65,7 @@ impl EntriesArena {
     /// Appends one entry to the end.
     pub(crate) fn push(&mut self, term: &[u8], id: TermId) {
         self.text.extend_from_slice(term);
-        self.offsets
-            .push(u32::try_from(self.text.len()).expect("scratch arena exceeds 32-bit offsets"));
+        self.offsets.push(self.text.len());
         self.ids.push(id);
     }
 
