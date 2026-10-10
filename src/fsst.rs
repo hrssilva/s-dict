@@ -167,6 +167,39 @@ impl SymbolTable {
         }
     }
 
+    /// [`Self::decode`] of codes from outside (a loaded file): refuses an
+    /// unknown code or a trailing escape instead of misreading them.
+    pub(crate) fn checked_decode(&self, codes: &[u8], out: &mut Vec<u8>) -> Result<(), &'static str> {
+        let mut i = 0;
+        while i < codes.len() {
+            let code = codes[i];
+            if code == ESCAPE {
+                out.push(*codes.get(i + 1).ok_or("truncated escape in a coded chain label")?);
+                i += 2;
+            } else {
+                if code as usize >= self.lens.len() {
+                    return Err("unknown symbol code in a coded chain label");
+                }
+                out.extend_from_slice(self.symbol(code));
+                i += 1;
+            }
+        }
+        Ok(())
+    }
+
+    /// Every symbol, by code (persistence).
+    pub(crate) fn symbols(&self) -> impl Iterator<Item = &[u8]> {
+        (0..self.lens.len() as u8).map(|code| self.symbol(code))
+    }
+
+    /// A table from persisted symbols: at most 255, each 1-8 bytes.
+    pub(crate) fn from_persisted(symbols: Vec<Vec<u8>>) -> Result<SymbolTable, &'static str> {
+        if symbols.len() > MAX_SYMBOLS || symbols.iter().any(|s| s.is_empty() || s.len() > 8) {
+            return Err("invalid symbol table");
+        }
+        Ok(SymbolTable::from_symbols(symbols))
+    }
+
     /// Decoded length of `codes`.
     pub(crate) fn decoded_len(&self, codes: &[u8]) -> usize {
         let (mut i, mut n) = (0, 0);

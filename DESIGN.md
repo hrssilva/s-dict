@@ -4992,3 +4992,48 @@ co-occurrence) did worse than term order (131.5 / 132.6 MiB of graph vs
 with the returned mapping (PRODUCTION_READINESS.md, item 3). New terms
 afterwards take `len()` and later ids, out of rank order, until the next
 renumbering.
+
+## Fallible operations, persistence and mapped loads
+
+**Limits before mutation.** Insertions refuse (`DictError`) before
+changing anything: ids are counted against the id limit (exactly, by
+lookup, only when the batch's distinct terms could exceed it), terms
+against a size limit, batches against their `u32` offsets. Block records
+are `u32`-addressed; rather than make every write fallible (which would
+need rollback across blocks), every mutation is checked against a provable
+bound on what it can write (`src/limits.rs`: 13 bytes per text byte for a
+fresh build, compaction or path compression; per input byte, one rewritten
+256-transition record plus one expanded chain for an incremental merge or
+removal), with a rebuild in chunks bounded by count and text where the
+incremental path can't be shown to fit. Chains are capped at 4,096 states
+so expanding one is bounded; blocks split by text as well as by count.
+Unit tests run with a 4 MiB address limit and 16-state chains, so the
+rebuild paths run, and `next_address` asserts the bound in debug builds.
+The checks cost nothing measurable (10M lines, interleaved: insertion
+12.4 s before and after).
+
+**Format.** A header (checksum over the header fields and payload), the
+symbol table, free ids, a block table, block ids and the records. Ids are
+stored as `BlockIds` keeps them -- interleaved runs plus a bit-packed run
+label per rank, or offsets from the minimum when smaller: storing only
+runs of consecutive ids in rank order made the reference file 41.8 MiB
+(ids 16 MiB) instead of 28.0 MiB.
+
+**Validation instead of trust.** A loaded block's records are parsed once
+by a checked mirror of the readers (`parse_checked`), so every address the
+readers will compute is known in range; targets always lie below their
+record, so the record graph is acyclic and counts are computed in address
+order and compared with every stored output; UTF-8 is checked on the
+automaton (one visit per record and decoder state) rather than per term.
+Randomized corruption (checksum fixed up) found one gap during
+development: the checksum first covered only the payload, so a flipped id
+limit loaded as a different, valid dictionary.
+
+**Borrowed records.** `load_shared` and `map` borrow each block's records
+from one image until the block's first mutation. A `Records` enum (owned
+or shared) matched on every read cost +16% insertion and +8% `get_id` even
+with only owned records; a pointer/length view kept current by the single
+mutation path (`RecordsMut`'s drop) brought both back to the baseline
+(12.27 s vs 12.42 s insertion, lookups within 1%), for +0.6% retained
+memory.
+

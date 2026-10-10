@@ -8,6 +8,9 @@
 
 use std::sync::Arc;
 
+mod persist;
+pub use persist::LoadError;
+
 use crate::batch::{BatchOrder, PreparedBatch};
 use crate::entries_arena::EntriesArena;
 use crate::fsst::SymbolTable;

@@ -283,7 +283,7 @@ struct StagingFrame {
 #[allow(dead_code)]
 #[derive(Clone, Debug)]
 pub(crate) struct PackedAutomaton {
-    bytes: Vec<u8>,
+    bytes: crate::records::Records,
     root: u32,
     /// The root's subtree count (= number of terms). The only count
     /// stored anywhere: every other state's count is derived top-down
@@ -408,7 +408,7 @@ impl Workspace {
 impl PackedAutomaton {
     fn empty() -> PackedAutomaton {
         PackedAutomaton {
-            bytes: Vec::new(),
+            bytes: crate::records::Records::default(),
             root: 0,
             term_count: 0,
             has_chains: false,
@@ -1152,29 +1152,30 @@ impl PackedAutomaton {
             let next = !self.bytes.is_empty() && target as usize == self.bytes.len() - 1;
             if !next {
                 let field = self.next_address();
-                write_leb128_rev(&mut self.bytes, field - target);
+                write_leb128_rev(&mut self.bytes.to_mut(), field - target);
             }
             let code = label_table().code(byte);
             if code == 0 {
-                self.bytes.push(byte);
+                self.bytes.to_mut().push(byte);
             }
-            self.bytes.push(0x80 | (u8::from(next) << 6) | code);
+            self.bytes.to_mut().push(0x80 | (u8::from(next) << 6) | code);
             return self.next_address() - 1;
         }
         // General form: `0 F nnnnnn`, transitions written in reverse so
         // the record reads forward from its header downward.
         for (i, &(b, out, target)) in children.iter().enumerate().rev() {
             let field = self.next_address();
-            write_leb128_rev(&mut self.bytes, field - target);
+            write_leb128_rev(&mut self.bytes.to_mut(), field - target);
             if i > 0 {
-                write_leb128_rev(&mut self.bytes, out);
+                write_leb128_rev(&mut self.bytes.to_mut(), out);
             }
-            self.bytes.push(b);
+            self.bytes.to_mut().push(b);
         }
         if children.len() >= PACKED_COUNT_ESCAPE {
-            self.bytes.push((children.len() - PACKED_COUNT_ESCAPE) as u8);
+            self.bytes.to_mut().push((children.len() - PACKED_COUNT_ESCAPE) as u8);
         }
         self.bytes
+            .to_mut()
             .push((u8::from(is_final) << 6) | children.len().min(PACKED_COUNT_ESCAPE) as u8);
         self.next_address() - 1
     }
@@ -1389,13 +1390,13 @@ impl PackedAutomaton {
             next = !self.bytes.is_empty() && target as usize == self.bytes.len() - 1;
             if !next {
                 let field = self.next_address();
-                write_leb128_rev(&mut self.bytes, field - target);
+                write_leb128_rev(&mut self.bytes.to_mut(), field - target);
             }
-            self.bytes.extend_from_slice(label);
+            self.bytes.to_mut().extend_from_slice(label);
         }
         let len = u32::try_from(label.len()).expect("chain label fits u32");
-        write_leb128_rev(&mut self.bytes, len << 2 | u32::from(coded) << 1 | u32::from(next));
-        self.bytes.push(0);
+        write_leb128_rev(&mut self.bytes.to_mut(), len << 2 | u32::from(coded) << 1 | u32::from(next));
+        self.bytes.to_mut().push(0);
         self.next_address() - 1
     }
 
@@ -1992,6 +1993,359 @@ pub(crate) fn decoded_term(bytes: Vec<u8>) -> String {
     // SAFETY: by the premise above, `bytes` is a complete term that was
     // inserted as a `&str`, hence valid UTF-8.
     unsafe { String::from_utf8_unchecked(bytes) }
+}
+
+/// `PackedAutomaton` flag bits as persisted (`crate::packed_automaton_dictionary::persist`).
+pub(crate) const FLAG_HAS_CHAINS: u8 = 1;
+pub(crate) const FLAG_PRISTINE: u8 = 2;
+pub(crate) const FLAG_CHAINS_CODED: u8 = 4;
+const KNOWN_FLAGS: u8 = FLAG_HAS_CHAINS | FLAG_PRISTINE | FLAG_CHAINS_CODED;
+
+impl PackedAutomaton {
+    /// `(records, root, term count, flags)`, for persistence.
+    pub(crate) fn parts(&self) -> (&[u8], u32, u32, u8) {
+        let flags = (u8::from(self.has_chains) * FLAG_HAS_CHAINS)
+            | (u8::from(self.pristine) * FLAG_PRISTINE)
+            | (u8::from(self.chains_coded) * FLAG_CHAINS_CODED);
+        (&self.bytes, self.root, self.term_count, flags)
+    }
+
+    pub(crate) fn has_symbols(&self) -> bool {
+        self.symbols.is_some()
+    }
+
+    /// An automaton from persisted parts, after checking that every read
+    /// and mutation path will find what it relies on (see [`validate`]).
+    /// Returns it with the total bytes of its terms.
+    pub(crate) fn from_parts(
+        bytes: crate::records::Records,
+        root: u32,
+        term_count: u32,
+        flags: u8,
+        symbols: Option<std::sync::Arc<crate::fsst::SymbolTable>>,
+    ) -> Result<(PackedAutomaton, u64), &'static str> {
+        if flags & !KNOWN_FLAGS != 0 {
+            return Err("unknown automaton flags");
+        }
+        let automaton = PackedAutomaton {
+            bytes,
+            root,
+            term_count,
+            has_chains: flags & FLAG_HAS_CHAINS != 0,
+            pristine: flags & FLAG_PRISTINE != 0,
+            symbols,
+            chains_coded: flags & FLAG_CHAINS_CODED != 0,
+        };
+        let text = validate(&automaton)?;
+        Ok((automaton, text))
+    }
+
+    /// The smallest and largest terms (`term_count > 0`).
+    pub(crate) fn first_and_last_terms(&self) -> (Vec<u8>, Vec<u8>) {
+        let (mut first, mut last) = (Vec::new(), Vec::new());
+        self.term_at_into(0, &mut first);
+        self.term_at_into(self.term_count - 1, &mut last);
+        (first, last)
+    }
+}
+
+/// One record as [`validate`] parsed it: a state (`edges` are its
+/// transitions) or a chain (`edges` holds its one target, `label` its
+/// decoded label).
+struct ParsedNode {
+    pos: u32,
+    is_final: bool,
+    /// `label_start..label_end` in `Parsed::labels` for a chain.
+    chain: Option<(u32, u32)>,
+    edges: std::ops::Range<u32>,
+}
+
+#[derive(Default)]
+struct Parsed {
+    nodes: Vec<ParsedNode>,
+    /// `(byte, output, target node)`; a chain's one edge has byte 0.
+    edges: Vec<(u8, u32, u32)>,
+    labels: Vec<u8>,
+}
+
+/// Reads a [`write_leb128_rev`] value ending at `end` as
+/// [`read_leb128_rev`] does, refusing anything it would misread: an
+/// out-of-range byte, or more than the 5 bytes (and 32 bits) of a `u32`.
+fn checked_leb128_rev(bytes: &[u8], end: Option<usize>) -> Result<(u32, usize), &'static str> {
+    let mut i = end.ok_or("field below the records")?;
+    let mut value = 0u32;
+    for k in 0..5 {
+        let byte = *bytes.get(i).ok_or("field outside the records")?;
+        if k == 4 && byte > 0x0F {
+            return Err("LEB128 value exceeds u32");
+        }
+        value |= u32::from(byte & 0x7F) << (7 * k);
+        if byte & 0x80 == 0 {
+            return Ok((value, i));
+        }
+        i = i.checked_sub(1).ok_or("field below the records")?;
+    }
+    Err("LEB128 value exceeds u32")
+}
+
+/// A record as [`parse_checked`] reads it: `(is_final, chain target,
+/// transitions)` -- a chain has a target (its label in the caller's
+/// buffer) and no transitions.
+type CheckedRecord = (bool, Option<u32>, Vec<(u8, u32, u32)>);
+
+/// Parses the record at `pos` exactly as the readers do (`chain_at`,
+/// `header`, `read_transition_at`), with every address and offset
+/// checked; targets as addresses.
+fn parse_checked(a: &PackedAutomaton, pos: u32, label: &mut Vec<u8>) -> Result<CheckedRecord, &'static str> {
+    let bytes: &[u8] = &a.bytes;
+    let p = pos as usize;
+    let header = *bytes.get(p).ok_or("record outside the records")?;
+    if a.has_chains && header == 0 {
+        let (packed_len, start) = checked_leb128_rev(bytes, p.checked_sub(1))?;
+        let len = (packed_len >> 2) as usize;
+        if len != 0 {
+            let label_start = start.checked_sub(len).ok_or("chain label below the records")?;
+            let target = if packed_len & 1 == 1 {
+                label_start.checked_sub(1).ok_or("chain target below the records")? as u32
+            } else {
+                let (delta, field) = checked_leb128_rev(bytes, label_start.checked_sub(1))?;
+                (field as u32).checked_sub(delta).ok_or("chain target below the records")?
+            };
+            let stored = &bytes[label_start..start];
+            label.clear();
+            if packed_len & 2 == 2 {
+                let table = a.symbols.as_deref().ok_or("coded chain without a symbol table")?;
+                table.checked_decode(stored, label)?;
+            } else {
+                label.extend_from_slice(stored);
+            }
+            if label.is_empty() || label.len() > crate::limits::MAX_CHAIN_STATES {
+                return Err("chain label length out of range");
+            }
+            return Ok((false, Some(target), Vec::new()));
+        }
+    }
+    if header == 0 {
+        // The empty non-final state (a length-0 chain record).
+        return Ok((false, None, Vec::new()));
+    }
+    let mut cursor = p.checked_sub(1);
+    let (is_final, count, mode) = if header & 0x80 != 0 {
+        let code = header & 0x3F;
+        let mode = RecordMode {
+            next: header & 0x40 != 0,
+            label: (code != 0).then(|| label_table().byte(code)),
+        };
+        (false, 1, mode)
+    } else {
+        let mut count = (header & 0x3F) as usize;
+        if count == PACKED_COUNT_ESCAPE {
+            let at = cursor.ok_or("count escape below the records")?;
+            count += *bytes.get(at).ok_or("count escape outside the records")? as usize;
+            cursor = at.checked_sub(1);
+        }
+        (header & 0x40 != 0, count, RecordMode::GENERAL)
+    };
+    let mut children = Vec::with_capacity(count);
+    for i in 0..count {
+        let b = match mode.label {
+            Some(label) => label,
+            None => {
+                let at = cursor.ok_or("transition below the records")?;
+                cursor = at.checked_sub(1);
+                *bytes.get(at).ok_or("transition outside the records")?
+            }
+        };
+        let output = if i == 0 {
+            u32::from(is_final)
+        } else {
+            let (value, start) = checked_leb128_rev(bytes, cursor)?;
+            cursor = start.checked_sub(1);
+            value
+        };
+        let target = if mode.next {
+            cursor.ok_or("NEXT target below the records")? as u32
+        } else {
+            let (delta, start) = checked_leb128_rev(bytes, cursor)?;
+            cursor = start.checked_sub(1);
+            (start as u32).checked_sub(delta).ok_or("transition target below the records")?
+        };
+        children.push((b, output, target));
+    }
+    Ok((is_final, None, children))
+}
+
+/// UTF-8 decoder states for checking an automaton's language: whether
+/// every path to a final state spells valid UTF-8, one visit per
+/// (record, state) pair rather than per term.
+const UTF8_ACCEPT: u8 = 0;
+const UTF8_REJECT: u8 = 8;
+
+fn utf8_step(state: u8, b: u8) -> u8 {
+    let cont = |next: u8, lo: u8, hi: u8| if (lo..=hi).contains(&b) { next } else { UTF8_REJECT };
+    match state {
+        UTF8_ACCEPT => match b {
+            0x00..=0x7F => UTF8_ACCEPT,
+            0xC2..=0xDF => 1,
+            0xE1..=0xEC | 0xEE..=0xEF => 2,
+            0xF1..=0xF3 => 3,
+            0xE0 => 4,
+            0xED => 5,
+            0xF0 => 6,
+            0xF4 => 7,
+            _ => UTF8_REJECT,
+        },
+        // 1, 2, 3: that many continuation bytes still to come.
+        1 => cont(UTF8_ACCEPT, 0x80, 0xBF),
+        2 => cont(1, 0x80, 0xBF),
+        3 => cont(2, 0x80, 0xBF),
+        // The lead bytes whose second byte is restricted (no overlongs,
+        // no surrogates, nothing above U+10FFFF).
+        4 => cont(1, 0xA0, 0xBF),
+        5 => cont(1, 0x80, 0x9F),
+        6 => cont(2, 0x90, 0xBF),
+        7 => cont(2, 0x80, 0x8F),
+        _ => UTF8_REJECT,
+    }
+}
+
+/// Checks loaded records against everything the read and mutation paths
+/// assume of records they wrote themselves: every reachable record parses
+/// within bounds (targets always point below their record, so traversal
+/// ends); transition bytes strictly increase; each output is the count of
+/// terms before its transition, so ranks and the counts derived top-down
+/// are exact; no reachable state is empty; the root's count is
+/// `term_count`; chain labels decode (valid codes) to at most
+/// `MAX_CHAIN_STATES` bytes; and every term is valid UTF-8 (the premise of
+/// `decoded_term`). Returns the total bytes of the terms, which must stay
+/// within `BLOCK_TEXT_LIMIT` (so the write bounds of `crate::limits` hold).
+fn validate(a: &PackedAutomaton) -> Result<u64, &'static str> {
+    if a.bytes.len() as u64 > crate::limits::ADDRESS_LIMIT {
+        return Err("records exceed the address limit");
+    }
+    if a.term_count == 0 {
+        return Err("an automaton holds at least one term");
+    }
+    // Reachable records, parsed once: node index by address.
+    let mut parsed = Parsed::default();
+    let mut index: std::collections::HashMap<u32, u32> = std::collections::HashMap::new();
+    let mut pending: Vec<(u32, u32)> = Vec::new(); // (edge index, target address)
+    let mut stack = vec![a.root];
+    index.insert(a.root, 0);
+    let mut label = Vec::new();
+    while let Some(pos) = stack.pop() {
+        let (is_final, chain_target, children) = parse_checked(a, pos, &mut label)?;
+        let edges_start = parsed.edges.len() as u32;
+        let chain = match chain_target {
+            Some(target) => {
+                let start = parsed.labels.len() as u32;
+                parsed.labels.extend_from_slice(&label);
+                pending.push((parsed.edges.len() as u32, target));
+                parsed.edges.push((0, 0, u32::MAX));
+                Some((start, parsed.labels.len() as u32))
+            }
+            None => {
+                if children.windows(2).any(|w| w[0].0 >= w[1].0) {
+                    return Err("transition bytes not strictly increasing");
+                }
+                for (b, out, target) in children {
+                    pending.push((parsed.edges.len() as u32, target));
+                    parsed.edges.push((b, out, u32::MAX));
+                }
+                None
+            }
+        };
+        parsed.nodes.push(ParsedNode {
+            pos,
+            is_final,
+            chain,
+            edges: edges_start..parsed.edges.len() as u32,
+        });
+        for &(edge, target) in &pending {
+            let next = index.len() as u32;
+            let node = *index.entry(target).or_insert_with(|| {
+                stack.push(target);
+                next
+            });
+            parsed.edges[edge as usize].2 = node;
+        }
+        pending.clear();
+    }
+    // Node indices follow first discovery; DFS discovery order differs
+    // from `stack` pop order, so map discovery index -> parsed node.
+    let mut by_index = vec![u32::MAX; index.len()];
+    for (n, node) in parsed.nodes.iter().enumerate() {
+        by_index[index[&node.pos] as usize] = n as u32;
+    }
+    for edge in &mut parsed.edges {
+        edge.2 = by_index[edge.2 as usize];
+    }
+    let root = by_index[0] as usize;
+
+    // Counts and text bottom-up: every target lies below its record, so
+    // ascending address order visits targets first.
+    let mut order: Vec<u32> = (0..parsed.nodes.len() as u32).collect();
+    order.sort_unstable_by_key(|&n| parsed.nodes[n as usize].pos);
+    let mut count = vec![0u64; parsed.nodes.len()];
+    let mut text = vec![0u64; parsed.nodes.len()];
+    for &n in &order {
+        let node = &parsed.nodes[n as usize];
+        let (mut c, mut t) = (u64::from(node.is_final), 0u64);
+        for &(_, out, child) in &parsed.edges[node.edges.start as usize..node.edges.end as usize] {
+            let child = child as usize;
+            if parsed.nodes[child].pos >= node.pos {
+                return Err("target not below its record");
+            }
+            let step = match node.chain {
+                Some((ls, le)) => u64::from(le - ls),
+                None => {
+                    if u64::from(out) != c {
+                        return Err("transition output differs from the terms before it");
+                    }
+                    1
+                }
+            };
+            c += count[child];
+            t = t.saturating_add(count[child].saturating_mul(step)).saturating_add(text[child]);
+        }
+        if c == 0 {
+            return Err("reachable state with no terms");
+        }
+        if c > u64::from(u32::MAX) || t > crate::limits::BLOCK_TEXT_LIMIT {
+            return Err("block exceeds the term count or text limit");
+        }
+        count[n as usize] = c;
+        text[n as usize] = t;
+    }
+    if count[root] != u64::from(a.term_count) {
+        return Err("root count differs from the term count");
+    }
+
+    // UTF-8: walk (node, decoder state) pairs once each.
+    let mut seen = vec![0u16; parsed.nodes.len()];
+    let mut walk = vec![(root as u32, UTF8_ACCEPT)];
+    seen[root] = 1 << UTF8_ACCEPT;
+    while let Some((n, state)) = walk.pop() {
+        let node = &parsed.nodes[n as usize];
+        if node.is_final && state != UTF8_ACCEPT {
+            return Err("a term is not valid UTF-8");
+        }
+        for &(b, _, child) in &parsed.edges[node.edges.start as usize..node.edges.end as usize] {
+            let next = match node.chain {
+                Some((ls, le)) => parsed.labels[ls as usize..le as usize].iter().fold(state, |s, &b| utf8_step(s, b)),
+                None => utf8_step(state, b),
+            };
+            if next == UTF8_REJECT {
+                return Err("a term is not valid UTF-8");
+            }
+            let bit = 1u16 << next;
+            if seen[child as usize] & bit == 0 {
+                seen[child as usize] |= bit;
+                walk.push((child, next));
+            }
+        }
+    }
+    Ok(text[root])
 }
 
 pub(crate) fn common_prefix_len(a: &[u8], b: &[u8]) -> usize {

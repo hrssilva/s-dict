@@ -48,8 +48,8 @@ size (4.69 bytes/term), 21-22s of dictionary insertion with one writer,
 either direction, ~24 us per single-term insert or remove.
 
 See [PRODUCTION_READINESS.md](PRODUCTION_READINESS.md) for what remains
-before general production use (persistence, fallible operations, the id
-reuse contract, fuzzing/CI, API stability).
+before general production use (the id reuse contract, fuzzing/CI, API
+stability).
 
 ## Install
 
@@ -58,7 +58,19 @@ reuse contract, fuzzing/CI, API stability).
 s-dict = { path = "../s-dict" }  # or a git dependency, once published
 ```
 
-No dependencies. One `unsafe` block: decoded terms become `String`s without re-validating UTF-8, a premise checked in debug builds (`decoded_term`; DESIGN.md's "premises, not re-checks").
+No dependencies by default. The optional `mmap` feature adds
+[`memmap2`](https://crates.io/crates/memmap2) for
+`PackedAutomatonDictionary::map`. `unsafe` code, each with its invariant
+documented at the site:
+
+- decoded terms become `String`s without re-validating UTF-8, a premise
+  checked in debug builds (`decoded_term`; DESIGN.md's "premises, not
+  re-checks") and established by validation for loaded files;
+- block records are read through a pointer/length view of either an owned
+  buffer or a shared image (`src/records.rs`), kept current by the one
+  mutation path, so reads don't branch on where the bytes live;
+- `map` (feature `mmap`), whose caller guarantees the file isn't modified
+  while mapped.
 
 ## Quick start
 
@@ -119,8 +131,54 @@ batch.clear(); // Reuse text and metadata capacity for the next bounded batch.
 sorted order always matches its terms (`into_batch` to edit it again).
 
 `TermId` is `u32`, matching `s-graph`'s id space; ids are reused after
-removal, and running out of ids panics rather than wrapping. Block size is
-a tunable (`with_block_bounds`).
+removal. Block size is a tunable (`with_block_bounds`).
+
+### Errors
+
+Every insertion has a fallible form (`try_insert`, `try_insert_batch`,
+`try_insert_prepared`, `TermBatch::try_push`) that refuses with a
+`DictError`, checked before anything changes, so a refused operation leaves
+the dictionary exactly as it was:
+
+- `IdsExhausted`: more new terms than ids left below the id limit (`u32`
+  by default, lower with `set_id_limit`). A batch is refused whole.
+- `TermTooLarge`: a term over 128 MiB.
+- `BatchTooLarge`: a `TermBatch` over 4 GiB of text.
+
+The panicking forms (`insert`, `insert_batch`, `insert_prepared`, `push`)
+panic exactly where these return errors. Nothing else depends on input
+size: a block's records are `u32`-addressed, and every mutation is checked
+against a provable bound on the bytes it can write, falling back to a
+rebuild in bounded chunks where the incremental path can't be shown to fit
+(`src/limits.rs`). `ShardedDictionary` gives each shard the id limit its
+global ids leave it, and checks every shard before inserting a batch.
+
+### Saving and loading
+
+```rust
+use s_dict::{PackedAutomatonDictionary, TermDictionary};
+let mut dict = PackedAutomatonDictionary::new();
+let id = dict.insert("http://example.org/a");
+dict.shrink_to_fit(); // Compact form: no dead records in the file.
+
+let mut bytes = Vec::new();
+dict.save(&mut bytes).unwrap(); // Or `save_file(path)`: temp file, sync, rename.
+let loaded = PackedAutomatonDictionary::load(&bytes).unwrap(); // Or `load_file(path)`.
+assert_eq!(loaded.get_id("http://example.org/a"), Some(id));
+```
+
+`load` copies each block's records; `load_shared(Arc<[u8]>)` borrows them
+from one shared buffer, and `map(path)` (feature `mmap`, `unsafe`: the file
+must not change while mapped) from a memory-mapped file. A borrowed block
+is copied out on its first mutation. On the reference corpus (6.88M terms)
+a 29.9 MiB dictionary saves to a 28.0 MiB file in 0.3 s and loads in ~0.8 s
+by any of the three, against ~42 s to rebuild. Every load validates the
+whole file
+-- checksum, then every block's automaton (bounds of every record, counts
+behind every rank, UTF-8 of every term), block order, and that live and
+free ids partition the id space -- and refuses anything inconsistent with a
+`LoadError`, never a panic. The format is documented in
+`src/packed_automaton_dictionary/persist.rs`.
 
 ## Project layout
 
@@ -134,6 +192,10 @@ a tunable (`with_block_bounds`).
 - `src/range_map.rs` -- `TermId -> block` as id runs.
 - `src/fsst.rs` -- the chain-label symbol table.
 - `src/batch.rs` -- `TermBatch`/`PreparedBatch` and the radix sort.
+- `src/packed_automaton_dictionary/persist.rs` -- the file format, save,
+  and validating loads (`load`, `load_shared`, `map`).
+- `src/records.rs` -- block records: owned, or borrowed from a shared image.
+- `src/limits.rs` -- size limits and the write bounds behind them.
 - `src/sharded.rs` -- `ShardedDictionary`.
 - `src/entries_arena.rs` -- scratch for splits and neighbor merges.
 - `tests/` -- differential tests against a plain `HashMap`/`Vec` model
@@ -146,7 +208,10 @@ a tunable (`with_block_bounds`).
 
 ```sh
 cargo test
-cargo clippy --all-targets
+cargo test --features mmap
+cargo clippy --all-targets --features mmap
+# a longer corruption run against the file validation:
+S_DICT_CORRUPTION_ROUNDS=300000 cargo test --release structurally
 ```
 
 ## License

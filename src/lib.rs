@@ -20,10 +20,11 @@ mod packed_automaton;
 mod packed_automaton_block;
 mod packed_automaton_dictionary;
 mod range_map;
+mod records;
 mod sharded;
 
 pub use batch::{PreparedBatch, TermBatch};
-pub use packed_automaton_dictionary::PackedAutomatonDictionary;
+pub use packed_automaton_dictionary::{LoadError, PackedAutomatonDictionary};
 pub use sharded::{ShardRouter, ShardedDictionary};
 
 /// Compiles and runs the README examples as doctests.

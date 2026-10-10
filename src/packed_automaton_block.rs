@@ -93,6 +93,28 @@ impl PackedAutomatonBlock {
         }
     }
 
+    /// The automaton and the growth baseline, for persistence (ids via
+    /// `ids_into`).
+    pub(crate) fn persisted_parts(&self) -> (&PackedAutomaton, f32) {
+        (&self.packed, self.compact_bytes_per_term)
+    }
+
+    /// A block from persisted parts: an automaton already validated (with
+    /// `text_bytes` of terms) and one id per term, in rank order.
+    pub(crate) fn from_persisted(packed: PackedAutomaton, text_bytes: u64, ids: &[TermId], compact_bytes_per_term: f32) -> PackedAutomatonBlock {
+        PackedAutomatonBlock {
+            packed,
+            compact_bytes_per_term,
+            ids: BlockIds::new(ids),
+            text_bytes,
+        }
+    }
+
+    /// The smallest and largest terms.
+    pub(crate) fn first_and_last_terms(&self) -> (Vec<u8>, Vec<u8>) {
+        self.packed.first_and_last_terms()
+    }
+
     /// End of a load: compaction plus path compression for faster reads
     /// (`PackedAutomaton::compact_and_chain`), coding chain labels with
     /// `symbols` when given.
